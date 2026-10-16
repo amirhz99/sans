@@ -1,0 +1,29 @@
+[Unit]
+Description=Bale football session manager
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/root/sans
+ExecStart=/usr/bin/python3 /root/sans/run.py
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=15
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/root/sans/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

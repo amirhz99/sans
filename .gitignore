@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+data/
+/logs/
+*.sqlite3*
+*.log
+/players.csv
