@@ -65,9 +65,9 @@ class BaseCase(unittest.TestCase):
         self.apply('new_session', title='پنجشنبه ۲۳ مهر', when_text='پنجشنبه ساعت ۲۱',
                    location='زمین آزادی', venue_cost=2400000, person_fee=150000)
 
-    def send(self, body='', user=10, chat=10, sender=None, **extra):
+    def send(self, body='', user=10, chat=10, sender=None, chat_type=None, **extra):
         self.update_id += 1
-        msg = {'message_id': self.update_id, 'chat': {'id': chat, 'type': 'private' if chat > 0 else 'group'},
+        msg = {'message_id': self.update_id, 'chat': {'id': chat, 'type': chat_type or ('private' if chat > 0 else 'group')},
                'from': sender or {'id': user}, 'text': body, **extra}
         update = {'update_id': self.update_id, 'message': msg}
         self.bot.process(update)
@@ -190,11 +190,14 @@ class FinancialTests(BaseCase):
         self.assertRegex(preview, r'زمان تهران: \d{4}-\d{2}-\d{2}، ساعت 21:00 \(Asia/Tehran\)')
         self.assertNotIn('session_at:', preview)
 
-    def test_database_rejects_new_session_without_structured_time(self):
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.db.execute('''INSERT INTO sessions(title,when_text,location,venue_cost,person_fee,note)
-                               VALUES (?,?,?,?,?,?)''',
-                            ('ثبت مستقیم نامعتبر', 'امروز عصر', '', 0, 150000, ''))
+    def test_database_allows_historical_or_incomplete_session_without_structured_time(self):
+        self.db.execute('''INSERT INTO sessions(title,when_text,location,venue_cost,person_fee,note)
+                           VALUES (?,?,?,?,?,?)''',
+                        ('سانس قدیمی بدون ساعت دقیق', 'مهرماه گذشته', '', None, 0, ''))
+        row = self.db.one('SELECT * FROM sessions WHERE title=?', ('سانس قدیمی بدون ساعت دقیق',))
+        self.assertIsNotNone(row)
+        self.assertIsNone(row['session_at'])
+        self.assertEqual(row['person_fee'], 0)
 
     def test_old_session_text_is_not_migrated_or_changed(self):
         legacy_path = Path(self.temp.name) / 'legacy.sqlite3'
@@ -291,7 +294,7 @@ class FinancialTests(BaseCase):
 class PermissionAndConversationTests(BaseCase):
     def test_all_group_members_can_manage_only_in_designated_group(self):
         self.seed()
-        self.bot.config = replace(self.config, admins=frozenset(), admin_access='group_members')
+        self.bot.config = replace(self.config, admins=frozenset())
         self.assertTrue(self.bot.is_admin(-100, 99))
         self.assertFalse(self.bot.is_admin(-200, 99))
         self.assertFalse(self.bot.is_admin(99, 99))
@@ -312,19 +315,49 @@ class PermissionAndConversationTests(BaseCase):
 
     def test_group_member_receipt_approval_is_scoped_to_group(self):
         self.seed()
-        self.bot.config = replace(self.config, admins=frozenset(), admin_access='group_members')
+        self.bot.config = replace(self.config, admins=frozenset())
         self.receipt(caption='100000')
         self.click('pay:1', user=99, chat=-200)
         self.assertEqual(self.service.balance(1), 0)
         self.click('pay:1', user=99, chat=-100)
         self.assertEqual(self.service.balance(1), -100000)
 
+    def test_unauthorized_group_is_ignored_before_any_side_effect(self):
+        self.seed()
+        updates = [
+            self.send('سلام بچه‌ها', user=99, chat=-200),
+            self.send('مسئول راهنما', user=99, chat=-200),
+            self.send('این را بررسی کن', user=99, chat=-200,
+                      reply_to_message={'from': {'id': 777, 'is_bot': True}, 'text': 'پیام ربات'}),
+            self.send('/help', user=99, chat=-200),
+            self.send('100000', user=99, chat=-200,
+                      caption='100000', photo=[{'file_id': 'unauthorized', 'file_unique_id': 'unauthorized'}]),
+            self.send('مسئول راهنما', user=99, chat=-201, chat_type='supergroup'),
+        ]
+        self.assertTrue(all(update['message']['chat']['id'] == -200 for update in updates[:-1]))
+        self.assertEqual(updates[-1]['message']['chat']['id'], -201)
+        self.assertIsNone(self.bot.acknowledgement_chat(updates[1]))
+        self.assertFalse(self.ai.calls)
+        self.assertFalse(self.db.all('SELECT * FROM chat_messages'))
+        self.assertFalse(self.db.all('SELECT * FROM agent_logs'))
+        self.assertFalse(self.db.all('SELECT * FROM conversations'))
+        self.assertFalse(self.db.all('SELECT * FROM receipts'))
+        self.assertFalse(self.db.all('SELECT * FROM pending'))
+        self.assertFalse(self.db.all('SELECT * FROM outbox'))
+
+    def test_unauthorized_group_callback_is_ignored_without_callback_answer(self):
+        self.bot.process({'update_id': 1, 'callback_query': {
+            'id': 'unauthorized-callback', 'data': 'pay:1', 'from': {'id': 99},
+            'message': {'chat': {'id': -200, 'type': 'group'}}}})
+        self.assertFalse(self.db.all('SELECT * FROM outbox'))
+        self.assertFalse(self.db.all('SELECT * FROM agent_logs'))
+
     def test_unknown_user_identity_is_admin_confirmed(self):
         self.seed(linked=False)
         self.send('/identify علی رضایی')
         self.assertIsNone(self.service.linked(10))
         claim = self.db.one('SELECT id FROM pending')['id']
-        self.click('yes:' + claim, user=10)
+        self.click('yes:' + claim, user=10, chat=-200)
         self.assertIsNone(self.service.linked(10))
         self.click('yes:' + claim)
         self.assertEqual(self.service.linked(10)['id'], 1)
@@ -401,7 +434,7 @@ class PermissionAndConversationTests(BaseCase):
         self.send('/debt رضا محمدی', user=1, chat=-100)
         self.assertIn('بدهی خصوصی رضا', self.replies(-100))
         before = self.replies(-100)
-        self.send('/debt رضا محمدی', user=55, chat=-100)
+        self.send('/debt رضا محمدی', user=55, chat=55)
         self.assertEqual(before, self.replies(-100))
 
     def test_model_cannot_grant_private_admin_access(self):
@@ -465,18 +498,18 @@ class PermissionAndConversationTests(BaseCase):
                   reply_to_message={'from': {'id': 778}, 'text': 'پیام کاربر دیگر'})
         self.assertFalse(self.ai.calls)
 
-    def test_non_admin_group_mention_gets_public_response_without_admin_access(self):
+    def test_every_group_member_gets_admin_access_in_designated_group(self):
         self.seed()
         self.ai.answer = {'action': 'help', 'args': {}}
         self.send('مسئول راهنما', user=99, chat=-100)
         self.assertEqual(len(self.ai.calls), 1)
-        self.assertNotIn('دستورات ادمین', self.replies(-100))
-        self.assertFalse(self.bot.is_admin(-100, 99))
+        self.assertIn('دستورات ادمین', self.replies(-100))
+        self.assertTrue(self.bot.is_admin(-100, 99))
 
         self.ai.answer = {'action': 'adjustment', 'args': {'player': 1, 'amount': 500, 'note': 'نباید ثبت شود'}}
         self.send('مسئول بدهی علی را اصلاح کن', user=99, chat=-100)
         self.assertEqual(self.service.balance(1), 0)
-        self.assertFalse(self.db.all('SELECT * FROM pending'))
+        self.assertTrue(self.db.all('SELECT * FROM pending'))
 
     def test_bot_username_mention_is_a_valid_group_trigger(self):
         with self.db.conn:
@@ -544,6 +577,15 @@ class PermissionAndConversationTests(BaseCase):
         self.assertNotIn('دستورات ادمین', reply)
         self.assertNotIn('/players', reply)
         self.assertLessEqual(len(reply.splitlines()), 10)
+
+    def test_private_start_gives_private_user_guidance_only(self):
+        self.send('/start', user=10, chat=10)
+        reply = self.replies(10)
+        self.assertIn('دستورات کاربران', reply)
+        self.assertIn('عکس رسید', reply)
+        self.assertNotIn('گروه مدیریتی', reply)
+        self.assertNotIn('دستورات ادمین', reply)
+        self.assertNotIn('/players', reply)
 
     def test_admin_help_separates_public_and_admin_commands(self):
         self.send('/help', user=1, chat=-100)
@@ -624,9 +666,84 @@ class PermissionAndConversationTests(BaseCase):
         class Client:
             def call(self, method, payload):
                 calls.append((method, payload))
+                return {'message_id': 42}
 
-        send_acknowledgement(Client(), 10)
+        message_id = send_acknowledgement(Client(), 10)
+        self.assertEqual(message_id, 42)
         self.assertEqual(calls, [('sendMessage', {'chat_id': 10, 'text': ACKNOWLEDGEMENT})])
+
+    def test_final_response_edits_acknowledgement_message(self):
+        calls = []
+
+        class Client:
+            def call(self, method, payload):
+                calls.append((method, payload))
+                return {'message_id': 42} if method == 'sendMessage' else True
+
+        client = Client()
+        message_id = send_acknowledgement(client, 10)
+        update = {'update_id': 1, 'message': {
+            'message_id': 1, 'chat': {'id': 10, 'type': 'private'},
+            'from': {'id': 10}, 'text': '/help'}}
+        self.bot.process(update, acknowledgement={'chat_id': 10, 'message_id': message_id})
+        flush_outbox(self.db, client, pace=0)
+
+        methods = [method for method, _ in calls]
+        self.assertEqual(methods, ['sendMessage', 'editMessageText'])
+        edited = calls[-1][1]
+        self.assertEqual(edited['chat_id'], 10)
+        self.assertEqual(edited['message_id'], 42)
+        self.assertIn('دستورات کاربران', edited['text'])
+
+    def test_failed_acknowledgement_edit_falls_back_to_new_message(self):
+        calls = []
+
+        class Client:
+            def call(self, method, payload):
+                calls.append((method, payload))
+                if method == 'sendMessage' and len(calls) == 1:
+                    return {'message_id': 42}
+                if method == 'editMessageText':
+                    raise APIError('message is not editable')
+                return {'message_id': 43}
+
+        client = Client()
+        message_id = send_acknowledgement(client, 10)
+        update = {'update_id': 1, 'message': {
+            'message_id': 1, 'chat': {'id': 10, 'type': 'private'},
+            'from': {'id': 10}, 'text': '/help'}}
+        self.bot.process(update, acknowledgement={'chat_id': 10, 'message_id': message_id})
+        flush_outbox(self.db, client, pace=0)
+
+        self.assertEqual([method for method, _ in calls],
+                         ['sendMessage', 'editMessageText', 'sendMessage'])
+        fallback = calls[-1][1]
+        self.assertEqual(fallback['chat_id'], 10)
+        self.assertNotIn('message_id', fallback)
+        self.assertIn('دستورات کاربران', fallback['text'])
+
+    def test_media_response_keeps_normal_send_path_after_acknowledgement(self):
+        self.seed()
+        calls = []
+
+        class Client:
+            def call(self, method, payload):
+                calls.append((method, payload))
+                return {'message_id': 42} if method == 'sendMessage' else True
+
+        update = {'update_id': 1, 'message': {
+            'message_id': 1, 'chat': {'id': 10, 'type': 'private'},
+            'from': {'id': 10},
+            'caption': 'سلام',
+            'photo': [{'file_id': 'receipt', 'file_unique_id': 'receipt'}]}}
+        client = Client()
+        message_id = send_acknowledgement(client, 10)
+        self.bot.process(update, acknowledgement={'chat_id': 10, 'message_id': message_id})
+        flush_outbox(self.db, client, pace=0)
+
+        self.assertEqual([method for method, _ in calls], ['sendMessage', 'sendMessage'])
+        self.assertNotIn('message_id', calls[-1][1])
+        self.assertIn('رسید دریافت شد', calls[-1][1]['text'])
 
     def test_ai_outage_does_not_break_commands(self):
         self.seed()
@@ -699,10 +816,19 @@ class OperationalTests(BaseCase):
             cfg = Config.from_env()
             self.assertEqual(cfg.admin_access, 'group_members')
             self.assertFalse(cfg.admins)
-        for policy in ('allowlist', 'everyone'):
+        for policy in ('everyone',):
             with patch.dict(os.environ, {**env, 'ADMIN_ACCESS': policy}, clear=True), patch('app.config.load_env'):
                 with self.assertRaises(ValueError):
                     Config.from_env()
+
+    def test_config_does_not_require_user_allowlist_for_group_access(self):
+        env = {'BALE_BOT_TOKEN': 'test', 'ADMIN_GROUP_ID': '-100',
+               'AI_BASE_URL': 'https://example.com/v1', 'AI_API_KEY': 'test',
+               'AI_MODEL': 'test'}
+        with patch.dict(os.environ, env, clear=True), patch('app.config.load_env'):
+            cfg = Config.from_env()
+        self.assertFalse(cfg.admins)
+        self.assertTrue(Bot(self.db, cfg, self.ai).is_admin(-100, 999))
 
     def csv(self, contents):
         path = Path(self.temp.name) / 'players.csv'

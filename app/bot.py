@@ -4,9 +4,10 @@ import sqlite3
 import time
 import uuid
 
+from .agent import SansAgent
 from .ai_context import AIContextBuilder
 from .clients import APIError
-from .content import ADMIN_HELP, HELP
+from .content import ADMIN_HELP, DEFAULTS, HELP, SYSTEM_PROMPT
 from .db import dumps
 from .domain import ConversationState, EntityRef, Intent, ResponseLevel
 from .presentation import SessionView
@@ -28,11 +29,43 @@ class Bot:
         self.service = Service(db)
         self.context_builder = AIContextBuilder(db, self.service)
         self.session_view = SessionView(self.service)
+        self.system_prompt = SYSTEM_PROMPT
+        self.content_defaults = DEFAULTS
+        self.agent = SansAgent(self)
 
     def is_admin(self, chat_id, user_id):
         return (isinstance(user_id, int) and not isinstance(user_id, bool) and user_id > 0
-                and chat_id == self.config.admin_group
-                and (self.config.admin_access == 'group_members' or user_id in self.config.admins))
+                and isinstance(chat_id, int) and chat_id < 0
+                and chat_id == self.config.admin_group)
+
+    def allowed_chat(self, chat):
+        """Return whether an update can be handled in this chat.
+
+        The configured admin group is the only group boundary.  Private chats
+        remain available for ordinary user flows; every other group is ignored
+        before message, callback, or acknowledgement handling begins.
+        """
+        if not isinstance(chat, dict):
+            return False
+        chat_id = chat.get('id')
+        if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+            return False
+        chat_type = chat.get('type')
+        if chat_id == self.config.admin_group:
+            # Callback fixtures and some API payloads omit the chat type; the
+            # configured group id still identifies the only enabled group.
+            return chat_type in (None, 'group', 'supergroup')
+        return chat_type == 'private' and chat_id > 0
+
+    def allowed_update(self, update):
+        if not isinstance(update, dict):
+            return False
+        callback = update.get('callback_query')
+        if isinstance(callback, dict):
+            message = callback.get('message')
+        else:
+            message = update.get('message')
+        return isinstance(message, dict) and self.allowed_chat(message.get('chat'))
 
     def addressed(self, msg, body):
         """Return whether a group message is directed at this bot.
@@ -94,7 +127,7 @@ class Bot:
         chat_id = chat.get('id')
         user_id = sender.get('id')
         if (not isinstance(chat_id, int) or not isinstance(user_id, int)
-                or sender.get('is_bot')):
+                or sender.get('is_bot') or not self.allowed_chat(chat)):
             return None
         private = chat.get('type') == 'private'
         if (msg.get('text') or msg.get('caption') or msg.get('contact')
@@ -115,7 +148,7 @@ class Bot:
             return None
         return chat_id if (not body.startswith('/') or self.is_admin(chat_id, user_id)) else None
 
-    def process(self, update):
+    def process(self, update, acknowledgement=None):
         uid = update.get('update_id')
         if not isinstance(uid, int):
             return
@@ -126,11 +159,18 @@ class Bot:
             self.db.execute('BEGIN IMMEDIATE')
             if self.db.one('SELECT 1 FROM processed_updates WHERE update_id=?', (uid,)):
                 return
+            if not self.allowed_update(update):
+                # Advance the polling offset without invoking any bot path for
+                # an unauthorized group.  This is infrastructure bookkeeping,
+                # not message, conversation, or domain persistence.
+                self.db.execute('INSERT INTO processed_updates(update_id) VALUES (?)', (uid,))
+                self.db.set_setting('offset', uid + 1)
+                return
             callback = update.get('callback_query')
             if callback:
                 self.callback(callback)
             elif update.get('message'):
-                self.message(update['message'])
+                self.message(update['message'], acknowledgement)
             self.db.execute('INSERT INTO processed_updates(update_id) VALUES (?)', (uid,))
             self.db.set_setting('offset', uid + 1)
 
@@ -180,7 +220,7 @@ class Bot:
         except (TypeError, ValueError):
             return ResponseLevel.SUMMARY
 
-    def message(self, msg):
+    def message(self, msg, acknowledgement=None):
         chat = msg.get('chat', {})
         chat_id = chat.get('id')
         user_id = msg.get('from', {}).get('id')
@@ -189,6 +229,11 @@ class Bot:
         private = chat.get('type') == 'private'
         admin = self.is_admin(chat_id, user_id)
         body = (msg.get('text') or msg.get('caption') or '').strip()
+        sender = msg.get('from') if isinstance(msg.get('from'), dict) else {}
+        sender_name = (' '.join(filter(None, [sender.get('first_name', ''), sender.get('last_name', '')]))
+                       or sender.get('username', '') or str(user_id))
+        if body and body.split('@')[0] != '/id':
+            self.db.log_message(chat_id, user_id, sender_name, body, 'user')
         reply_to = msg.get('reply_to_message') if isinstance(msg.get('reply_to_message'), dict) else None
         reply_body = ((reply_to or {}).get('text') or (reply_to or {}).get('caption') or '').strip()
         processing_body = body
@@ -199,12 +244,38 @@ class Bot:
             return
         # In the admin group, don't interpret every ordinary conversation as a command.
         if not private and not self.addressed(msg, body):
+            if body:
+                self.db.log_agent_event(
+                    chat_id,
+                    user_id,
+                    sender_name,
+                    'SKIPPED_NOT_ADDRESSED',
+                    summary=body[:200],
+                    details={'reason': 'Group message without bot mention or reply to bot'},
+                )
             return
         # Public mentions/replies may be answered, but slash commands in a group
         # remain restricted to the admin permission boundary.
         if not private and body.startswith('/') and not admin:
+            self.db.log_agent_event(
+                chat_id,
+                user_id,
+                sender_name,
+                'SKIPPED_NOT_ADMIN',
+                summary=body[:200],
+                details={'reason': 'Slash command in non-admin group or by non-admin user'},
+            )
             return
+        self.db.log_agent_event(
+            chat_id,
+            user_id,
+            sender_name,
+            'INCOMING',
+            summary=body[:300] or '[media/contact]',
+            details={'private': private, 'admin': admin, 'has_reply': bool(reply_to)},
+        )
         state, history = self.db.conversation(chat_id, user_id)
+        had_receipt_step = bool(state.get('receipt'))
         # A bare greeting is routed to the model like any other free message so
         # the conversation stays natural, but it may only ask a clarifying
         # question; see the dispatch guard below.
@@ -252,6 +323,26 @@ class Bot:
                     amount = self.parse_amount(body) if state.get('receipt') else None
                     if amount is not None:
                         command = {'action': 'payment_amount', 'args': {'amount': amount}}
+                    elif getattr(self.ai, 'use_langgraph', False):
+                        try:
+                            reply, markup, effects = self.agent.run(
+                                processing_body,
+                                history,
+                                chat_id,
+                                user_id,
+                                admin,
+                                sender=sender,
+                                llm_override=getattr(self.ai, 'llm_override', None),
+                            )
+                            if effects.get('last_session_id'):
+                                s = self.service.session(effects['last_session_id'])
+                                state['last_entity'] = EntityRef('session', s['id'], s['title']).to_dict()
+                            elif effects.get('last_player_id'):
+                                p = self.service.player(effects['last_player_id'])
+                                state['last_entity'] = EntityRef('player', p['id'], p['name']).to_dict()
+                            command = {'action': '_agent_handled', 'args': {}}
+                        except Exception as exc:
+                            raise APIError(f'LangGraph execution error: {exc}') from None
                     else:
                         try:
                             command = Intent.from_dict(self.ai.parse(
@@ -267,13 +358,16 @@ class Bot:
                         if command['action'] not in allowed:
                             raise UserError('تأیید یا اتصال مستقیم از طریق هوش مصنوعی مجاز نیست؛ از دکمه‌ها یا فرمان‌های راهنما استفاده کنید.')
                 action, args = command['action'], command.get('args', {})
-                if bare_greeting:
+                if action == '_agent_handled':
+                    pass
+                elif bare_greeting:
                     # A greeting is never a request: keep it side-effect free even
                     # when the model tried to derive an operation from it.
                     question = command.get('question')
                     if action != 'clarify' or not isinstance(question, str) or not question.strip():
                         raise UserError(GREETING_REPLY)
-                if action == 'cancel':
+                    reply = text(question, 'سؤال', limit=1500)
+                elif action == 'cancel':
                     state.clear()
                     history.clear()
                     self.db.execute("UPDATE pending SET status='cancelled' WHERE requester=? AND chat_id=? AND status='pending'",
@@ -351,7 +445,26 @@ class Bot:
                 reply = str(exc)
         history += [{'role': 'user', 'content': processing_body[:4000]}, {'role': 'assistant', 'content': reply[:2500]}]
         self.db.save_conversation(chat_id, user_id, state, history)
-        self.db.say(chat_id, reply, markup)
+        self.db.log_message(chat_id, 0, self.config.bot_name, reply, 'assistant')
+        # The polling loop may have sent a short-lived processing notice before
+        # entering this transaction. Replace it with the final response when
+        # possible; otherwise preserve the established chunking/send behavior.
+        edit = (acknowledgement if isinstance(acknowledgement, dict) else {})
+        edit_chat = edit.get('chat_id')
+        edit_message = edit.get('message_id')
+        can_edit = (isinstance(edit_chat, int) and not isinstance(edit_chat, bool)
+                    and edit_chat == chat_id
+                    and isinstance(edit_message, int) and not isinstance(edit_message, bool)
+                    and edit_message > 0 and len(reply) <= 3500
+                    and not had_receipt_step
+                    and not msg.get('contact') and not msg.get('photo') and not msg.get('document'))
+        if can_edit:
+            payload = {'chat_id': edit_chat, 'message_id': edit_message, 'text': reply}
+            if markup:
+                payload['reply_markup'] = {'inline_keyboard': markup}
+            self.db.queue('editMessageText', payload)
+        else:
+            self.db.say(chat_id, reply, markup)
 
     @staticmethod
     def parse_amount(body):

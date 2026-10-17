@@ -37,8 +37,6 @@ class Config:
             raise ValueError('ADMIN_ACCESS must be allowlist or group_members')
         required = ('BALE_BOT_TOKEN', 'ADMIN_GROUP_ID',
                     'AI_BASE_URL', 'AI_API_KEY', 'AI_MODEL')
-        if access == 'allowlist':
-            required += ('ADMIN_USER_IDS',)
         missing = [key for key in required if not os.getenv(key, '').strip()]
         if missing:
             raise ValueError('Missing configuration: ' + ', '.join(missing))
@@ -46,7 +44,7 @@ class Config:
         if urlparse(url).scheme != 'https':
             raise ValueError('AI_BASE_URL must use HTTPS')
         admins = frozenset(int(x.strip()) for x in os.getenv('ADMIN_USER_IDS', '').split(',') if x.strip())
-        if (access == 'allowlist' and not admins) or any(x <= 0 for x in admins):
+        if any(x <= 0 for x in admins):
             raise ValueError('ADMIN_USER_IDS must contain positive numeric IDs')
         database = Path(os.getenv('DATABASE_PATH', 'data/sans.sqlite3'))
         if not database.is_absolute():

@@ -48,6 +48,8 @@ PROMPT = SYSTEM_PROMPT
 
 
 class AIClient:
+    use_langgraph = True
+
     def __init__(self, config):
         self.url = config.ai_url + '/chat/completions'
         self.key = config.ai_key

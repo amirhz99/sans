@@ -12,26 +12,16 @@ class Database:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path.resolve()
-        self.conn = sqlite3.connect(path, timeout=10)
+        self.conn = sqlite3.connect(path, timeout=10, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA foreign_keys = ON')
         self.conn.execute('PRAGMA journal_mode = WAL')
         self.conn.executescript(Path(__file__).with_name('schema.sql').read_text())
-        # Existing installations predate structured session times.  Do not fill
-        # this column from old prose: phrases such as «امروز عصر» are not exact
-        # timestamps and historical sessions must remain unchanged.
         columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(sessions)')}
         if 'session_at' not in columns:
             self.conn.execute('ALTER TABLE sessions ADD COLUMN session_at TEXT')
-        # Every newly inserted session must have a parsed Tehran timestamp.  Keep
-        # legacy rows untouched, but do not allow old/direct writers to create
-        # another malformed session after the structured-time migration.
-        self.conn.execute('''CREATE TRIGGER IF NOT EXISTS sessions_require_session_at
-                             BEFORE INSERT ON sessions
-                             WHEN NEW.session_at IS NULL OR trim(NEW.session_at) = ''
-                             BEGIN
-                                 SELECT RAISE(ABORT, 'new sessions require session_at');
-                             END''')
+        # Drop legacy trigger if present so incomplete/historical sessions work freely.
+        self.conn.execute('DROP TRIGGER IF EXISTS sessions_require_session_at')
         self.conn.commit()
 
     def close(self):
@@ -82,4 +72,50 @@ class Database:
     def save_conversation(self, chat_id, user_id, state, history):
         self.execute('''INSERT INTO conversations VALUES (?,?,?,?)
             ON CONFLICT(chat_id,user_id) DO UPDATE SET state=excluded.state,history=excluded.history''',
-                     (chat_id, user_id, dumps(state), dumps(history[-12:])))
+                     (chat_id, user_id, dumps(state), dumps(history[-20:])))
+
+    def log_message(self, chat_id, user_id, sender_name, text, role='user'):
+        if not text or not str(text).strip():
+            return
+        self.execute(
+            'INSERT INTO chat_messages(chat_id, user_id, sender_name, role, text) VALUES (?,?,?,?,?)',
+            (int(chat_id), int(user_id or 0), str(sender_name or '')[:120], str(role), str(text).strip()[:2000]),
+        )
+
+    def recent_messages(self, chat_id, limit=20):
+        rows = self.all(
+            'SELECT user_id, sender_name, role, text, created_at FROM chat_messages WHERE chat_id=? ORDER BY id DESC LIMIT ?',
+            (int(chat_id), int(limit)),
+        )
+        return [dict(row) for row in reversed(rows)]
+
+    def log_agent_event(self, chat_id, user_id, sender_name, event, summary='', details=None, duration_ms=0):
+        payload = dumps(details or {})
+        self.execute(
+            'INSERT INTO agent_logs(chat_id, user_id, sender_name, event, summary, details, duration_ms) VALUES (?,?,?,?,?,?,?)',
+            (
+                int(chat_id or 0),
+                int(user_id or 0),
+                str(sender_name or '')[:120],
+                str(event)[:60],
+                str(summary or '')[:1000],
+                payload[:4000],
+                int(duration_ms or 0),
+            ),
+        )
+        try:
+            log_dir = self.path.parent / 'logs'
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / 'agent.log'
+            line = (
+                f"[{event}] chat={chat_id} user={user_id} ({sender_name}) "
+                f"dur={int(duration_ms or 0)}ms | {summary} | {payload}\n"
+            )
+            with log_file.open('a', encoding='utf-8') as fh:
+                fh.write(line)
+        except OSError:
+            pass
+
+    def recent_agent_logs(self, limit=40):
+        rows = self.all('SELECT * FROM agent_logs ORDER BY id DESC LIMIT ?', (int(limit),))
+        return [dict(row) for row in reversed(rows)]

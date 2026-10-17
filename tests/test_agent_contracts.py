@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 
 from app.ai_context import AIContextBuilder
+from app.agent import AGENT_SYSTEM_PROMPT
+from app.content import SYSTEM_PROMPT
 from app.db import Database
 from app.domain import ConversationState, EntityRef, EntityType, Intent, ResponseLevel
 from app.bot import Bot
@@ -110,6 +112,17 @@ class AgentContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PromptLoader(bad_prompt).load()
 
+    def test_ai_prompts_reject_unrelated_requests_without_tools(self):
+        scope_reply = 'این درخواست نامرتبط است؛ من فقط مسئول مدیریت سانس فوتبال هستم و نمی‌توانم به آن پاسخ بدهم.'
+
+        self.assertIn('نامرتبط', AGENT_SYSTEM_PROMPT)
+        self.assertIn('هیچ ابزاری را اجرا نکن', AGENT_SYSTEM_PROMPT)
+        self.assertIn(scope_reply, AGENT_SYSTEM_PROMPT)
+
+        self.assertIn('نامرتبط', SYSTEM_PROMPT)
+        self.assertIn('action=clarify', SYSTEM_PROMPT)
+        self.assertIn(scope_reply, SYSTEM_PROMPT)
+
     def test_session_view_has_explicit_levels(self):
         session = {
             'id': 1, 'title': 'سانس آزمایشی', 'when_text': 'فردا ساعت ۲۱',
@@ -134,6 +147,171 @@ class AgentContractTests(unittest.TestCase):
         rendered = view.render(incomplete)
         self.assertIn('نامشخص', rendered)
         self.assertIn('هنوز اعلام نشده', rendered)
+
+    def test_langgraph_agent_executes_tools_and_proposes_financial_changes(self):
+        from langchain_core.messages import AIMessage
+        from app.config import Config
+
+        class ScriptedLangGraphLLM:
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.calls = 0
+
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, messages):
+                idx = min(self.calls, len(self.responses) - 1)
+                self.calls += 1
+                return self.responses[idx]
+
+        class LangGraphDriver:
+            use_langgraph = True
+
+            def __init__(self, responses):
+                self.llm_override = ScriptedLangGraphLLM(responses)
+
+        config = Config(
+            'fake-token', -100, frozenset({1}), 'https://example.com/v1',
+            'fake-key', 'fake-model', Path(self.temp.name) / 'contracts.sqlite3',
+        )
+        driver = LangGraphDriver([
+            AIMessage(
+                content='',
+                tool_calls=[
+                    {
+                        'id': 'call_1',
+                        'name': 'manage_records',
+                        'args': {
+                            'operation': 'save_session',
+                            'data_json': json.dumps({
+                                'title': 'سانس اول مهر',
+                                'when_text': 'مهرماه (بدون ساعت دقیق)',
+                                'person_fee': 150000,
+                            }, ensure_ascii=False),
+                        },
+                    },
+                    {
+                        'id': 'call_2',
+                        'name': 'manage_records',
+                        'args': {
+                            'operation': 'set_attendance',
+                            'data_json': json.dumps({
+                                'session': 'سانس اول مهر',
+                                'present': [{'name': 'علی رضایی', 'guests': 1}, 'رضا محمدی'],
+                            }, ensure_ascii=False),
+                        },
+                    },
+                    {
+                        'id': 'call_3',
+                        'name': 'propose_financial_change',
+                        'args': {
+                            'action': 'finalize',
+                            'session': 'سانس اول مهر',
+                        },
+                    },
+                ],
+            ),
+            AIMessage(content='سانس اول مهر و حاضرانش ثبت شد؛ کارت نهایی‌سازی بدهی را تأیید کنید.'),
+        ])
+        bot = Bot(self.db, config, driver)
+        bot.process({
+            'update_id': 1,
+            'message': {
+                'message_id': 10,
+                'chat': {'id': -100, 'type': 'group'},
+                'from': {'id': 1, 'first_name': 'ادمین'},
+                'text': 'مسئول، سانس اول مهر رو با حضور علی رضایی (+۱ مهمان) و رضا محمدی ثبت کن و ببند.',
+            },
+        })
+
+        session = self.db.one('SELECT * FROM sessions WHERE title=?', ('سانس اول مهر',))
+        self.assertIsNotNone(session)
+        self.assertIsNone(session['session_at'])
+        attendees = self.db.all('SELECT * FROM attendance WHERE session_id=?', (session['id'],))
+        self.assertEqual(len(attendees), 2)
+        pending = self.db.one("SELECT * FROM pending WHERE kind='commands' AND status='pending'")
+        self.assertIsNotNone(pending)
+        self.assertEqual(self.service.balance(1), 0)
+
+        # Approve via inline button callback
+        bot.process({
+            'update_id': 2,
+            'callback_query': {
+                'id': 'cb1',
+                'data': 'yes:' + pending['id'],
+                'from': {'id': 1},
+                'message': {'chat': {'id': -100}},
+            },
+        })
+        self.assertEqual(self.service.balance(1), 300000)
+        self.assertEqual(self.service.balance(2), 150000)
+        self.assertTrue(self.db.recent_messages(-100))
+        agent_logs = self.db.recent_agent_logs(10)
+        self.assertTrue(any(row['event'] == 'AGENT_REPLY' for row in agent_logs))
+
+    def test_langgraph_agent_unwraps_accidental_json_and_logs_skipped(self):
+        from langchain_core.messages import AIMessage
+        from app.config import Config
+
+        class ScriptedLangGraphLLM:
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.calls = 0
+
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, messages):
+                idx = min(self.calls, len(self.responses) - 1)
+                self.calls += 1
+                return self.responses[idx]
+
+        class LangGraphDriver:
+            use_langgraph = True
+
+            def __init__(self, responses):
+                self.llm_override = ScriptedLangGraphLLM(responses)
+
+        config = Config(
+            token='t',
+            admin_group=-100,
+            admins=frozenset({1}),
+            ai_url='https://example.invalid',
+            ai_key='k',
+            ai_model='m',
+            database=Path(self.temp.name) / 'contracts.sqlite3',
+        )
+        driver = LangGraphDriver([
+            AIMessage(content='{"action":"clarify", "args":{}, "question":"سلام! چطور کمکتون کنم؟"}'),
+        ])
+        bot = Bot(self.db, config, driver)
+        # Unaddressed group message is logged as SKIPPED_NOT_ADDRESSED
+        bot.process({
+            'update_id': 10,
+            'message': {
+                'message_id': 11,
+                'chat': {'id': -100, 'type': 'group'},
+                'from': {'id': 1, 'first_name': 'دانیال'},
+                'text': 'سلام بچه ها',
+            },
+        })
+        logs = self.db.recent_agent_logs(10)
+        self.assertTrue(any(r['event'] == 'SKIPPED_NOT_ADDRESSED' for r in logs))
+
+        # Addressed group message unwraps accidental JSON into natural text
+        bot.process({
+            'update_id': 11,
+            'message': {
+                'message_id': 12,
+                'chat': {'id': -100, 'type': 'group'},
+                'from': {'id': 1, 'first_name': 'دانیال'},
+                'text': 'مسئول سلام',
+            },
+        })
+        outbox = self.db.all('SELECT * FROM outbox ORDER BY id DESC')
+        self.assertIn('سلام! چطور کمکتون کنم؟', outbox[0]['payload'])
+        self.assertNotIn('"action"', outbox[0]['payload'])
 
 
 if __name__ == '__main__':

@@ -188,14 +188,29 @@ def import_players(db, path):
     return len(rows)
 
 
-def flush_outbox(db, client, limit=20, pace=0.55):
+def flush_outbox(db, client, limit=20, pace=0.15):
     for _ in range(limit):
         row = db.one('SELECT * FROM outbox WHERE next_attempt<=? ORDER BY id LIMIT 1', (time.time(),))
         if not row:
             break
         try:
-            client.call(row['method'], json.loads(row['payload']))
+            payload = json.loads(row['payload'])
+            client.call(row['method'], payload)
         except APIError as exc:
+            if row['method'] == 'editMessageText':
+                # Editing is a presentation optimization. If it is rejected
+                # (for example because the provider no longer considers the
+                # acknowledgement editable), deliver the same response as a
+                # normal new message instead of retrying the edit forever.
+                fallback = {key: value for key, value in payload.items()
+                            if key not in ('message_id',)}
+                with db.conn:
+                    db.execute('DELETE FROM outbox WHERE id=?', (row['id'],))
+                    db.queue('sendMessage', fallback)
+                LOG.warning('Outbox %s edit failed; queued send fallback (%s)', row['id'], exc)
+                if pace:
+                    time.sleep(pace)
+                continue
             delay = max(exc.retry_after, min(300, 2 ** min(row['attempts'] + 1, 8)))
             with db.conn:
                 db.execute('UPDATE outbox SET attempts=attempts+1,next_attempt=? WHERE id=?',
@@ -209,12 +224,15 @@ def flush_outbox(db, client, limit=20, pace=0.55):
 
 
 def send_acknowledgement(client, chat_id):
-    """Send a best-effort immediate notice before slow command processing."""
+    """Send a best-effort notice and return its provider message id."""
     try:
-        client.call('sendMessage', {'chat_id': chat_id, 'text': ACKNOWLEDGEMENT})
+        result = client.call('sendMessage', {'chat_id': chat_id, 'text': ACKNOWLEDGEMENT})
+        message_id = result.get('message_id') if isinstance(result, dict) else None
+        return message_id if isinstance(message_id, int) and not isinstance(message_id, bool) else None
     except APIError as exc:
         # The real response remains in the transactional outbox; this notice is only a UX aid.
         LOG.warning('Immediate acknowledgement failed for chat %s (%s)', chat_id, exc)
+        return None
 
 
 def run(db, config):
@@ -235,9 +253,12 @@ def run(db, config):
             updates = client.call('getUpdates', {'offset': int(db.setting('offset', '0')), 'timeout': 20, 'limit': 50})
             for update in sorted(updates or [], key=lambda u: u['update_id']):
                 chat_id = bot.acknowledgement_chat(update)
+                acknowledgement = None
                 if chat_id is not None:
-                    send_acknowledgement(client, chat_id)
-                bot.process(update)
+                    message_id = send_acknowledgement(client, chat_id)
+                    if message_id is not None:
+                        acknowledgement = {'chat_id': chat_id, 'message_id': message_id}
+                bot.process(update, acknowledgement)
                 flush_outbox(db, client)
         except APIError as exc:
             LOG.warning('API unavailable: %s', exc)
@@ -258,6 +279,7 @@ def main():
     commands.add_argument('--import-players', type=Path, metavar='CSV_OR_XLSX')
     commands.add_argument('--backup', type=Path, metavar='DESTINATION', help='Create consistent SQLite backup')
     commands.add_argument('--discover-ids', action='store_true', help='Show IDs from recent messages; only BALE_BOT_TOKEN needed')
+    commands.add_argument('--logs', type=int, nargs='?', const=30, metavar='N', help='Show last N agent trace logs from database')
     args = parser.parse_args()
     load_env()
     path = args.database or Path(os.getenv('DATABASE_PATH', 'data/sans.sqlite3'))
@@ -278,6 +300,21 @@ def main():
                 print(f'chat_id={chat_id} user_id={user_id} type={kind}')
             if not found:
                 print('Send /id to the bot privately and in the admin group, then run this command again.')
+            return
+        if args.logs is not None:
+            db = Database(path)
+            try:
+                rows = db.recent_agent_logs(args.logs)
+                if not rows:
+                    print('No agent logs recorded yet.')
+                for r in rows:
+                    print(
+                        f"#{r['id']} [{r['created_at']}] {r['event']} "
+                        f"chat={r['chat_id']} user={r['user_id']}({r['sender_name']}) "
+                        f"{r['duration_ms']}ms | {r['summary']} | {r['details']}"
+                    )
+            finally:
+                db.close()
             return
         # Backups also acquire the installation lock: stop the bot first.
         with instance_lock(path):

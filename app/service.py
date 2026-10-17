@@ -149,6 +149,80 @@ class Service:
                 f"#{r['id']} {r['name']}" for r in matches))
         raise UserError('بازیکن پیدا نشد؛ ابتدا نام کامل او را ثبت کنید.')
 
+    def ensure_player(self, name, note='', actor='agent'):
+        clean = text(name, 'نام')
+        norm = normalize(clean)
+        row = self.db.one('SELECT * FROM players WHERE normalized_name=?', (norm,))
+        if row:
+            if note and note.strip() and note.strip() not in (row['note'] or ''):
+                updated_note = ((row['note'] + ' | ' if row['note'] else '') + note.strip())[:500]
+                self.db.execute('UPDATE players SET note=? WHERE id=?', (updated_note, row['id']))
+            return self.db.one('SELECT * FROM players WHERE id=?', (row['id'],))
+        cur = self.db.execute(
+            'INSERT INTO players(name, normalized_name, note) VALUES (?,?,?)',
+            (clean, norm, text(note or '', 'توضیح', False)),
+        )
+        self.db.audit(actor, 'new_player', {'name': clean, 'note': note or ''})
+        return self.db.one('SELECT * FROM players WHERE id=?', (cur.lastrowid,))
+
+    def save_session_flexible(self, title=None, when_text=None, location=None,
+                              person_fee=None, venue_cost=None, note=None,
+                              session_ref=None, actor='agent'):
+        """Create or update a session without requiring an exact timestamp (supports historical/incomplete sessions)."""
+        existing = None
+        if session_ref not in (None, '', 0, '0'):
+            try:
+                existing = self.session(session_ref, draft=False)
+            except UserError:
+                existing = None
+        if existing is None and title:
+            existing = self.db.one('SELECT * FROM sessions WHERE title=?', (str(title).strip(),))
+
+        session_at = None
+        if when_text and str(when_text).strip():
+            try:
+                session_at = parse_session_datetime(str(when_text).strip())
+            except UserError:
+                session_at = None
+
+        if existing is None:
+            clean_title = text(title or (f'سانس {when_text}' if when_text else f'سانس #{int(self.db.one("SELECT COUNT(*)+1 AS n FROM sessions")["n"])}'), 'عنوان سانس')
+            if self.db.one('SELECT id FROM sessions WHERE title=?', (clean_title,)):
+                clean_title = f"{clean_title} ({int(self.db.one('SELECT COUNT(*)+1 AS n FROM sessions')['n'])})"
+            w_text = text(str(when_text or ''), 'تاریخ سانس', False)
+            loc = text(str(location if location is not None else DEFAULTS['location']), 'محل', False)
+            fee = integer(person_fee if person_fee is not None else DEFAULTS['person_fee'], 'سهم هر نفر', 0)
+            v_cost = None if venue_cost is None else integer(venue_cost, 'هزینه زمین', 0)
+            s_note = text(str(note or ''), 'توضیح', False)
+            cur = self.db.execute(
+                '''INSERT INTO sessions(title,when_text,session_at,location,venue_cost,person_fee,note)
+                   VALUES (?,?,?,?,?,?,?)''',
+                (clean_title, w_text, session_at, loc, v_cost, fee, s_note),
+            )
+            self.db.audit(actor, 'new_session_flexible', {'id': cur.lastrowid, 'title': clean_title})
+            return self.db.one('SELECT * FROM sessions WHERE id=?', (cur.lastrowid,))
+        else:
+            updates = {}
+            if title and str(title).strip() and str(title).strip() != existing['title']:
+                updates['title'] = text(str(title), 'عنوان سانس')
+            if when_text is not None:
+                updates['when_text'] = text(str(when_text), 'تاریخ سانس', False)
+                if session_at:
+                    updates['session_at'] = session_at
+            if location is not None:
+                updates['location'] = text(str(location), 'محل', False)
+            if person_fee is not None:
+                updates['person_fee'] = integer(person_fee, 'سهم هر نفر', 0)
+            if venue_cost is not None:
+                updates['venue_cost'] = integer(venue_cost, 'هزینه زمین', 0)
+            if note is not None:
+                updates['note'] = text(str(note), 'توضیح', False)
+            for k, v in updates.items():
+                self.db.execute(f'UPDATE sessions SET {k}=? WHERE id=?', (v, existing['id']))
+            if updates:
+                self.db.audit(actor, 'update_session_flexible', {'id': existing['id'], **updates})
+            return self.db.one('SELECT * FROM sessions WHERE id=?', (existing['id'],))
+
     def linked(self, user_id):
         return self.db.one('SELECT * FROM players WHERE bale_id=?', (user_id,))
 

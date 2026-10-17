@@ -20,17 +20,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     when_text TEXT NOT NULL DEFAULT '',
     session_at TEXT,
     location TEXT NOT NULL DEFAULT '',
-    venue_cost INTEGER CHECK(venue_cost >= 0),
-    person_fee INTEGER CHECK(person_fee > 0),
+    venue_cost INTEGER CHECK(venue_cost IS NULL OR venue_cost >= 0),
+    person_fee INTEGER NOT NULL DEFAULT 0 CHECK(person_fee >= 0),
     note TEXT NOT NULL DEFAULT '',
     finalized INTEGER NOT NULL DEFAULT 0 CHECK(finalized IN (0, 1))
 );
-CREATE TRIGGER IF NOT EXISTS sessions_require_session_at
-BEFORE INSERT ON sessions
-WHEN NEW.session_at IS NULL OR trim(NEW.session_at) = ''
-BEGIN
-    SELECT RAISE(ABORT, 'new sessions require session_at');
-END;
 CREATE TABLE IF NOT EXISTS attendance (
     session_id INTEGER NOT NULL REFERENCES sessions(id),
     player_id INTEGER NOT NULL REFERENCES players(id),
@@ -77,6 +71,28 @@ CREATE TABLE IF NOT EXISTS conversations (
     history TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY(chat_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    sender_name TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT 'user',
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id, id);
+CREATE TABLE IF NOT EXISTS agent_logs (
+    id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL DEFAULT 0,
+    user_id INTEGER NOT NULL DEFAULT 0,
+    sender_name TEXT NOT NULL DEFAULT '',
+    event TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    details TEXT NOT NULL DEFAULT '{}',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_agent_logs_id ON agent_logs(id DESC);
 CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY,
     actor TEXT NOT NULL,

@@ -69,6 +69,15 @@ state formats.
 - [x] AC-008: A bare greeting can never trigger a domain action or create a
   pending proposal; when the AI is unavailable or returns an invalid command the
   user still receives one short fixed greeting line instead of a technical error.
+- [x] AC-009: Only private chats and the configured admin group are active;
+  messages, media, callbacks, acknowledgements, AI calls, and side effects from
+  every other group or supergroup are ignored before routing.
+- [x] AC-010: Every valid sender in the configured admin group has admin
+  capabilities, while private-chat users retain ordinary user capabilities and
+  never receive group-admin access.
+- [x] AC-011: Private `/start` guidance contains only private-user capabilities;
+  a successful immediate acknowledgement is edited into the final response,
+  while failed or unsuitable edits fall back to the normal outbound message.
 
 ## Test Mapping
 
@@ -79,7 +88,7 @@ state formats.
 - AC-004 -> existing integration and financial tests in `tests/test_sans.py`
 - AC-005 -> `tests/test_sans.py::PermissionAndConversationTests::test_group_reply_to_bot_is_addressed_without_bot_name` and
   `test_group_reply_to_another_user_is_not_addressed` and
-  `test_non_admin_group_mention_gets_public_response_without_admin_access` and
+  `test_every_group_member_gets_admin_access_in_designated_group` and
   `test_bot_username_mention_is_a_valid_group_trigger`
 - AC-006 -> `tests/test_sans.py::PermissionAndConversationTests::test_group_only_responds_when_addressed` and
   `test_bare_private_greeting_reaches_ai_without_side_effect` and
@@ -90,6 +99,16 @@ state formats.
 - AC-008 -> `tests/test_sans.py::PermissionAndConversationTests::test_bare_greeting_never_runs_a_model_action` and
   `test_bare_greeting_falls_back_when_the_model_fails` and
   `test_greeting_caption_on_a_receipt_keeps_the_receipt_flow`
+- AC-009 -> `tests/test_sans.py::PermissionAndConversationTests::test_unauthorized_group_is_ignored_before_any_side_effect` and
+  `test_unauthorized_group_callback_is_ignored_without_callback_answer` and
+  `test_acknowledgement_targets_only_messages_the_bot_will_process`
+- AC-010 -> `tests/test_sans.py::PermissionAndConversationTests::test_all_group_members_can_manage_only_in_designated_group` and
+  `test_every_group_member_gets_admin_access_in_designated_group` and
+  `test_all_members_policy_does_not_grant_private_management`
+- AC-011 -> `tests/test_sans.py::PermissionAndConversationTests::test_private_start_gives_private_user_guidance_only`,
+  `test_final_response_edits_acknowledgement_message`, and
+  `test_failed_acknowledgement_edit_falls_back_to_new_message`, and
+  `test_media_response_keeps_normal_send_path_after_acknowledgement`
 
 ## Safety Constraints
 
@@ -113,6 +132,14 @@ This is the next implementation boundary, not a claim that the migration is
 complete. It should be split into small patches if routing and persistence do
 not have the same risk profile.
 
+Revision (2026-10-17): AC-009 and AC-010 are now implemented at the update
+boundary. The configured `ADMIN_GROUP_ID` is the sole active group boundary;
+all members of that group have admin capabilities, while legacy user allowlist
+configuration is retained only for compatibility and is no longer required.
+Unauthorized group updates are consumed for polling-offset bookkeeping but do
+not create message/agent logs, conversation state, receipts, proposals, or
+outbound messages.
+
 Revision (2026-10-16): AC-006 previously required a fixed reply for a bare
 greeting without an AI call. Real usage showed that the fixed line read as a
 canned answer and hid the assistant, so a bare greeting now goes through the
@@ -122,3 +149,9 @@ fallback line (`GREETING_REPLY` in `app/bot.py`) is fixed. A bare greeting is
 answered with a single message, so it receives no immediate "processing" notice
 from `Bot.acknowledgement_chat()`. `content/bot-content.json` carries the
 matching prompt rule; restart the service after editing it.
+
+Revision (2026-10-17): AC-011 is implemented without a schema change. The
+polling boundary retains the message id returned by `sendMessage`, queues
+`editMessageText` for short final responses, and converts an edit failure to a
+normal `sendMessage` fallback. Long responses continue to use the existing
+chunking behavior, and media/multistep responses keep the normal send path.
