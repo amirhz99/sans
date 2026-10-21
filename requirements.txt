@@ -1,0 +1,5 @@
+# Runtime dependencies of the AI layer (app/agent.py, app/clients.py).
+# Everything else in the project uses the Python standard library only.
+langchain-core==1.6.11
+langchain-openai==1.7.2
+langgraph==1.2.15
