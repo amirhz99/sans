@@ -28,6 +28,7 @@ class Config:
     bot_name: str = 'مسئول'
     reminder_hours: int = 24
     admin_access: str = 'allowlist'
+    ai_fallback_models: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls):
@@ -52,6 +53,21 @@ class Config:
         hours = int(os.getenv('REMINDER_HOURS', '24'))
         if hours < 0:
             raise ValueError('REMINDER_HOURS must be non-negative')
+        model = os.environ['AI_MODEL']
+        fallbacks = parse_fallback_models(
+            os.getenv('AI_FALLBACK_MODELS', os.getenv('AI_FALLBACK_MODEL', '')), model)
         return cls(os.environ['BALE_BOT_TOKEN'], int(os.environ['ADMIN_GROUP_ID']),
-                   admins, url, os.environ['AI_API_KEY'], os.environ['AI_MODEL'],
-                   database, os.getenv('BOT_NAME', 'مسئول'), hours, access)
+                   admins, url, os.environ['AI_API_KEY'], model,
+                   database, os.getenv('BOT_NAME', 'مسئول'), hours, access, fallbacks)
+
+
+def parse_fallback_models(raw, primary=''):
+    """Parse a comma-separated fallback model list.
+
+    Order is preserved so operators can express preference; blanks, duplicates
+    and the primary model are dropped because they would only repeat a failure.
+    """
+    if not isinstance(raw, str):
+        return ()
+    models = (item.strip() for item in raw.split(','))
+    return tuple(dict.fromkeys(model for model in models if model and model != primary))

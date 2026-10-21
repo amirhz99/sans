@@ -1,8 +1,11 @@
+import difflib
+import json
 import re
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .content import CONTENT_PATH, DEFAULTS
+from . import jalali
 
 
 class UserError(ValueError):
@@ -29,27 +32,92 @@ def text(value, label, required=True, limit=500):
     return value.strip()
 
 
+def setting_value_is_explicit(message, key, value):
+    """Return whether a setting value is present in the current user message.
+
+    Conversation history and a reply to an earlier question are deliberately
+    not inputs here.  In particular, an acknowledgement such as «آره انجامش
+    بده» must not become a card number or silently toggle a safety setting.
+    """
+    body = normalize(message)
+    if not body:
+        return False
+    if key == 'approval_required':
+        if not isinstance(value, bool):
+            return False
+        if value:
+            markers = ('تایید', 'تأیید', 'فعال', 'روشن', 'لازم', 'بررسی شود', 'بررسی بشه')
+        else:
+            markers = ('خاموش', 'غیرفعال', 'غیر فعال', 'لازم نیست', 'بدون تایید', 'بدون تأیید')
+        return any(normalize(marker) in body for marker in markers)
+    if not isinstance(value, str) or not value.strip():
+        return False
+    candidate = normalize(value)
+    if candidate in body:
+        return True
+    # Models sometimes remove separators from card numbers while the user
+    # writes them with spaces or dashes; compare the digit run as well.
+    if key == 'card':
+        digits = ''.join(char for char in candidate if char.isdigit())
+        message_digits = ''.join(char for char in body if char.isdigit())
+        return bool(digits) and digits in message_digits
+    return False
+
+
 TEHRAN = ZoneInfo('Asia/Tehran')
 WEEKDAYS = {
     'دوشنبه': 0, 'سه شنبه': 1, 'سه‌شنبه': 1, 'چهارشنبه': 2,
     'پنجشنبه': 3, 'جمعه': 4, 'شنبه': 5, 'یکشنبه': 6, 'یک‌شنبه': 6,
 }
-JALALI_MONTHS = ('فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'مرداد', 'شهریور',
-                 'مهر', 'آبان', 'آذر', 'دی', 'بهمن', 'اسفند')
+JALALI_MONTHS = jalali.MONTHS
+
+
+def _jalali_date(value, now, require_day=True):
+    """Resolve a Jalali phrase («۹ خرداد» or «1405/03/09») to a Gregorian date.
+
+    The year is optional and defaults to the current Jalali year, because every
+    operator writes dates in the Solar Hijri calendar.  ``None`` means the text
+    contains no Jalali date at all.  With ``require_day=False`` a month without
+    a day is treated as historical text instead of an error, while an impossible
+    day still raises.
+    """
+    numeric = re.search(r'(?<!\d)(1[34]\d{2})[-/](\d{1,2})[-/](\d{1,2})(?!\d)', value)
+    if numeric:
+        jy, jm, jd = (int(part) for part in numeric.groups())
+    else:
+        month = next((index for index, name in enumerate(JALALI_MONTHS, 1) if name in value), None)
+        if month is None:
+            return None
+        name = JALALI_MONTHS[month - 1]
+        position = value.find(name)
+        before = re.search(r'(?<!\d)([0-3]?\d)\s*$', value[:position])
+        after = re.search(r'^\s*([0-3]?\d)(?!\d)', value[position + len(name):])
+        day = before or after
+        if not day:
+            if not require_day:
+                return None
+            raise UserError('روز ماه شمسی مشخص نیست؛ مثلاً «۹ خرداد ساعت ۲۱» بنویسید.')
+        year = re.search(r'(?<!\d)(1[34]\d{2})(?!\d)', value)
+        jy = int(year.group(1)) if year else jalali.from_gregorian(now.date())[0]
+        jm, jd = month, int(day.group(1))
+    try:
+        return jalali.to_gregorian(jy, jm, jd)
+    except ValueError:
+        raise UserError('تاریخ سانس معتبر نیست؛ روز و ماه شمسی را بررسی کنید.')
 
 
 def parse_session_datetime(value, now=None):
     """Parse an exact Persian session date/time and return a Tehran ISO value.
 
-    Deliberately does not guess a day period: «ساعت ۹» and «امروز عصر» are
-    rejected because either morning/night or an exact hour is missing.  A
-    weekday means the next occurrence (including today when still upcoming).
+    Jalali dates («۹ خرداد ساعت ۲۱», «1405/03/09 21:00») and Gregorian dates
+    (``YYYY-MM-DD``) are both accepted.  Deliberately does not guess a day
+    period: «ساعت ۹» and «امروز عصر» are rejected because either
+    morning/night or an exact hour is missing.  A weekday means the next
+    occurrence (including today when still upcoming).
     """
     if not isinstance(value, str) or not value.strip():
-        raise UserError('تاریخ و ساعت دقیق سانس را اعلام کنید؛ مثلاً «فردا ساعت ۲۱».')
+        raise UserError('تاریخ و ساعت دقیق سانس را اعلام کنید؛ مثلاً «فردا ساعت ۲۱» یا «۹ خرداد ساعت ۲۱».')
     raw = normalize(value)
-    if any(month in raw for month in JALALI_MONTHS):
-        raise UserError('تبدیل تاریخ ماه‌های تقویم شمسی در این نسخه انجام نمی‌شود؛ «فردا»، روز هفته یا تاریخ YYYY-MM-DD را بنویسید.')
     now = now or datetime.now(TEHRAN)
     if now.tzinfo is None:
         now = now.replace(tzinfo=TEHRAN)
@@ -94,13 +162,17 @@ def parse_session_datetime(value, now=None):
     if hour > 23:
         raise UserError('ساعت سانس معتبر نیست.')
 
+    date_text = raw[:clock.start()] + ' ' + raw[clock.end():]
     target = now.date()
-    explicit = re.search(r'(?<!\d)(20\d{2})[-/]([01]?\d)[-/]([0-3]?\d)(?!\d)', raw)
+    explicit = re.search(r'(?<!\d)(20\d{2})[-/]([01]?\d)[-/]([0-3]?\d)(?!\d)', date_text)
+    jalali_target = _jalali_date(date_text, now)
     if explicit:
         try:
             target = date(int(explicit.group(1)), int(explicit.group(2)), int(explicit.group(3)))
         except ValueError:
             raise UserError('تاریخ سانس معتبر نیست.')
+    elif jalali_target is not None:
+        target = jalali_target
     elif 'پسفردا' in raw:
         target += timedelta(days=2)
     elif 'فردا' in raw:
@@ -122,12 +194,24 @@ def parse_session_datetime(value, now=None):
 
 
 ADMIN_ACTIONS = {'new_player', 'new_session', 'update_session', 'attendance',
-                 'finalize', 'adjustment', 'settings', 'player_note', 'settle'}
+                 'finalize', 'adjustment', 'settings', 'player_note', 'settle',
+                 'player_rename', 'player_merge', 'player_delete'}
+
+SETTING_LABELS = {'card': 'شماره کارت', 'payment_note': 'پیام راهنمای پرداخت',
+                  'approval_required': 'بررسی رسید توسط ادمین'}
 
 
 class Service:
     def __init__(self, db):
         self.db = db
+
+    def require_explicit_setting(self, message, args):
+        if not isinstance(args, dict):
+            raise UserError('کلید و مقدار تنظیم را صریحاً در همین پیام بنویسید.')
+        key = args.get('key')
+        value = args.get('value')
+        if key not in ('card', 'payment_note', 'approval_required') or not setting_value_is_explicit(message, key, value):
+            raise UserError('مقدار تنظیم باید صریحاً در همین پیام نوشته شود؛ پاسخ‌هایی مثل «آره انجامش بده» کافی نیستند.')
 
     def player(self, ref):
         if isinstance(ref, bool) or not isinstance(ref, (str, int)):
@@ -149,7 +233,202 @@ class Service:
                 f"#{r['id']} {r['name']}" for r in matches))
         raise UserError('بازیکن پیدا نشد؛ ابتدا نام کامل او را ثبت کنید.')
 
-    def ensure_player(self, name, note='', actor='agent'):
+    def similar_players(self, name, exclude_id=None):
+        """Return existing players whose name strongly matches ``name``.
+
+        The result is advisory: it stops the agent from creating a second row
+        for a shortened or misspelled name, but a human still decides whether
+        to rename, merge, or force a genuinely new player.
+        """
+        clean = normalize(name)
+        if not clean:
+            return []
+        found = []
+        for row in self.db.all('SELECT * FROM players ORDER BY id'):
+            if exclude_id is not None and row['id'] == exclude_id:
+                continue
+            other = row['normalized_name']
+            ratio = difflib.SequenceMatcher(None, clean, other).ratio()
+            if other == clean:
+                reason = 'نام یکسان'
+            elif min(len(clean), len(other)) >= 3 and (
+                    f' {clean} ' in f' {other} ' or f' {other} ' in f' {clean} '):
+                reason = 'بخشی از نام کامل'
+            elif ratio >= 0.85:
+                # Two full names that only share a family name are different
+                # people («مهیار قهرمان زاده» vs «مهراد قهرمان زاده»); require
+                # the given name to match as well before suggesting a merge.
+                if len(clean.split()) > 1 and len(other.split()) > 1:
+                    given = difflib.SequenceMatcher(None, clean.split()[0], other.split()[0]).ratio()
+                    if given < 0.85:
+                        continue
+                reason = 'املای نزدیک'
+            else:
+                continue
+            found.append({'id': row['id'], 'name': row['name'], 'reason': reason,
+                          'ratio': round(ratio, 2)})
+        found.sort(key=lambda item: (-item['ratio'], item['id']))
+        return found
+
+    def player_usage(self, player_id, ignore_pending=None):
+        """Count every record that refers to a player (used by merge/delete)."""
+        usage = {table: self.db.one(f'SELECT COUNT(*) n FROM {table} WHERE player_id=?',
+                                    (player_id,))['n']
+                 for table in ('attendance', 'ledger', 'receipts')}
+        usage['balance'] = self.balance(player_id)
+        usage['pending'] = self._pending_reference(player_id, ignore=ignore_pending)
+        return usage
+
+    def _pending_reference(self, *player_ids, ignore=None):
+        """Return a pending proposal id that points at one of the players."""
+        wanted = set(player_ids)
+        for row in self.db.all("SELECT id,payload FROM pending WHERE status='pending'"):
+            if ignore is not None and row['id'] == ignore:
+                # The proposal currently being applied refers to the player by
+                # definition; it must not block its own operation.
+                continue
+            try:
+                payload = json.loads(row['payload'])
+            except (TypeError, ValueError):
+                continue
+            stack = [payload]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        if (key in ('player', 'source', 'target') and isinstance(value, int)
+                                and not isinstance(value, bool) and value in wanted):
+                            return row['id']
+                        stack.append(value)
+                elif isinstance(item, list):
+                    stack.extend(item)
+        return None
+
+    def _merge_conflict(self, source, target, ignore_pending=None):
+        """Return why two players must not be merged, or ``None`` when safe."""
+        if source['bale_id'] is not None and target['bale_id'] is not None:
+            return 'هر دو بازیکن به یک حساب بله متصل هستند؛ ادغام دو حساب متصل مجاز نیست.'
+        pending = self._pending_reference(source['id'], target['id'], ignore=ignore_pending)
+        if pending:
+            return f'درخواست منتظر {pending} به یکی از این دو بازیکن اشاره می‌کند؛ اول آن را تأیید یا رد کنید.'
+        guests = {}
+        for row in self.db.all('SELECT session_id,player_id,guests FROM attendance WHERE player_id IN (?,?)',
+                               (source['id'], target['id'])):
+            guests.setdefault(row['session_id'], {})[row['player_id']] = row['guests']
+        for session_id, per_player in guests.items():
+            if (source['id'] in per_player and target['id'] in per_player
+                    and per_player[source['id']] > per_player[target['id']]):
+                return (f'در سانس #{session_id} برای «{source["name"]}» {per_player[source["id"]]} مهمان '
+                        f'و برای «{target["name"]}» {per_player[target["id"]]} مهمان ثبت شده؛ '
+                        'ادغام باعث گم‌شدن مهمان می‌شود.')
+        return None
+
+    def rename_player(self, player_id, new_name, actor='agent'):
+        """Rename a player while keeping the id and the whole history."""
+        player = self.player(player_id)
+        clean = text(new_name, 'نام جدید')
+        norm = normalize(clean)
+        if norm == player['normalized_name']:
+            raise UserError('نام جدید با نام فعلی یکسان است.')
+        clash = self.db.one('SELECT * FROM players WHERE normalized_name=? AND id<>?', (norm, player['id']))
+        if clash:
+            raise UserError(f'این نام قبلاً برای #{clash["id"]} {clash["name"]} ثبت شده؛ '
+                            'برای یکی‌کردن دو رکورد از ادغام استفاده کنید.')
+        self.db.execute('UPDATE players SET name=?, normalized_name=? WHERE id=?',
+                        (clean, norm, player['id']))
+        self.db.audit(actor, 'player_rename', {'player': player['id'], 'old': player['name'], 'new': clean})
+        return {'id': player['id'], 'old': player['name'], 'new': clean}
+
+    def merge_players(self, source_id, target_id, actor='agent', ignore_pending=None):
+        """Move all history from one player to another, then delete the source."""
+        source, target = self.player(source_id), self.player(target_id)
+        if source['id'] == target['id']:
+            raise UserError('مبدأ و مقصد ادغام یک نفر است؛ دو بازیکن متفاوت انتخاب کنید.')
+        conflict = self._merge_conflict(source, target, ignore_pending=ignore_pending)
+        if conflict:
+            raise UserError(conflict)
+        moved = {'attendance': 0, 'ledger': 0, 'receipts': 0}
+        for row in self.db.all('SELECT session_id FROM attendance WHERE player_id=?', (source['id'],)):
+            existing = self.db.one('SELECT 1 FROM attendance WHERE session_id=? AND player_id=?',
+                                   (row['session_id'], target['id']))
+            if existing:
+                self.db.execute('DELETE FROM attendance WHERE session_id=? AND player_id=?',
+                                (row['session_id'], source['id']))
+            else:
+                self.db.execute('UPDATE attendance SET player_id=? WHERE session_id=? AND player_id=?',
+                                (target['id'], row['session_id'], source['id']))
+            moved['attendance'] += 1
+        for table in ('ledger', 'receipts'):
+            # ``ledger.source`` stays untouched on purpose: it is a unique
+            # audit key for the original transaction, not an ownership field.
+            moved[table] = self.db.execute(
+                f'UPDATE {table} SET player_id=? WHERE player_id=?', (target['id'], source['id'])).rowcount
+        note = target['note'] or ''
+        if source['note'] and source['note'] not in note:
+            note = ((note + ' | ') if note else '') + source['note']
+        bale_id = target['bale_id'] if target['bale_id'] is not None else source['bale_id']
+        if source['bale_id'] is not None and target['bale_id'] is None:
+            # Release the unique bale_id before moving it to the target.
+            self.db.execute('UPDATE players SET bale_id=NULL WHERE id=?', (source['id'],))
+        self.db.execute('UPDATE players SET note=?, bale_id=? WHERE id=?', (note[:500], bale_id, target['id']))
+        self.db.execute('DELETE FROM players WHERE id=?', (source['id'],))
+        self.db.audit(actor, 'player_merge', {'source': source['id'], 'source_name': source['name'],
+                                              'target': target['id'], 'target_name': target['name'],
+                                              **moved})
+        return {'source': source['id'], 'target': target['id'],
+                'target_name': target['name'], 'moved': moved}
+
+    def _assert_deletable(self, player, ignore_pending=None):
+        usage = self.player_usage(player['id'], ignore_pending=ignore_pending)
+        if player['bale_id'] is not None or usage['attendance'] or usage['ledger'] or usage['receipts']:
+            raise UserError(f"«{player['name']}» حضور، تراکنش یا رسید ثبت‌شده دارد و حذف نمی‌شود؛ "
+                            'برای حفظ سابقه آن را با بازیکن درست ادغام کنید.')
+        if usage['pending']:
+            raise UserError(f"برای «{player['name']}» درخواست منتظر {usage['pending']} وجود دارد؛ "
+                            'اول آن را تأیید یا رد کنید.')
+
+    def delete_player(self, player_id, actor='agent', ignore_pending=None):
+        """Delete a player only when no record references it."""
+        player = self.player(player_id)
+        self._assert_deletable(player, ignore_pending=ignore_pending)
+        self.db.execute('DELETE FROM players WHERE id=?', (player['id'],))
+        self.db.audit(actor, 'player_delete', {'player': player['id'], 'name': player['name']})
+        return {'id': player['id'], 'name': player['name']}
+
+    def _player_weight(self, row):
+        usage = self.player_usage(row['id'])
+        return (usage['attendance'] + usage['ledger'] + usage['receipts'],
+                len(row['normalized_name']), -row['id'])
+
+    def duplicate_players(self):
+        """Return suspected duplicate pairs, keeping the richer record."""
+        pairs, seen = [], set()
+        for row in self.db.all('SELECT * FROM players ORDER BY id'):
+            for match in self.similar_players(row['name'], exclude_id=row['id']):
+                key = tuple(sorted((row['id'], match['id'])))
+                if key in seen:
+                    continue
+                seen.add(key)
+                other = self.db.one('SELECT * FROM players WHERE id=?', (match['id'],))
+                keep, drop = ((row, other) if self._player_weight(row) >= self._player_weight(other)
+                              else (other, row))
+                pairs.append({'keep': {'id': keep['id'], 'name': keep['name']},
+                              'drop': {'id': drop['id'], 'name': drop['name']},
+                              'reason': match['reason'], 'ratio': match['ratio']})
+        return pairs
+
+    def duplicates_report(self):
+        pairs = self.duplicate_players()
+        if not pairs:
+            return 'هیچ نام تکراری یا ناقصی پیدا نشد؛ هویت بازیکن‌ها یکدست است.'
+        lines = ['نام‌های مشکوک به تکرار:']
+        for item in pairs:
+            keep, drop = item['keep'], item['drop']
+            lines.append(f"• #{drop['id']} {drop['name']} ← #{keep['id']} {keep['name']} "
+                         f"({item['reason']}، شباهت {item['ratio']}) | پیشنهاد: /merge {drop['id']} {keep['id']}")
+        return '\n'.join(lines)
+
+    def ensure_player(self, name, note='', actor='agent', allow_similar=False):
         clean = text(name, 'نام')
         norm = normalize(clean)
         row = self.db.one('SELECT * FROM players WHERE normalized_name=?', (norm,))
@@ -158,6 +437,12 @@ class Service:
                 updated_note = ((row['note'] + ' | ' if row['note'] else '') + note.strip())[:500]
                 self.db.execute('UPDATE players SET note=? WHERE id=?', (updated_note, row['id']))
             return self.db.one('SELECT * FROM players WHERE id=?', (row['id'],))
+        similar = [] if allow_similar else self.similar_players(clean)
+        if similar:
+            raise UserError('بازیکن جدید ساخته نشد؛ این نام با بازیکن‌های موجود مشابه است:\n' + '\n'.join(
+                f"#{item['id']} {item['name']}" for item in similar) +
+                '\nاگر منظورتان یکی از آن‌هاست همان را با نام کامل یا شناسه انتخاب کنید؛ '
+                'اگر واقعاً فرد جدیدی است، نام کامل‌تری بفرستید یا صریحاً بگویید «بازیکن جدید بساز».')
         cur = self.db.execute(
             'INSERT INTO players(name, normalized_name, note) VALUES (?,?,?)',
             (clean, norm, text(note or '', 'توضیح', False)),
@@ -180,8 +465,12 @@ class Service:
 
         session_at = None
         if when_text and str(when_text).strip():
+            phrase = str(when_text).strip()
+            # Historical text may lack a day or an exact hour, but a Jalali day
+            # that does not exist must never be stored silently.
+            _jalali_date(normalize(phrase), datetime.now(TEHRAN), require_day=False)
             try:
-                session_at = parse_session_datetime(str(when_text).strip())
+                session_at = parse_session_datetime(phrase)
             except UserError:
                 session_at = None
 
@@ -228,8 +517,10 @@ class Service:
 
     @staticmethod
     def session_time(row):
-        """Return the exact new format, or the untouched legacy text."""
-        return row['session_at'] or row['when_text'] or 'نامشخص'
+        """Return the readable Jalali time, or the untouched legacy text."""
+        if row['session_at']:
+            return Service.session_at_display(row['session_at'], with_zone=False)
+        return row['when_text'] or 'نامشخص'
 
     @staticmethod
     def session_time_display(row):
@@ -237,13 +528,14 @@ class Service:
         return prefix + Service.session_time(row)
 
     @staticmethod
-    def session_at_display(value):
-        """Render a stored timestamp as an unambiguous Tehran date and time."""
+    def session_at_display(value, with_zone=True):
+        """Render a stored timestamp in the Jalali calendar Tehran time."""
         try:
             parsed = datetime.fromisoformat(value).astimezone(TEHRAN)
         except (TypeError, ValueError):
             return str(value)
-        return f'{parsed:%Y-%m-%d}، ساعت {parsed:%H:%M} (Asia/Tehran)'
+        text = f'{jalali.format_date(parsed.date())}، ساعت {jalali.persian_digits(f"{parsed:%H:%M}")}'
+        return text + ' (Asia/Tehran)' if with_zone else text
 
     def session(self, ref=None, draft=False):
         if isinstance(ref, bool) or (ref is not None and not isinstance(ref, (str, int))):
@@ -365,8 +657,13 @@ class Service:
             lines.append(f"رسید منتظر #{r['id']}: {r['name']}، {r['amount']:,} تومان؛ /approve {r['id']} یا /reject {r['id']}")
         return '\n'.join(lines)
 
-    def prepare(self, action, args):
-        """Resolve ambiguous names now, validate all input, return an immutable proposal."""
+    def prepare(self, action, args, ignore_pending=None):
+        """Resolve ambiguous names now, validate all input, return an immutable proposal.
+
+        ``ignore_pending`` is the proposal currently being applied; without it a
+        merge/delete proposal would block itself because it references its own
+        target player.
+        """
         if action not in ADMIN_ACTIONS | {'declare_debt'} or not isinstance(args, dict):
             raise UserError('درخواست مدیریتی معتبر نیست.')
         a = {}
@@ -406,6 +703,27 @@ class Service:
                     raise UserError('سهم ثابت هر نفر برای این سانس چقدر است؟')
                 if not self.db.one('SELECT 1 FROM attendance WHERE session_id=?', (s['id'],)):
                     raise UserError('ابتدا حاضران سانس را ثبت کنید.')
+        elif action == 'player_rename':
+            p = self.player(args.get('player', ''))
+            a = {'player': p['id'], 'name': text(args.get('name'), 'نام جدید')}
+            norm = normalize(a['name'])
+            if norm == p['normalized_name']:
+                raise UserError('نام جدید با نام فعلی یکسان است.')
+            if self.db.one('SELECT id FROM players WHERE normalized_name=? AND id<>?', (norm, p['id'])):
+                raise UserError('این نام قبلاً ثبت شده؛ برای یکی‌کردن دو رکورد از ادغام استفاده کنید.')
+        elif action == 'player_merge':
+            source = self.player(args.get('source', ''))
+            target = self.player(args.get('target', ''))
+            if source['id'] == target['id']:
+                raise UserError('مبدأ و مقصد ادغام باید دو بازیکن متفاوت باشند.')
+            conflict = self._merge_conflict(source, target, ignore_pending=ignore_pending)
+            if conflict:
+                raise UserError(conflict)
+            a = {'source': source['id'], 'target': target['id']}
+        elif action == 'player_delete':
+            p = self.player(args.get('player', ''))
+            self._assert_deletable(p, ignore_pending=ignore_pending)
+            a = {'player': p['id']}
         elif action in ('adjustment', 'player_note', 'declare_debt'):
             a['player'] = self.player(args.get('player', ''))['id']
             a['note'] = text(args.get('note', 'بدهی اعلام‌شده توسط خود فرد'), 'توضیح', False)
@@ -434,8 +752,47 @@ class Service:
             a = {'key': key, 'value': value}
         return {'action': action, 'args': a}
 
+    def setting_display(self, key, value):
+        """Render a stored setting value for a human reader."""
+        if key == 'approval_required':
+            return ('فعال؛ هر رسید توسط ادمین بررسی می‌شود' if value == 'true'
+                    else 'غیرفعال؛ رسیدها خودکار تأیید می‌شوند')
+        return value or '—'
+
+    def settings_preview(self, a):
+        """Describe one settings change without applying it."""
+        key, value = a['key'], a['value']
+        lines = ['تغییر تنظیمات',
+                 f'{SETTING_LABELS[key]}: {self.setting_display(key, value)}']
+        current = self.db.setting(key)
+        if current is not None and current != value:
+            lines.append(f'مقدار فعلی: {self.setting_display(key, current)}')
+        if key == 'approval_required' and value == 'false':
+            lines.append('هشدار: بدون بررسی بانکی، هر رسید با مبلغ اعلامی کاربر از بدهی کم خواهد شد.')
+        return '\n'.join(lines)
+
     def preview(self, command):
         action, a = command['action'], command['args']
+        if action == 'settings':
+            return self.settings_preview(a)
+        if action == 'player_merge':
+            source, target = self.player(a['source']), self.player(a['target'])
+            usage = self.player_usage(source['id'])
+            return '\n'.join([
+                'ادغام بازیکن',
+                f"حذف‌شونده: #{source['id']} {source['name']}",
+                f"باقی‌مانده: #{target['id']} {target['name']}",
+                f"تاریخچهٔ منتقل‌شده: {usage['attendance']} حضور، {usage['ledger']} تراکنش، {usage['receipts']} رسید",
+                'شناسهٔ باقی‌مانده و همهٔ سوابقش حفظ می‌شود؛ رکورد تکراری حذف می‌شود.',
+            ])
+        if action == 'player_rename':
+            p = self.player(a['player'])
+            return '\n'.join(['تغییرنام بازیکن', f"#{p['id']} «{p['name']}» ← «{a['name']}»",
+                              'شناسه و کل تاریخچه حفظ می‌شود.'])
+        if action == 'player_delete':
+            p = self.player(a['player'])
+            return '\n'.join(['حذف بازیکن', f"#{p['id']} {p['name']}",
+                              'این بازیکن هیچ حضور، تراکنش یا رسیدی ندارد.'])
         labels = {'new_player': 'ثبت بازیکن', 'new_session': 'ثبت سانس', 'update_session': 'تکمیل سانس',
                   'attendance': 'ثبت/اصلاح حضور', 'finalize': 'نهایی‌سازی بدهی سانس',
                   'adjustment': 'اصلاح حساب', 'declare_debt': 'ثبت بدهی اعلام‌شده',
@@ -463,8 +820,6 @@ class Service:
                 total += amount
                 lines.append(f"{row['name']}: {row['guests']} مهمان، {amount:,} تومان")
             lines.append(f'جمع بدهی جدید: {total:,} تومان؛ هزینهٔ زمین در محاسبه دخالت ندارد.')
-        if action == 'settings' and a == {'key': 'approval_required', 'value': 'false'}:
-            lines.append('هشدار: بدون بررسی بانکی، هر رسید با مبلغ اعلامی کاربر از بدهی کم خواهد شد.')
         return '\n'.join(lines)
 
     def apply(self, command, actor, source):
@@ -474,7 +829,10 @@ class Service:
         raw = dict(a)
         if action == 'settings' and a['key'] == 'approval_required':
             raw['value'] = a['value'] == 'true'
-        a = self.prepare(action, raw)['args']
+        ignored = None
+        if isinstance(source, str) and source.startswith('proposal:'):
+            ignored = source.split(':')[1] or None
+        a = self.prepare(action, raw, ignore_pending=ignored)['args']
         if action == 'new_player':
             self.db.execute('INSERT INTO players(name, normalized_name, note) VALUES (?,?,?)',
                             (a['name'], normalize(a['name']), a['note']))
@@ -516,9 +874,22 @@ class Service:
             self.db.set_setting(a['key'], a['value'])
         elif action == 'player_note':
             self.db.execute('UPDATE players SET note=? WHERE id=?', (a['note'], a['player']))
-        self.db.audit(actor, action, a)
+        elif action == 'player_rename':
+            self.rename_player(a['player'], a['name'], actor)
+        elif action == 'player_merge':
+            self.merge_players(a['source'], a['target'], actor, ignore_pending=ignored)
+        elif action == 'player_delete':
+            self.delete_player(a['player'], actor, ignore_pending=ignored)
+        else:
+            # Unknown actions must never be acknowledged as applied.
+            raise UserError('درخواست مدیریتی معتبر نیست.')
+        if action not in ('player_rename', 'player_merge', 'player_delete'):
+            # The three identity operations record their own detailed audit row.
+            self.db.audit(actor, action, a)
 
     def bind(self, player_id, user_id, actor):
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            raise UserError('شناسهٔ کاربر بله معتبر نیست.')
         p = self.player(player_id)
         if p['bale_id'] is not None or self.linked(user_id):
             raise UserError('این بازیکن یا حساب بله قبلاً متصل شده است؛ اتصال دوباره مجاز نیست.')

@@ -35,7 +35,7 @@ class Bot:
 
     def is_admin(self, chat_id, user_id):
         return (isinstance(user_id, int) and not isinstance(user_id, bool) and user_id > 0
-                and isinstance(chat_id, int) and chat_id < 0
+                and isinstance(chat_id, int) and not isinstance(chat_id, bool)
                 and chat_id == self.config.admin_group)
 
     def allowed_chat(self, chat):
@@ -180,7 +180,26 @@ class Bot:
                         (ident, kind, dumps(payload), user_id, chat_id, self.db.revision, int(time.time())))
         return ident
 
+    def propose_settings(self, changes, user_id, chat_id):
+        """Create one approval proposal for one or more settings changes.
+
+        ``changes`` maps setting keys to their new values.  Nothing is written
+        until an admin presses «تأیید»; the model can only prepare the
+        proposal.
+        """
+        if not isinstance(changes, dict) or not changes:
+            raise UserError('مقدار تنظیم مشخص نشد؛ کلید و مقدار را صریحاً بنویسید.')
+        commands = [self.service.prepare('settings', {'key': key, 'value': value})
+                    for key, value in changes.items()]
+        ident = self.new_pending('commands', commands, user_id, chat_id)
+        preview = '\n\n'.join(self.service.preview(c) for c in commands)
+        return (preview + f'\n\nاین تغییر با تأیید شما اعمال می‌شود. کد: {ident}',
+                buttons('yes:' + ident, 'no:' + ident))
+
     def propose(self, command, user_id, chat_id):
+        if command['action'] == 'settings':
+            args = command.get('args', {})
+            return self.propose_settings({args.get('key'): args.get('value')}, user_id, chat_id)
         if command['action'] == 'batch':
             raw = command.get('args', {}).get('commands')
             if not isinstance(raw, list) or not 1 <= len(raw) <= 20:
@@ -333,6 +352,7 @@ class Bot:
                                 admin,
                                 sender=sender,
                                 llm_override=getattr(self.ai, 'llm_override', None),
+                                current_message=body,
                             )
                             if effects.get('last_session_id'):
                                 s = self.service.session(effects['last_session_id'])
@@ -415,10 +435,18 @@ class Bot:
                     reply, markup = self.request_self_debt(args, user_id, chat_id)
                 elif not admin:
                     raise UserError('این عملیات فقط برای ادمین‌های مجاز در گروه مدیریتی است.')
+                elif action == 'duplicates':
+                    reply = self.service.duplicates_report()
+                elif action == 'player_rename':
+                    reply = self.rename_player(args.get('player'), args.get('name'), user_id)
                 elif action in ADMIN_ACTIONS or action == 'batch':
+                    if action == 'settings':
+                        self.service.require_explicit_setting(body, args)
                     reply, markup = self.propose(command, user_id, chat_id)
                 elif action == 'list_players':
                     reply = '\n'.join(f"#{p['id']} {p['name']}" for p in self.db.all('SELECT * FROM players')) or 'بازیکنی ثبت نشده.'
+                    if admin and self.service.duplicate_players():
+                        reply += '\n\n⚠️ نام‌های مشکوک به تکرار پیدا شد؛ /duplicates را ببینید.'
                 elif action == 'list_sessions':
                     reply = '\n'.join(f"#{s['id']} {s['title']} — {self.service.session_time_display(s)} — {'نهایی' if s['finalized'] else 'باز'}" for s in self.db.all('SELECT * FROM sessions ORDER BY id DESC')) or 'سانسی ثبت نشده.'
                 elif action == 'report':
@@ -432,6 +460,8 @@ class Bot:
                     reply = self.review(integer(args.get('id'), 'شناسهٔ رسید', 1), action == 'approve', user_id)
                 elif action == 'link':
                     reply, markup = self.resolve_claim(args['id'], args['player'], user_id)
+                elif action == 'bind':
+                    reply, markup = self.bind_profile(args, msg, user_id, chat_id)
                 else:
                     raise UserError('درخواست شناخته نشد؛ /help را ببینید یا واضح‌تر بنویسید.')
         except (UserError, APIError, sqlite3.IntegrityError) as exc:
@@ -486,11 +516,45 @@ class Bot:
             key = {'debt': 'player', 'session': 'session', 'identify': 'name', 'amount': 'amount'}.get(name, 'id')
             return {'action': {'session': 'session_info', 'amount': 'payment_amount'}.get(name, name),
                     'args': {key: rest} if rest else {}}
+        if name == 'setcard' and admin:
+            if not rest:
+                raise UserError('/setcard شماره کارت و نام صاحب حساب')
+            return {'action': 'settings', 'args': {'key': 'card', 'value': rest}}
         if name == 'link' and admin:
             pieces = rest.split(maxsplit=1)
             if len(pieces) != 2:
                 raise UserError('/link کد_درخواست شناسه_بازیکن')
             return {'action': 'link', 'args': {'id': pieces[0], 'player': pieces[1]}}
+        if name == 'bind' and admin:
+            if not rest:
+                raise UserError('/bind شناسه یا نام بازیکن [@username] و ریپلای به پروفایل')
+            pieces = rest.rsplit(maxsplit=1)
+            if len(pieces) == 2 and pieces[1].startswith('@'):
+                player, username = pieces
+                if not player.strip():
+                    raise UserError('/bind شناسه یا نام بازیکن [@username] و ریپلای به پروفایل')
+                return {'action': 'bind', 'args': {'player': player, 'username': username}}
+            return {'action': 'bind', 'args': {'player': rest}}
+        if name in ('merge', 'rename', 'delplayer', 'newplayer', 'duplicates') and admin:
+            if name == 'duplicates':
+                return {'action': 'duplicates', 'args': {}}
+            pieces = rest.split(maxsplit=1)
+            if name == 'merge':
+                if len(pieces) != 2:
+                    raise UserError('/merge رکورد_تکراری رکورد_اصلی — مثلاً /merge 12 18 '
+                                    '(برای نام‌های چندکلمه‌ای از شناسه استفاده کنید)')
+                return {'action': 'player_merge', 'args': {'source': pieces[0], 'target': pieces[1]}}
+            if name == 'rename':
+                if len(pieces) != 2:
+                    raise UserError('/rename شناسه_یا_نام_فعلی نام کامل جدید — مثلاً /rename 15 محمد مهدی موحد')
+                return {'action': 'player_rename', 'args': {'player': pieces[0], 'name': pieces[1]}}
+            if name == 'delplayer':
+                if len(pieces) != 1:
+                    raise UserError('/delplayer شناسه_یا_نام_بازیکن')
+                return {'action': 'player_delete', 'args': {'player': pieces[0]}}
+            if not rest:
+                raise UserError('/newplayer نام کامل بازیکن')
+            return {'action': 'new_player', 'args': {'name': rest}}
         if name == 'do' and admin:
             try:
                 obj = json.loads(rest)
@@ -500,6 +564,13 @@ class Bot:
             except ValueError:
                 raise UserError('پس از /do یک JSON معتبر شامل action و args بفرستید.') from None
         return {'action': 'help', 'args': {}}
+
+    def rename_player(self, player_ref, new_name, actor):
+        """Rename directly: it is reversible and keeps the id and history."""
+        player = self.service.player(player_ref)
+        result = self.service.rename_player(player['id'], new_name, actor)
+        return (f"نام #{result['id']} از «{result['old']}» به «{result['new']}» تغییر کرد؛ "
+                'شناسه و کل تاریخچه حفظ شد.')
 
     def identify(self, name, user_id, chat_id, sender=None, phone_number=None):
         if self.service.linked(user_id):
@@ -580,6 +651,18 @@ class Bot:
         return note
 
     def pending_summary(self, row):
+        if row['kind'] == 'binding':
+            payload = json.loads(row['payload'])
+            return (f"درخواست اتصال {row['id']}\nبازیکن: #{payload['player']} {payload['player_name']}\n"
+                    f"شناسهٔ داخلی بله: {payload['user_id']}\n"
+                    f"username: @{payload['username']}\nآیا این حساب به این بازیکن متصل شود؟")
+        if row['kind'] == 'commands':
+            try:
+                commands = json.loads(row['payload'])
+                preview = '\n\n'.join(self.service.preview(c) for c in commands)
+            except (TypeError, ValueError, UserError, KeyError):
+                return f"{row['id']} | {row['kind']} | {row['payload']}"
+            return f"درخواست {row['id']} — منتظر تأیید ادمین\n{preview}"
         if row['kind'] not in ('identity', 'claim'):
             return f"{row['id']} | {row['kind']} | {row['payload']}"
         payload = json.loads(row['payload'])
@@ -599,12 +682,133 @@ class Bot:
         return (self.identity_note(ident, payload, player) + '\nآیا این حساب به این بازیکن متصل شود؟',
                 buttons('yes:' + ident, 'no:' + ident))
 
+    @staticmethod
+    def _profile_user(profile):
+        if not isinstance(profile, dict):
+            return None
+        user_id = profile.get('id')
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            return None
+        if profile.get('is_bot') is True:
+            return None
+        username = profile.get('username')
+        if username is not None and (not isinstance(username, str) or not username.strip()):
+            return None
+        return user_id, (username.strip().lstrip('@').casefold() if isinstance(username, str) else '')
+
+    @classmethod
+    def extract_profile_user(cls, message):
+        """Return a trusted structured profile, never resolving message text."""
+        if not isinstance(message, dict):
+            return None
+        contact = message.get('contact')
+        if isinstance(contact, dict) and 'id' not in contact:
+            contact = dict(contact)
+            contact['id'] = contact.get('user_id')
+        # A contact/forward identifies its target, while ``from`` identifies
+        # the person who sent the wrapper message. Prefer the target fields to
+        # avoid binding the admin who forwarded a contact.
+        candidates = [contact, message.get('forward_from')]
+        for key in ('forward_origin', 'forwarded_from'):
+            origin = message.get(key)
+            if isinstance(origin, dict):
+                candidates.append(origin.get('sender_user'))
+                candidates.append(origin.get('from'))
+        candidates.append(message.get('from'))
+        for candidate in candidates:
+            profile = cls._profile_user(candidate)
+            if profile:
+                return profile
+        return None
+
+    def bind_profile(self, args, message, actor, chat_id):
+        if not self.is_admin(chat_id, actor):
+            raise UserError('اتصال حساب فقط برای ادمین‌های گروه مدیریتی مجاز است.')
+        reply = message.get('reply_to_message') if isinstance(message, dict) else None
+        profile = self.extract_profile_user(reply)
+        if not profile:
+            raise UserError('برای /bind باید به پیام پروفایل کاربر ریپلای کنید؛ شناسهٔ عددی معتبر و غیررباتی لازم است.')
+        user_id, profile_username = profile
+        requested_username = args.get('username')
+        if requested_username is not None:
+            if not isinstance(requested_username, str) or not requested_username.strip():
+                raise UserError('username معتبر نیست.')
+            requested_username = requested_username.strip().lstrip('@').casefold()
+            if not profile_username or requested_username != profile_username:
+                raise UserError('username اعلام‌شده با username پروفایل یکسان نیست.')
+        player = self.service.player(args.get('player'))
+        if player['bale_id'] is not None or self.service.linked(user_id):
+            raise UserError('این بازیکن یا حساب بله قبلاً متصل شده است؛ اتصال دوباره مجاز نیست.')
+        for pending in self.db.all("SELECT payload FROM pending WHERE kind='binding' AND status='pending'"):
+            try:
+                pending_payload = json.loads(pending['payload'])
+            except (TypeError, ValueError):
+                continue
+            if pending_payload.get('player') == player['id'] or pending_payload.get('user_id') == user_id:
+                raise UserError('برای این بازیکن یا حساب بله، درخواست اتصال دیگری منتظر بررسی است.')
+        ident = self.new_pending('binding', {
+            'player': player['id'], 'player_name': player['name'], 'user_id': user_id,
+            'username': profile_username or 'ارسال نشده',
+        }, actor, chat_id)
+        note = (f'درخواست اتصال {ident}\nبازیکن: #{player["id"]} {player["name"]}\n'
+                f'شناسهٔ داخلی بله: {user_id}\nusername: @{profile_username or "ارسال نشده"}\n'
+                'آیا این حساب به این بازیکن متصل شود؟')
+        self.db.say(self.config.admin_group, note, buttons('yes:' + ident, 'no:' + ident))
+        return 'درخواست اتصال برای تأیید ادمین ثبت شد؛ هنوز حسابی متصل نشده.', buttons('yes:' + ident, 'no:' + ident)
+
+    def repair_last_entity(self, chat_id, user_id, commands):
+        """Point follow-up memory at the surviving row after a merge/delete.
+
+        ``AIContextBuilder`` already drops stale references, but keeping the
+        stored state accurate means the next «بدهی‌اش؟» still refers to the
+        person the admin was working on.
+        """
+        state, history = self.db.conversation(chat_id, user_id)
+        try:
+            ref = ConversationState.from_dict(state).last_entity
+        except ValueError:
+            ref = None
+            stale = True
+        else:
+            stale = False
+        if not ref or ref.type != 'player':
+            if stale:
+                state.pop('last_entity', None)
+                self.db.save_conversation(chat_id, user_id, state, history)
+            return
+        try:
+            ident = None if isinstance(ref.id, bool) else int(ref.id)
+        except (TypeError, ValueError):
+            ident = None
+        if ident is None:
+            state.pop('last_entity', None)
+            self.db.save_conversation(chat_id, user_id, state, history)
+            return
+        changed = False
+        for command in commands if isinstance(commands, list) else []:
+            if not isinstance(command, dict):
+                continue
+            args = command.get('args') if isinstance(command.get('args'), dict) else {}
+            action = command.get('action')
+            if action == 'player_merge' and args.get('source') == ident:
+                target = self.db.one('SELECT id,name FROM players WHERE id=?', (args.get('target'),))
+                if target:
+                    state['last_entity'] = EntityRef('player', target['id'], target['name']).to_dict()
+                    changed = True
+            elif action == 'player_delete' and args.get('player') == ident:
+                state.pop('last_entity', None)
+                changed = True
+        if changed:
+            self.db.save_conversation(chat_id, user_id, state, history)
+
     def confirm(self, ident, approve, actor):
         ident = text(ident, 'کد درخواست', limit=32)
         row = self.db.one('SELECT * FROM pending WHERE id=?', (ident,))
         if not row or row['status'] != 'pending':
             raise UserError('این درخواست موجود نیست یا قبلاً بررسی/لغو شده است.')
         payload = json.loads(row['payload'])
+        settings_change = (row['kind'] == 'commands' and isinstance(payload, list)
+                           and any(isinstance(c, dict) and c.get('action') == 'settings' for c in payload))
         if approve and row['kind'] == 'commands':
             if time.time() - row['created_at'] > 86400 or row['revision'] != self.db.revision:
                 self.db.execute("UPDATE pending SET status='expired' WHERE id=?", (ident,))
@@ -618,12 +822,15 @@ class Bot:
                 raise
             finally:
                 self.db.execute('RELEASE apply_commands')
-        elif approve and row['kind'] == 'identity':
+            self.repair_last_entity(row['chat_id'], row['requester'], payload)
+        elif approve and row['kind'] in ('identity', 'binding'):
             self.service.bind(payload['player'], payload['user_id'], actor)
         elif approve:
             raise UserError('ابتدا تطبیق بازیکن را با /link مشخص کنید.')
         self.db.execute('UPDATE pending SET status=? WHERE id=?', ('approved' if approve else 'rejected', ident))
-        if row['kind'] in ('identity', 'claim'):
+        if row['kind'] == 'binding':
+            self.db.say(row['chat_id'], 'اتصال حساب تأیید شد ✅')
+        elif row['kind'] in ('identity', 'claim'):
             self.db.say(row['chat_id'], 'هویت شما تأیید شد.\n' + self.service.debt(payload['player']) if approve
                         else 'درخواست شناسایی تأیید نشد. لطفاً با /identify نام کامل دقیق را دوباره بفرستید.')
         if approve and row['kind'] == 'commands':
@@ -632,7 +839,13 @@ class Bot:
                     for player in self.db.all('''SELECT p.id,p.bale_id FROM attendance a JOIN players p ON p.id=a.player_id
                                                 WHERE a.session_id=? AND p.bale_id IS NOT NULL''', (command['args']['session'],)):
                         self.db.say(player['bale_id'], 'حساب سانس ثبت شد.\n' + self.service.debt(player['id']))
-            self.ask_missing()
+            if not settings_change:
+                self.ask_missing()
+        if settings_change:
+            return 'تنظیمات اعمال شد ✅' if approve else 'تغییر تنظیمات رد شد؛ هیچ مقداری تغییر نکرد.'
+        if approve and row['kind'] == 'commands' and any(
+                c.get('action') in ('player_merge', 'player_delete') for c in payload):
+            return 'انجام شد ✅ فهرست بازیکنان به‌روز شد؛ برای بررسی /players و /duplicates را بفرستید.'
         return 'ثبت شد ✅' if approve else 'درخواست رد شد؛ تغییری در حساب ایجاد نشد.'
 
     def request_self_debt(self, args, user_id, chat_id):

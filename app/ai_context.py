@@ -8,9 +8,33 @@ from .domain import ConversationState, EntityRef
 
 
 class AIContextBuilder:
+    # Only these entity types may travel as a follow-up reference.
+    _ENTITY_COLUMNS = {'session': ('sessions', 'title'), 'player': ('players', 'name')}
+
     def __init__(self, db, service=None):
         self.db = db
         self.service = service
+
+    def _entity_context(self, entity: EntityRef | None) -> dict[str, Any] | None:
+        """Return the follow-up entity only while it still exists.
+
+        A merge/delete removes a row, and SQLite reuses a freed integer id for
+        the next insert, so an unvalidated reference could silently point at a
+        different person. An unknown or malformed reference is dropped instead.
+        """
+        if not entity or entity.type not in self._ENTITY_COLUMNS:
+            return None
+        if isinstance(entity.id, bool):
+            return None
+        try:
+            ident = int(entity.id)
+        except (TypeError, ValueError):
+            return None
+        table, column = self._ENTITY_COLUMNS[entity.type]
+        row = self.db.one(f'SELECT id,{column} label FROM {table} WHERE id=?', (ident,))
+        if not row:
+            return None
+        return {'type': entity.type, 'id': row['id'], 'title': row['label']}
 
     def _session_context(self, entity: EntityRef | None) -> list[dict[str, Any]]:
         if not entity or entity.type != 'session':
@@ -31,7 +55,7 @@ class AIContextBuilder:
             'role': 'admin' if admin else 'player',
             'now_tehran': datetime.now(ZoneInfo('Asia/Tehran')).isoformat(timespec='minutes'),
             'self': {'id': linked['id'], 'name': linked['name']} if linked else None,
-            'last_entity': conversation.last_entity.to_dict() if conversation.last_entity else None,
+            'last_entity': self._entity_context(conversation.last_entity),
             'response_level': conversation.response_level.value,
             'awaiting_receipt_amount': conversation.receipt is not None,
             # Only the entity needed for a follow-up is included.  In particular,

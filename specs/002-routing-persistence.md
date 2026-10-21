@@ -78,6 +78,10 @@ state formats.
 - [x] AC-011: Private `/start` guidance contains only private-user capabilities;
   a successful immediate acknowledgement is edited into the final response,
   while failed or unsuitable edits fall back to the normal outbound message.
+- [x] AC-012: An admin setting change must contain its exact value in the
+  current message. A reply to an earlier question, chat history, or an
+  ambiguous acknowledgement such as «آره انجامش بده» must not supply or
+  confirm a missing card number, payment note, or approval setting.
 
 ## Test Mapping
 
@@ -109,6 +113,9 @@ state formats.
   `test_final_response_edits_acknowledgement_message`, and
   `test_failed_acknowledgement_edit_falls_back_to_new_message`, and
   `test_media_response_keeps_normal_send_path_after_acknowledgement`
+- AC-012 -> `tests/test_sans.py::PermissionAndConversationTests::test_positive_group_id_grants_group_admin_access`,
+  `test_ambiguous_group_acknowledgement_cannot_set_card`, and
+  `tests/test_agent_contracts.py::AgentContractTests::test_langgraph_rejects_ambiguous_setting_acknowledgement`
 
 ## Safety Constraints
 
@@ -139,6 +146,11 @@ configuration is retained only for compatibility and is no longer required.
 Unauthorized group updates are consumed for polling-offset bookkeeping but do
 not create message/agent logs, conversation state, receipts, proposals, or
 outbound messages.
+
+Revision (2026-10-17): AC-012 is implemented at both the legacy intent route
+and the LangGraph settings tool. Setting values are validated against the
+current user message only; reply text and persisted conversation history are
+not accepted as the value of a new setting.
 
 Revision (2026-10-16): AC-006 previously required a fixed reply for a bare
 greeting without an AI call. Real usage showed that the fixed line read as a

@@ -1,9 +1,12 @@
 import json
+import logging
 import urllib.error
 import urllib.request
 
 from .content import SYSTEM_PROMPT
 from .domain import Intent
+
+LOG = logging.getLogger('sans.ai')
 
 
 class APIError(RuntimeError):
@@ -54,6 +57,13 @@ class AIClient:
         self.url = config.ai_url + '/chat/completions'
         self.key = config.ai_key
         self.model = config.ai_model
+        self.fallback_models = tuple(getattr(config, 'ai_fallback_models', ()) or ())
+
+    @property
+    def models(self):
+        """Primary model first, then configured fallbacks, without duplicates."""
+        ordered = (self.model,) + tuple(self.fallback_models)
+        return tuple(dict.fromkeys(model for model in ordered if model))
 
     def parse(self, message, history, context):
         # The model only needs a short tail for linguistic continuity.  The
@@ -63,16 +73,31 @@ class AIClient:
             for item in (history or [])[-4:]
             if isinstance(item, dict) and item.get('role') in ('user', 'assistant')
         ]
-        result = post_json(self.url, {
-            'model': self.model,
-            'messages': [
-                {'role': 'system', 'content': SYSTEM_PROMPT},
-                {'role': 'user', 'content': json.dumps({'context': context, 'history': compact_history,
-                                                      'message': message}, ensure_ascii=False)},
-            ],
-            'temperature': 0,
-            'max_tokens': 2000,
-        }, {'Authorization': 'Bearer ' + self.key})
+        messages = [
+            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'user', 'content': json.dumps({'context': context, 'history': compact_history,
+                                                  'message': message}, ensure_ascii=False)},
+        ]
+        models = self.models
+        last_error = None
+        for index, model in enumerate(models):
+            try:
+                result = post_json(self.url, {
+                    'model': model,
+                    'messages': messages,
+                    'temperature': 0,
+                    'max_tokens': 2000,
+                }, {'Authorization': 'Bearer ' + self.key})
+                return self._intent(result)
+            except APIError as exc:
+                last_error = exc
+                if index + 1 < len(models):
+                    LOG.warning('AI model %s failed (%s); trying fallback %s',
+                                model, exc, models[index + 1])
+        raise last_error
+
+    @staticmethod
+    def _intent(result):
         try:
             content = result['choices'][0]['message']['content'].strip()
             if content.startswith('```') and content.endswith('```'):

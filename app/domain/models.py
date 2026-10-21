@@ -62,6 +62,9 @@ class Action(str, Enum):
     ADJUSTMENT = 'adjustment'
     SETTINGS = 'settings'
     PLAYER_NOTE = 'player_note'
+    PLAYER_RENAME = 'player_rename'
+    PLAYER_MERGE = 'player_merge'
+    PLAYER_DELETE = 'player_delete'
     SETTLE = 'settle'
 
 

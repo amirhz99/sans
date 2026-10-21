@@ -1,7 +1,7 @@
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from dataclasses import replace
 import tempfile
 import unittest
@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from app import jalali
 from app.bot import Bot, GREETING_REPLY
 from app.ai_context import AIContextBuilder
 from app.clients import AIClient, APIError
@@ -187,7 +188,7 @@ class FinancialTests(BaseCase):
             'title': 'سانس تأیید', 'when_text': 'فردا ساعت ۲۱'}}, ensure_ascii=False), user=1, chat=-100)
         preview = self.replies(-100)
         self.assertIn('زمان تهران:', preview)
-        self.assertRegex(preview, r'زمان تهران: \d{4}-\d{2}-\d{2}، ساعت 21:00 \(Asia/Tehran\)')
+        self.assertRegex(preview, r'زمان تهران: [۰-۹]+ \S+ [۰-۹]{4}، ساعت ۲۱:۰۰ \(Asia/Tehran\)')
         self.assertNotIn('session_at:', preview)
 
     def test_database_allows_historical_or_incomplete_session_without_structured_time(self):
@@ -289,6 +290,72 @@ class FinancialTests(BaseCase):
         self.seed()
         self.send('200', document=document)
         self.assertEqual(self.db.one('SELECT media_type FROM receipts')['media_type'], 'document')
+
+
+class JalaliDateTests(BaseCase):
+    """SPEC-008: operators write session dates in the Solar Hijri calendar."""
+
+    NOW = datetime(2026, 10, 20, 12, 0, tzinfo=ZoneInfo('Asia/Tehran'))
+
+    def test_jalali_dates_use_the_current_jalali_year(self):
+        self.assertEqual(parse_session_datetime('۹ خرداد ساعت ۲۱', self.NOW),
+                         '2026-05-30T21:00+03:30')
+        self.assertEqual(parse_session_datetime('خرداد ۹ ساعت ۲۱', self.NOW),
+                         '2026-05-30T21:00+03:30')
+        self.assertEqual(parse_session_datetime('۱۴۰۵/۰۳/۰۹ ۲۱:۰۰', self.NOW),
+                         '2026-05-30T21:00+03:30')
+        self.assertEqual(parse_session_datetime('۹ خرداد ساعت ۹ شب', self.NOW),
+                         '2026-05-30T21:00+03:30')
+
+    def test_explicit_jalali_year_is_respected(self):
+        self.assertEqual(parse_session_datetime('۹ خرداد ۱۴۰۴ ساعت ۲۱', self.NOW),
+                         '2025-05-30T21:00+03:30')
+        self.assertEqual(parse_session_datetime('۳۰ اسفند ۱۴۰۳ ساعت ۲۱', self.NOW),
+                         '2025-03-20T21:00+03:30')
+
+    def test_invalid_jalali_dates_fail_closed(self):
+        for value in ('۳۰ اسفند ۱۴۰۴ ساعت ۲۱', '۳۱ مهر ساعت ۲۱',
+                      '۰ خرداد ساعت ۲۱', '۳۲ خرداد ساعت ۲۱'):
+            with self.assertRaises(UserError):
+                parse_session_datetime(value, self.NOW)
+        with self.assertRaises(UserError) as caught:
+            parse_session_datetime('خرداد ساعت ۲۱', self.NOW)
+        self.assertIn('روز ماه شمسی', str(caught.exception))
+
+    def test_jalali_conversion_matches_known_anchors_and_round_trips(self):
+        anchors = [((1405, 1, 1), date(2026, 3, 21)),
+                   ((1403, 12, 30), date(2025, 3, 20)),
+                   ((1405, 7, 28), date(2026, 10, 20))]
+        for jalali_date, gregorian in anchors:
+            self.assertEqual(jalali.to_gregorian(*jalali_date), gregorian)
+            self.assertEqual(jalali.from_gregorian(gregorian), jalali_date)
+        for offset in range(0, 4000, 11):
+            day = date(2024, 1, 1) + timedelta(days=offset)
+            self.assertEqual(jalali.to_gregorian(*jalali.from_gregorian(day)), day)
+
+    def test_sessions_store_and_display_jalali_time(self):
+        self.apply('new_session', title='سانس شمسی', when_text='۹ خرداد ۱۴۰۵ ساعت ۲۱')
+        row = self.db.one('SELECT * FROM sessions WHERE title=?', ('سانس شمسی',))
+        self.assertEqual(row['when_text'], '۹ خرداد ۱۴۰۵ ساعت ۲۱')
+        self.assertEqual(row['session_at'], '2026-05-30T21:00+03:30')
+        self.assertEqual(self.service.session_time_display(row),
+                         'زمان تهران: ۹ خرداد ۱۴۰۵، ساعت ۲۱:۰۰')
+        self.assertEqual(self.service.session_at_display(row['session_at']),
+                         '۹ خرداد ۱۴۰۵، ساعت ۲۱:۰۰ (Asia/Tehran)')
+
+    def test_flexible_session_path_rejects_impossible_days_but_keeps_history(self):
+        with self.assertRaises(UserError):
+            with self.db.conn:
+                self.service.save_session_flexible(title='تاریخ ناموجود', when_text='۳۱ مهر ساعت ۲۱', actor=1)
+        self.assertIsNone(self.db.one("SELECT id FROM sessions WHERE title='تاریخ ناموجود'"))
+
+        with self.db.conn:
+            history = self.service.save_session_flexible(title='سانس قدیمی', when_text='مهرماه گذشته', actor=1)
+            no_hour = self.service.save_session_flexible(title='سانس بی‌ساعت', when_text='۹ خرداد', actor=1)
+        self.assertIsNone(history['session_at'])
+        self.assertEqual(history['when_text'], 'مهرماه گذشته')
+        self.assertIsNone(no_hour['session_at'])
+        self.assertEqual(no_hour['when_text'], '۹ خرداد')
 
 
 class PermissionAndConversationTests(BaseCase):
@@ -437,6 +504,7 @@ class PermissionAndConversationTests(BaseCase):
         self.send('/debt رضا محمدی', user=55, chat=55)
         self.assertEqual(before, self.replies(-100))
 
+
     def test_model_cannot_grant_private_admin_access(self):
         self.seed()
         self.ai.answer = {'action': 'adjustment', 'args': {'player': 1, 'amount': -100000, 'note': 'hack'}}
@@ -510,6 +578,22 @@ class PermissionAndConversationTests(BaseCase):
         self.send('مسئول بدهی علی را اصلاح کن', user=99, chat=-100)
         self.assertEqual(self.service.balance(1), 0)
         self.assertTrue(self.db.all('SELECT * FROM pending'))
+
+    def test_positive_group_id_grants_group_admin_access(self):
+        self.bot.config = replace(self.config, admin_group=4766035811)
+        self.ai.answer = {'action': 'help', 'args': {}}
+        self.send('مسئول راهنما', user=99, chat=4766035811, chat_type='group')
+        self.assertTrue(self.bot.is_admin(4766035811, 99))
+        self.assertIn('دستورات ادمین', self.replies(4766035811))
+        self.assertFalse(self.bot.is_admin(4766035810, 99))
+        self.assertFalse(self.bot.is_admin(4766035811, 0))
+
+    def test_ambiguous_group_acknowledgement_cannot_set_card(self):
+        self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': '6037997512345678'}}
+        self.send('مسئول آره انجامش بده', user=99, chat=-100)
+        self.assertEqual(self.db.setting('card'), '')
+        self.assertFalse(self.db.all("SELECT * FROM pending WHERE status='pending'"))
+        self.assertIn('صریحاً در همین پیام', self.replies(-100))
 
     def test_bot_username_mention_is_a_valid_group_trigger(self):
         with self.db.conn:
@@ -807,6 +891,80 @@ class PermissionAndConversationTests(BaseCase):
         self.assertEqual(len([r for r in self.db.all('SELECT * FROM outbox') if json.loads(r['payload']).get('chat_id') == -100]), count)
 
 
+class AdminBindingTests(BaseCase):
+    @staticmethod
+    def profile_reply(user_id=20, username='ali_profile', **extra):
+        return {'from': {'id': user_id, 'username': username, **extra}, 'text': 'profile text'}
+
+    def send_bind(self, reply=None, command='/bind 1 @ali_profile', user=1, chat=-100):
+        return self.send(command, user=user, chat=chat,
+                         reply_to_message=reply or self.profile_reply())
+
+    def test_bind_creates_pending_without_binding(self):
+        self.seed(linked=False)
+        self.send_bind()
+
+        row = self.db.one("SELECT * FROM pending WHERE kind='binding'")
+        self.assertIsNotNone(row)
+        payload = json.loads(row['payload'])
+        self.assertEqual(payload['player'], 1)
+        self.assertEqual(payload['user_id'], 20)
+        self.assertIsNone(self.service.linked(20))
+        self.assertIsNone(self.service.player(1)['bale_id'])
+
+    def test_bind_approval_and_rejection(self):
+        self.seed(linked=False)
+        self.send_bind()
+        ident = self.db.one("SELECT id FROM pending WHERE kind='binding'")['id']
+        self.click('no:' + ident)
+        self.assertEqual(self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status'], 'rejected')
+        self.assertIsNone(self.service.linked(20))
+
+        self.send_bind(reply=self.profile_reply(user_id=21))
+        second = self.db.one("SELECT id FROM pending WHERE kind='binding' AND status='pending'")['id']
+        self.click('yes:' + second)
+        self.assertEqual(self.service.linked(21)['id'], 1)
+
+    def test_bind_rejects_untrusted_profiles(self):
+        self.seed(linked=False)
+        cases = (
+            ('/bind 1', {'text': '@ali_profile'}),
+            ('/bind 1 @ali_profile', {'from': {'username': 'ali_profile'}}),
+            ('/bind 1 @ali_profile', {'from': {'id': 0, 'username': 'ali_profile'}}),
+            ('/bind 1 @ali_profile', {'from': {'id': 20, 'username': 'other'}}),
+            ('/bind 1 @ali_profile', {'from': {'id': 20, 'username': 'ali_profile', 'is_bot': True}}),
+        )
+        for index, (command, reply) in enumerate(cases, 1):
+            with self.subTest(index=index):
+                self.send_bind(reply=reply, command=command)
+        self.assertFalse(self.db.all("SELECT * FROM pending WHERE kind='binding'"))
+        self.assertIsNone(self.service.player(1)['bale_id'])
+
+    def test_bind_rejects_duplicate_links_and_pending_requests(self):
+        self.seed(linked=False)
+        with self.db.conn:
+            self.service.bind(2, 30, 1)
+        self.send_bind(command='/bind 2 @other',
+                      reply=self.profile_reply(user_id=30, username='other'))
+        self.assertFalse(self.db.all("SELECT * FROM pending WHERE kind='binding'"))
+
+        self.send_bind()
+        self.send_bind()
+        self.assertEqual(self.db.one("SELECT COUNT(*) n FROM pending WHERE kind='binding'")['n'], 1)
+
+    def test_bind_requires_admin_group(self):
+        self.seed(linked=False)
+        self.send_bind(user=1, chat=10)
+        self.send_bind(user=1, chat=-200)
+        self.assertFalse(self.db.all("SELECT * FROM pending WHERE kind='binding'"))
+
+    def test_bind_accepts_structured_profile_sources(self):
+        self.assertEqual(Bot.extract_profile_user({'from': {'id': 1, 'username': 'one'}}), (1, 'one'))
+        self.assertEqual(Bot.extract_profile_user({'contact': {'user_id': 2, 'username': 'two'}}), (2, 'two'))
+        self.assertEqual(Bot.extract_profile_user({'forward_from': {'id': 3}}), (3, ''))
+        self.assertEqual(Bot.extract_profile_user({'forward_origin': {'sender_user': {'id': 4}}}), (4, ''))
+
+
 class OperationalTests(BaseCase):
     def test_config_group_members_does_not_require_allowlist(self):
         env = {'BALE_BOT_TOKEN': 'test', 'ADMIN_GROUP_ID': '5312848841',
@@ -970,6 +1128,386 @@ class ArchitectureContractTests(BaseCase):
         self.send('این کار را انجام بده')
         self.assertEqual(self.service.balance(1), 0)
         self.assertIn('درخواست معتبر', self.replies(10))
+
+
+class SettingsApprovalTests(BaseCase):
+    """SPEC-005: a settings change is written only after an admin button press."""
+
+    CARD = '6037997512345678'
+
+    def last_payload(self, chat=-100):
+        rows = self.db.all("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id")
+        for row in reversed(rows):
+            payload = json.loads(row['payload'])
+            if payload.get('chat_id') == chat:
+                return payload
+        return {}
+
+    def callback_texts(self):
+        return [json.loads(row['payload']).get('text', '')
+                for row in self.db.all("SELECT payload FROM outbox WHERE method='answerCallbackQuery' ORDER BY id")]
+
+    def proposals(self):
+        return self.db.all("SELECT * FROM pending WHERE kind='commands' ORDER BY rowid")
+
+    def test_explicit_card_creates_proposal_without_applying(self):
+        self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': self.CARD}}
+        self.send(f'مسئول شماره کارت {self.CARD} بانک ملی به نام علی رضایی', user=1, chat=-100)
+
+        self.assertEqual(self.db.setting('card'), '')
+        rows = self.proposals()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['status'], 'pending')
+        self.assertEqual(json.loads(rows[0]['payload']),
+                         [{'action': 'settings', 'args': {'key': 'card', 'value': self.CARD}}])
+        reply = self.last_payload()
+        self.assertIn('شماره کارت', reply['text'])
+        self.assertIn(rows[0]['id'], reply['text'])
+        self.assertEqual(reply['reply_markup']['inline_keyboard'], [[
+            {'text': 'تأیید', 'callback_data': 'yes:' + rows[0]['id']},
+            {'text': 'رد', 'callback_data': 'no:' + rows[0]['id']},
+        ]])
+
+    def test_card_proposal_approval_applies_exactly_once(self):
+        self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': self.CARD}}
+        self.send(f'مسئول شماره کارت {self.CARD} را ثبت کن', user=1, chat=-100)
+        ident = self.proposals()[0]['id']
+        self.assertEqual(self.db.setting('card'), '')
+
+        self.click('yes:' + ident)
+        self.assertEqual(self.db.setting('card'), self.CARD)
+        self.assertEqual(self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status'], 'approved')
+        self.assertIn('تنظیمات اعمال شد', self.callback_texts()[-1])
+
+        # A second click on the same proposal must not write again.
+        self.click('yes:' + ident)
+        self.assertEqual(self.db.setting('card'), self.CARD)
+        self.assertIn('قبلاً بررسی', self.callback_texts()[-1])
+
+    def test_card_proposal_rejection_keeps_value(self):
+        self.apply('settings', key='card', value='1111111111111111')
+        self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': self.CARD}}
+        self.send(f'مسئول شماره کارت {self.CARD} را عوض کن', user=1, chat=-100)
+        ident = self.proposals()[0]['id']
+
+        self.click('no:' + ident)
+        self.assertEqual(self.db.setting('card'), '1111111111111111')
+        self.assertEqual(self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status'], 'rejected')
+        self.assertIn('رد شد', self.callback_texts()[-1])
+
+    def test_ambiguous_reply_creates_no_setting_proposal(self):
+        self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': self.CARD}}
+        self.send('مسئول آره انجامش بده', user=1, chat=-100)
+
+        self.assertEqual(self.db.setting('card'), '')
+        self.assertEqual(self.proposals(), [])
+        self.assertIn('صریحاً در همین پیام', self.replies(-100))
+
+    def test_setcard_requires_admin_and_explicit_value(self):
+        self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': self.CARD}}
+
+        # A non-admin cannot reach the deterministic command path; the unknown
+        # command falls back to the ordinary help text with no side effect.
+        self.send('/setcard ' + self.CARD, user=10, chat=10)
+        self.assertEqual(self.proposals(), [])
+        self.assertEqual(self.db.setting('card'), '')
+        self.assertIn('دستورات کاربران', self.replies(10))
+
+        # The admin command still needs a value in the same message.
+        self.send('/setcard', user=1, chat=-100)
+        self.assertEqual(self.proposals(), [])
+        self.assertIn('/setcard شماره کارت', self.replies(-100))
+
+        # A complete command becomes the same pending proposal, not a write.
+        self.send('/setcard ' + self.CARD + ' علی رضایی', user=1, chat=-100)
+        rows = self.proposals()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self.db.setting('card'), '')
+        self.assertIn('شماره کارت', self.last_payload()['text'])
+        self.assertIn(rows[0]['id'], self.last_payload()['text'])
+        self.assertEqual(self.last_payload()['reply_markup']['inline_keyboard'][0][0]['callback_data'],
+                         'yes:' + rows[0]['id'])
+
+    def test_setting_proposal_expires_after_revision_change(self):
+        self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': self.CARD}}
+        self.send(f'مسئول شماره کارت {self.CARD} را ثبت کن', user=1, chat=-100)
+        ident = self.proposals()[0]['id']
+
+        self.apply('new_player', name='بازیکن دیگر')
+        self.click('yes:' + ident)
+
+        self.assertEqual(self.db.setting('card'), '')
+        self.assertEqual(self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status'], 'expired')
+        self.assertIn('تغییر کرده', self.callback_texts()[-1])
+
+    def test_private_callback_cannot_approve_setting(self):
+        self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': self.CARD}}
+        self.send(f'مسئول شماره کارت {self.CARD} را ثبت کن', user=1, chat=-100)
+        ident = self.proposals()[0]['id']
+
+        # A private-chat callback reaches the handler but is rejected as non-admin.
+        self.update_id += 1
+        self.bot.process({'update_id': self.update_id, 'callback_query': {
+            'id': f'cb{self.update_id}', 'data': 'yes:' + ident, 'from': {'id': 1},
+            'message': {'chat': {'id': 10, 'type': 'private'}}}})
+        self.assertEqual(self.db.setting('card'), '')
+        self.assertEqual(self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status'], 'pending')
+        self.assertIn('فقط ادمین مجاز', self.callback_texts()[-1])
+
+        # A callback outside the configured group is dropped at the update boundary.
+        self.click('yes:' + ident, user=1, chat=-200)
+        self.assertEqual(self.db.setting('card'), '')
+        self.assertEqual(self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status'], 'pending')
+
+    def test_pending_summary_shows_readable_setting_preview(self):
+        self.ai.answer = {'action': 'settings',
+                          'args': {'key': 'approval_required', 'value': False}}
+        self.send('مسئول بررسی رسید توسط ادمین را غیرفعال کن', user=1, chat=-100)
+        self.assertEqual(self.db.setting('approval_required'), 'true')
+
+        self.send('/pending', user=1, chat=-100)
+        summary = self.last_payload()['text']
+        self.assertIn('بررسی رسید توسط ادمین', summary)
+        self.assertIn('غیرفعال', summary)
+        self.assertIn('هشدار', summary)
+        self.assertNotIn('"action"', summary)
+
+
+class PlayerIdentityTests(BaseCase):
+    """SPEC-007: rename, merge, delete and duplicate detection for players."""
+
+    def player_id(self, name):
+        return self.db.one('SELECT id FROM players WHERE normalized_name=?', (normalize(name),))['id']
+
+    def callback_texts(self):
+        return [json.loads(row['payload']).get('text', '')
+                for row in self.db.all("SELECT payload FROM outbox WHERE method='answerCallbackQuery' ORDER BY id")]
+
+    def test_rename_keeps_id_history_and_binding(self):
+        self.seed()
+        self.apply('attendance', session=1, player=1, guests=1)
+        self.apply('player_rename', player=1, name='علی احمد رضایی')
+
+        row = self.db.one('SELECT * FROM players WHERE id=1')
+        self.assertEqual(row['name'], 'علی احمد رضایی')
+        self.assertEqual(row['normalized_name'], normalize('علی احمد رضایی'))
+        self.assertEqual(row['bale_id'], 10)
+        self.assertEqual(self.db.one('SELECT player_id FROM attendance')['player_id'], 1)
+        self.assertEqual(self.service.linked(10)['id'], 1)
+        self.assertTrue(self.db.one("SELECT 1 FROM audit_logs WHERE action='player_rename'"))
+
+    def test_rename_rejects_existing_or_unchanged_name(self):
+        self.seed()
+        for name in ('رضا محمدی', 'علی رضایی'):
+            with self.assertRaises(UserError):
+                self.apply('player_rename', player=1, name=name)
+        self.assertEqual(self.db.one('SELECT name FROM players WHERE id=1')['name'], 'علی رضایی')
+
+    def test_merge_moves_attendance_ledger_and_receipts(self):
+        self.seed()
+        self.apply('new_session', title='سانس دوم', when_text='فردا ساعت ۲۱')
+        self.apply('attendance', session=1, player=1, guests=0)
+        self.apply('attendance', session=2, player=2, guests=1)
+        self.apply('finalize', session=1)
+        self.apply('finalize', session=2)
+        with self.db.conn:
+            self.db.execute("INSERT INTO receipts(player_id,amount,file_id,file_key,media_type,"
+                            "chat_id,message_id,status) VALUES (2,50000,'f','key-1','photo',10,1,'pending')")
+        balance_before = self.service.balance(1) + self.service.balance(2)
+
+        self.apply('player_merge', source=2, target=1)
+
+        self.assertIsNone(self.db.one('SELECT * FROM players WHERE id=2'))
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM attendance WHERE player_id=1')['n'], 2)
+        self.assertEqual(self.db.one('SELECT player_id FROM receipts')['player_id'], 1)
+        self.assertEqual(self.service.balance(1), balance_before)
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM ledger WHERE player_id=2')['n'], 0)
+        audit = self.db.one("SELECT details FROM audit_logs WHERE action='player_merge'")
+        self.assertIn('"attendance":1', audit['details'])
+        # A second merge is impossible because the source row is gone.
+        with self.assertRaises(UserError):
+            self.apply('player_merge', source=2, target=1)
+
+    def test_merge_refuses_to_lose_guests(self):
+        self.seed()
+        self.apply('attendance', session=1, player=1, guests=0)
+        self.apply('attendance', session=1, player=2, guests=2)
+        with self.assertRaises(UserError) as caught:
+            self.apply('player_merge', source=2, target=1)
+        self.assertIn('مهمان', str(caught.exception))
+        self.assertIsNotNone(self.db.one('SELECT 1 FROM players WHERE id=2'))
+
+        # Merging the smaller guest count into the larger one is safe.
+        self.apply('player_merge', source=1, target=2)
+        self.assertEqual(self.db.one('SELECT guests FROM attendance')['guests'], 2)
+
+    def test_merge_refuses_two_bound_players_and_pending_references(self):
+        self.seed(linked=False)
+        with self.db.conn:
+            self.service.bind(1, 10, 1)
+            self.service.bind(2, 11, 1)
+        with self.assertRaises(UserError):
+            self.apply('player_merge', source=2, target=1)
+
+        self.db.execute('UPDATE players SET bale_id=NULL WHERE id=2')
+        with self.db.conn:
+            self.bot.new_pending('commands', [{'action': 'attendance',
+                                               'args': {'session': 1, 'player': 2, 'guests': 0}}], 1, -100)
+        with self.assertRaises(UserError):
+            self.apply('player_merge', source=2, target=1)
+        self.assertIsNotNone(self.db.one('SELECT 1 FROM players WHERE id=2'))
+    def test_delete_only_removes_unused_players(self):
+        self.seed()
+        self.apply('new_player', name='موقت')
+        temp_id = self.player_id('موقت')
+        self.apply('player_delete', player=temp_id)
+        self.assertIsNone(self.db.one('SELECT 1 FROM players WHERE id=?', (temp_id,)))
+
+        self.apply('attendance', session=1, player=1)
+        with self.assertRaises(UserError) as caught:
+            self.apply('player_delete', player=1)
+        self.assertIn('ادغام', str(caught.exception))
+        self.assertIsNotNone(self.db.one('SELECT 1 FROM players WHERE id=1'))
+
+    def test_merge_and_delete_need_an_admin_confirmation(self):
+        self.seed()
+        self.apply('attendance', session=1, player=2, guests=0)
+        self.send('/merge 2 1', user=1, chat=-100)
+        ident = self.proposal()
+        self.assertIsNotNone(self.db.one('SELECT 1 FROM players WHERE id=2'))
+        self.assertEqual(self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status'], 'pending')
+        self.assertIn('ادغام', self.replies(-100))
+        self.click('yes:' + ident)
+        self.assertIsNone(self.db.one('SELECT 1 FROM players WHERE id=2'))
+        self.assertEqual(self.db.one('SELECT player_id FROM attendance')['player_id'], 1)
+        self.assertIn('انجام شد', self.callback_texts()[-1])
+
+        self.apply('new_player', name='موقت')
+        temp_id = self.player_id('موقت')
+        self.send(f'/delplayer {temp_id}', user=1, chat=-100)
+        self.assertIsNotNone(self.db.one('SELECT 1 FROM players WHERE id=?', (temp_id,)))
+        self.click('yes:' + self.proposal())
+        self.assertIsNone(self.db.one('SELECT 1 FROM players WHERE id=?', (temp_id,)))
+
+    def test_rejected_merge_changes_nothing(self):
+        self.seed()
+        self.apply('attendance', session=1, player=2, guests=0)
+        self.send('/merge 2 1', user=1, chat=-100)
+        self.click('no:' + self.proposal())
+        self.assertIsNotNone(self.db.one('SELECT 1 FROM players WHERE id=2'))
+        self.assertEqual(self.db.one('SELECT player_id FROM attendance')['player_id'], 2)
+
+    def test_stale_follow_up_reference_never_reaches_the_model(self):
+        self.seed()
+        self.apply('new_player', name='موقت')
+        temp_id = self.player_id('موقت')
+        self.apply('player_delete', player=temp_id)
+        builder = AIContextBuilder(self.db, self.service)
+
+        context = builder.build(-100, 1, True,
+                                ConversationState(last_entity=EntityRef('player', temp_id, 'موقت')))
+        self.assertIsNone(context['last_entity'])
+        context = builder.build(-100, 1, True,
+                                ConversationState(last_entity=EntityRef('player', 'not-a-number')))
+        self.assertIsNone(context['last_entity'])
+        context = builder.build(-100, 1, True,
+                                ConversationState(last_entity=EntityRef('session', 999)))
+        self.assertIsNone(context['last_entity'])
+        self.assertEqual(context['sessions'], [])
+
+        # A live reference is still sent, with its current stored label.
+        context = builder.build(-100, 1, True,
+                                ConversationState(last_entity=EntityRef('player', 1, 'نام قدیمی')))
+        self.assertEqual(context['last_entity'], {'type': 'player', 'id': 1, 'title': 'علی رضایی'})
+
+    def test_merge_repairs_and_delete_clears_follow_up_memory(self):
+        self.seed()
+        with self.db.conn:
+            self.db.save_conversation(-100, 1,
+                                      {'last_entity': EntityRef('player', 2, 'رضا محمدی').to_dict()}, [])
+        self.send('/merge 2 1', user=1, chat=-100)
+        self.click('yes:' + self.proposal())
+        state, _ = self.db.conversation(-100, 1)
+        self.assertEqual(state['last_entity'], {'type': 'player', 'id': 1, 'title': 'علی رضایی'})
+
+        self.apply('new_player', name='موقت')
+        temp_id = self.player_id('موقت')
+        with self.db.conn:
+            self.db.save_conversation(-100, 1,
+                                      {'last_entity': EntityRef('player', temp_id, 'موقت').to_dict()}, [])
+        self.send(f'/delplayer {temp_id}', user=1, chat=-100)
+        self.click('yes:' + self.proposal())
+        state, _ = self.db.conversation(-100, 1)
+        self.assertNotIn('last_entity', state)
+
+    def test_non_admin_cannot_rename_merge_or_delete(self):
+        self.seed()
+        # Private chat: slash commands are not management commands there.
+        self.send('/rename 1 علی دیگر', user=99, chat=99)
+        self.send('/merge 2 1', user=99, chat=99)
+        self.send('/delplayer 2', user=99, chat=99)
+        self.assertEqual(self.db.one('SELECT name FROM players WHERE id=1')['name'], 'علی رضایی')
+        self.assertIsNotNone(self.db.one('SELECT 1 FROM players WHERE id=2'))
+        self.assertFalse(self.db.all('SELECT * FROM pending'))
+
+        # A group other than the configured admin group is ignored entirely.
+        before = self.db.one('SELECT COUNT(*) n FROM outbox')['n']
+        self.send('/merge 2 1', user=99, chat=-200)
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM outbox')['n'], before)
+        self.assertFalse(self.db.all('SELECT * FROM pending'))
+
+    def test_rename_command_applies_directly_for_admin(self):
+        self.seed()
+        self.send('/rename 1 علی احمد رضایی', user=1, chat=-100)
+        self.assertEqual(self.db.one('SELECT name FROM players WHERE id=1')['name'], 'علی احمد رضایی')
+        self.assertEqual(self.service.linked(10)['id'], 1)
+        self.assertIn('تغییر کرد', self.replies(-100))
+        self.assertFalse(self.db.all('SELECT * FROM pending'))
+
+    def test_duplicates_report_and_players_hint(self):
+        self.apply('new_player', name='سید امین هاشمی')
+        self.apply('new_player', name='هاشمی')
+        self.apply('new_session', title='سانس', when_text='فردا ساعت ۲۱')
+        self.apply('attendance', session=1, player=self.player_id('سید امین هاشمی'))
+        self.send('/duplicates', user=1, chat=-100)
+        report = self.replies(-100)
+        self.assertIn('هاشمی', report)
+        self.assertIn('/merge', report)
+        self.assertIn('#', report)
+
+        self.send('/players', user=1, chat=-100)
+        self.assertIn('/duplicates', self.replies(-100))
+
+    def test_same_family_name_is_not_a_duplicate(self):
+        self.apply('new_player', name='مهیار قهرمان زاده')
+        self.apply('new_player', name='مهراد قهرمان زاده')
+        self.assertEqual(self.service.duplicate_players(), [])
+        # The guard must not block a genuinely different given name either.
+        with self.db.conn:
+            created = self.service.ensure_player('مهدی قهرمان زاده')
+        self.assertEqual(created['name'], 'مهدی قهرمان زاده')
+
+    def test_duplicate_pairs_keep_the_record_with_history(self):
+        self.apply('new_player', name='سید امین هاشمی')
+        self.apply('new_player', name='هاشمی')
+        self.apply('new_session', title='سانس', when_text='فردا ساعت ۲۱')
+        self.apply('attendance', session=1, player=self.player_id('هاشمی'))
+        pairs = self.service.duplicate_players()
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]['keep']['name'], 'هاشمی')
+        self.assertEqual(pairs[0]['drop']['name'], 'سید امین هاشمی')
+
+    def test_ensure_player_asks_before_creating_a_similar_name(self):
+        self.apply('new_player', name='محمد مهدی موحد')
+        with self.assertRaises(UserError) as caught:
+            self.service.ensure_player('موحد')
+        self.assertIn('محمد مهدی موحد', str(caught.exception))
+        self.assertIsNone(self.db.one('SELECT 1 FROM players WHERE normalized_name=?', (normalize('موحد'),)))
+
+        with self.db.conn:
+            created = self.service.ensure_player('موحد', allow_similar=True)
+        self.assertEqual(created['name'], 'موحد')
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM players')['n'], 2)
 
 
 if __name__ == '__main__':

@@ -9,10 +9,10 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.graph import START, MessagesState, StateGraph
+from langgraph.prebuilt import tools_condition
 
-from .service import TEHRAN, UserError, integer
+from .service import TEHRAN, UserError, integer, setting_value_is_explicit
 
 LOG = logging.getLogger('sans.agent')
 
@@ -28,8 +28,12 @@ AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمن�
 ۲. مرز کارهای مستقیم و کارهای نیازمند تأیید ادمین:
    - کارهای خواندنی (`query_database`): همیشه آزاد. قبل از جواب دادن درباره بدهی، سانس یا حاضران، دیتابیس را چک کن.
    - کارهای اجرایی روزمره (`manage_records`):
-     * اگر کاربر «ادمین» است: ساخت و ویرایش بازیکنان، ساخت و ویرایش سانس‌ها (جدید یا قدیمی/ناقص)، ثبت حضور و غیاب (تکی یا دسته‌جمعی برای چند نفر)، و ثبت شماره کارت/تنظیمات را مستقیم و فوری با `manage_records` انجام بده و نتیجه را صمیمی گزارش کن.
+     * اگر کاربر «ادمین» است: ساخت و ویرایش بازیکنان، ساخت و ویرایش سانس‌ها (جدید یا قدیمی/ناقص)، و ثبت حضور و غیاب (تکی یا دسته‌جمعی برای چند نفر) را مستقیم و فوری با `manage_records` انجام بده و نتیجه را صمیمی گزارش کن.
+     * تغییر تنظیمات (`card`، `payment_note`، `approval_required`) را با عملیات `update_settings` فقط به‌صورت پیشنهاد با دکمهٔ تأیید بساز؛ مقدار باید صریحاً در پیام همین نوبت کاربر نوشته شده باشد و هرگز از حافظه، پیام قبلی یا پاسخ‌هایی مثل «آره» برداشت نشود.
      * اگر کاربر «بازیکن عادی» است: می‌تواند با `manage_records` خودش را معرفی کند (`identify`) یا حضور خودش را در سانس باز ثبت/لغو کند (`attendance_self`).
+     * هویت بازیکن‌ها را تمیز نگه دار: هرگز برای یک نام کوتاه، ناقص یا با املای متفاوت بازیکن جدید نساز. اگر ابزار فهرست بازیکن‌های مشابه را برگرداند، همان‌ها را با #شناسه نشان بده و نام کامل را بپرس.
+     * تغییرنام (`rename_player`) با درخواست صریح ادمین مستقیم انجام می‌شود؛ ادغام (`merge_player`) و حذف (`delete_player`) فقط با شناسه یا نام دقیق و همیشه به‌صورت کارت تأیید.
+     * برای یافتن نام‌های تکراری از `query_database` با target='duplicate_players' استفاده کن.
    - تغییرات مالی در دفترکل (`propose_financial_change`):
      * نهایی‌سازی بدهی سانس (`finalize`)، اصلاح دستی بدهی/طلب بازیکن (`adjustment`)، تسویه حساب (`settle`) و اعلام بدهی توسط بازیکن (`declare_debt`) حساس هستند. برای این‌ها از `propose_financial_change` استفاده کن تا کارت تأیید با دکمه شیشه‌ای ساخته شود.
    - پرسش از ادمین‌ها (`ask_admins`):
@@ -125,7 +129,8 @@ class SansAgent:
         }
         return json.dumps(snapshot, ensure_ascii=False)
 
-    def _make_tools(self, chat_id: int, user_id: int, admin: bool, sender: dict | None, effects: dict[str, Any]):
+    def _make_tools(self, chat_id: int, user_id: int, admin: bool, sender: dict | None,
+                    effects: dict[str, Any], current_message: str = ''):
         bot = self.bot
         service = bot.service
         db = bot.db
@@ -133,7 +138,7 @@ class SansAgent:
         @tool
         def query_database(target: str, reference: str = '') -> str:
             """Read data from the database.
-            target: 'overview', 'players', 'sessions', 'session_details', 'debt', 'pending'.
+            target: 'overview', 'players', 'sessions', 'session_details', 'debt', 'pending', 'duplicate_players'.
             reference: optional player name/ID or session title/ID.
             """
             try:
@@ -210,6 +215,10 @@ class SansAgent:
                         {'pending': [dict(r) for r in rows], 'receipts': [dict(r) for r in receipts]},
                         ensure_ascii=False,
                     )
+                if target == 'duplicate_players':
+                    if not admin:
+                        return 'فقط ادمین به فهرست نام‌های تکراری دسترسی دارد.'
+                    return service.duplicates_report()
                 return 'هدف جستجو نامعتبر است.'
             except Exception as exc:
                 return f'خطا در خواندن اطلاعات: {exc}'
@@ -220,10 +229,14 @@ class SansAgent:
             Operations:
             - 'identify': data_json='{"name": "نام کامل"}'
             - 'attendance_self': data_json='{"present": true, "guests": 0, "session": ""}'
-            - 'upsert_players': (admin) data_json='{"players": [{"name": "علی رضایی", "note": ""}]}'
-            - 'save_session': (admin) create/update new or historical session.
-            - 'set_attendance': (admin) set present/absent players for a session (auto-creates missing players!).
-            - 'update_settings': (admin) data_json='{"card": "...", "payment_note": "..."}'
+            - 'upsert_players': (admin) data_json='{"players": [{"name": "علی رضایی", "note": ""}]}'; a name similar to an existing player is refused unless force=true.
+            - 'save_session': (admin) create/update new or historical session; date is accepted as an alias for when_text. Jalali («۹ خرداد ساعت ۲۱», «1405/03/09 21:00») and Gregorian (YYYY-MM-DD) dates are both accepted; a Jalali date without a year uses the current Jalali year.
+            - 'set_attendance': (admin) set present/absent players for a session; unknown names are refused, no player is ever created here.
+            - 'rename_player': (admin) data_json='{"player": "#15", "name": "نام کامل"}' — keeps the id and the whole history.
+            - 'merge_player': (admin) data_json='{"source": "#4", "target": "#15"}' — moves history and builds an approval card.
+            - 'delete_player': (admin) data_json='{"player": "#4"}' — only for a player with no history; builds an approval card.
+            - 'duplicates': (admin) list suspected duplicate or partial names.
+            - 'update_settings': (admin) propose setting changes with approval buttons; data_json='{"card": "...", "payment_note": "...", "approval_required": true}'
             """
             try:
                 data = json.loads(data_json) if isinstance(data_json, str) and data_json.strip() else {}
@@ -256,13 +269,23 @@ class SansAgent:
                     return 'خطا: این عملیات مدیریتی فقط برای ادمین مجاز است.'
 
                 if operation == 'upsert_players':
+                    unknown = set(data) - {'players', 'name', 'note', 'force'}
+                    if unknown:
+                        return 'کلید ناشناخته در درخواست بازیکن: ' + '، '.join(sorted(unknown))
                     raw_list = data.get('players') or ([data] if data.get('name') else [])
+                    if not isinstance(raw_list, list):
+                        return 'فهرست بازیکنان باید آرایه باشد.'
+                    force = data.get('force') is True
                     created = []
                     for item in raw_list:
                         if isinstance(item, str):
-                            p = service.ensure_player(item, actor=user_id)
+                            p = service.ensure_player(item, actor=user_id, allow_similar=force)
                         elif isinstance(item, dict) and item.get('name'):
-                            p = service.ensure_player(item['name'], item.get('note', ''), actor=user_id)
+                            extra = set(item) - {'name', 'note'}
+                            if extra:
+                                return 'کلید ناشناخته در بازیکن: ' + '، '.join(sorted(extra))
+                            p = service.ensure_player(item['name'], item.get('note', ''), actor=user_id,
+                                                      allow_similar=force)
                         else:
                             continue
                         created.append(f"#{p['id']} {p['name']}")
@@ -270,9 +293,13 @@ class SansAgent:
                     return 'بازیکنان ثبت/به‌روز شدند: ' + ('، '.join(created) if created else 'موردی نبود')
 
                 if operation == 'save_session':
+                    unknown = set(data) - {'title', 'when_text', 'date', 'location', 'person_fee',
+                                           'venue_cost', 'note', 'session', 'session_id'}
+                    if unknown:
+                        return 'کلید ناشناخته در سانس: ' + '، '.join(sorted(unknown))
                     s = service.save_session_flexible(
                         title=data.get('title'),
-                        when_text=data.get('when_text'),
+                        when_text=data.get('when_text') or data.get('date'),
                         location=data.get('location'),
                         person_fee=data.get('person_fee'),
                         venue_cost=data.get('venue_cost'),
@@ -284,6 +311,14 @@ class SansAgent:
                     return f"سانس #{s['id']} «{s['title']}» با موفقیت ذخیره شد (زمان: {s['when_text'] or s['session_at'] or 'بدون تاریخ'}، سهم هر نفر: {s['person_fee']:,} تومان)."
 
                 if operation == 'set_attendance':
+                    unknown = set(data) - {'session', 'session_id', 'present', 'attendees',
+                                           'players', 'absent'}
+                    if unknown:
+                        return 'کلید ناشناخته در ثبت حضور: ' + '، '.join(sorted(unknown))
+                    present = data.get('present', data.get('attendees', data.get('players', [])))
+                    absent = data.get('absent', [])
+                    if not isinstance(present, list) or not isinstance(absent, list):
+                        return 'فهرست حاضران و غایبان باید آرایه باشد.'
                     s_ref = data.get('session') or data.get('session_id') or effects.get('last_session_id')
                     try:
                         s = service.session(s_ref, draft=False)
@@ -294,19 +329,29 @@ class SansAgent:
                             raise
                     if s['finalized']:
                         return 'این سانس نهایی شده است؛ برای تغییر مالی از propose_financial_change استفاده کنید.'
-                    added = []
-                    for item in data.get('present', []):
+                    # Resolve every name first: a half-applied attendance list is
+                    # worse than a clear error, and no player is created here.
+                    planned, missing = [], []
+                    for item in present:
                         if isinstance(item, str):
                             p_name, guests = item, 0
                         elif isinstance(item, dict):
+                            extra = set(item) - {'name', 'player', 'guests'}
+                            if extra:
+                                return 'کلید ناشناخته در حاضران: ' + '، '.join(sorted(extra))
                             p_name = item.get('name') or item.get('player') or ''
                             guests = integer(item.get('guests', 0), 'مهمان', 0, 50)
                         else:
                             continue
                         try:
-                            p = service.player(p_name)
+                            planned.append((service.player(p_name), guests))
                         except UserError:
-                            p = service.ensure_player(p_name, actor=user_id)
+                            missing.append(str(p_name).strip() or '—')
+                    if missing:
+                        return ('حضور ثبت نشد؛ این نام‌ها در فهرست بازیکنان نیست:\n' + '، '.join(missing) +
+                                '\nاول با upsert_players بازیکن را با نام کامل ثبت کنید یا نام درست را از فهرست انتخاب کنید.')
+                    added = []
+                    for p, guests in planned:
                         db.execute(
                             '''INSERT INTO attendance VALUES (?,?,?) ON CONFLICT(session_id,player_id)
                                DO UPDATE SET guests=excluded.guests''',
@@ -329,18 +374,67 @@ class SansAgent:
                     )
 
                 if operation == 'update_settings':
-                    changed = []
-                    for key in ('card', 'payment_note'):
-                        if key in data and data[key] is not None:
-                            db.set_setting(key, str(data[key]).strip())
-                            changed.append(key)
-                    if 'approval_required' in data and data['approval_required'] is not None:
-                        db.set_setting('approval_required', 'true' if data['approval_required'] else 'false')
-                        changed.append('approval_required')
-                    db.audit(user_id, 'settings', data)
-                    return 'تنظیمات به‌روزرسانی شد: ' + ', '.join(changed)
+                    if not admin:
+                        return 'خطا: این عملیات مدیریتی فقط برای ادمین مجاز است.'
+                    allowed = ('card', 'payment_note', 'approval_required')
+                    if any(key not in allowed for key in data):
+                        return 'کلید تنظیم نامعتبر است.'
+                    changes = {}
+                    for key in allowed:
+                        if key not in data or data[key] is None:
+                            continue
+                        value = data[key]
+                        if key == 'approval_required' and not isinstance(value, bool):
+                            return 'وضعیت تأیید باید true یا false باشد.'
+                        if not setting_value_is_explicit(current_message, key, value):
+                            return 'مقدار تنظیم باید صریحاً در همین پیام نوشته شود؛ پاسخ‌هایی مثل «آره انجامش بده» کافی نیستند.'
+                        changes[key] = value
+                    if not changes:
+                        return 'مقدار تنظیمی برای تغییر مشخص نشد.'
+                    # Settings are never written by the model; the admin must
+                    # press «تأیید» on the attached inline keyboard.
+                    preview, markup = bot.propose_settings(changes, user_id, chat_id)
+                    effects['markup'] = markup
+                    effects['proposal_preview'] = preview
+                    return f'پیشنهاد تغییر تنظیمات آماده شد و دکمه‌های تأیید/رد ضمیمه گردید:\n{preview}'
+
+                if operation == 'rename_player':
+                    unknown = set(data) - {'player', 'name'}
+                    if unknown:
+                        return 'کلید ناشناخته در تغییرنام: ' + '، '.join(sorted(unknown))
+                    result = service.rename_player(data.get('player', ''), data.get('name'), actor=user_id)
+                    effects['last_player_id'] = result['id']
+                    return (f"نام بازیکن #{result['id']} از «{result['old']}» به «{result['new']}» تغییر کرد؛ "
+                            'شناسه و کل تاریخچه حفظ شد.')
+
+                if operation in ('merge_player', 'merge_players'):
+                    unknown = set(data) - {'source', 'target', 'source_id', 'target_id'}
+                    if unknown:
+                        return 'کلید ناشناخته در ادغام: ' + '، '.join(sorted(unknown))
+                    cmd = {'action': 'player_merge', 'args': {
+                        'source': data.get('source', data.get('source_id')),
+                        'target': data.get('target', data.get('target_id'))}}
+                    preview, markup = bot.propose(cmd, user_id, chat_id)
+                    effects['markup'] = markup
+                    effects['proposal_preview'] = preview
+                    return f'پیشنهاد ادغام آماده شد و دکمه‌های تأیید/رد ضمیمه گردید:\n{preview}'
+
+                if operation == 'delete_player':
+                    unknown = set(data) - {'player'}
+                    if unknown:
+                        return 'کلید ناشناخته در حذف بازیکن: ' + '، '.join(sorted(unknown))
+                    cmd = {'action': 'player_delete', 'args': {'player': data.get('player', '')}}
+                    preview, markup = bot.propose(cmd, user_id, chat_id)
+                    effects['markup'] = markup
+                    effects['proposal_preview'] = preview
+                    return f'پیشنهاد حذف بازیکن آماده شد و دکمه‌های تأیید/رد ضمیمه گردید:\n{preview}'
+
+                if operation == 'duplicates':
+                    return service.duplicates_report()
 
                 return f'عملیات {operation} شناخته نشد.'
+            except UserError as exc:
+                return str(exc)
             except Exception as exc:
                 return f'خطا در اجرای عملیات: {exc}'
 
@@ -365,10 +459,9 @@ class SansAgent:
                 if action == 'finalize':
                     cmd = {'action': 'finalize', 'args': {'session': session or effects.get('last_session_id') or 'current'}}
                 elif action == 'adjustment':
-                    try:
-                        p = service.player(player)
-                    except UserError:
-                        p = service.ensure_player(player, actor=user_id)
+                    # A financial correction never creates a player as a side
+                    # effect; an unknown or partial name must be clarified.
+                    p = service.player(player)
                     cmd = {'action': 'adjustment', 'args': {'player': p['id'], 'amount': amount, 'note': note or 'اصلاح حساب توسط ادمین'}}
                 elif action == 'settle':
                     p = service.player(player)
@@ -380,6 +473,8 @@ class SansAgent:
                 effects['markup'] = markup
                 effects['proposal_preview'] = preview
                 return f'پیشنهاد مالی آماده شد و دکمه‌های تأیید/رد ضمیمه گردید:\n{preview}'
+            except UserError as exc:
+                return str(exc)
             except Exception as exc:
                 return f'خطا در ساخت پیشنهاد مالی: {exc}'
 
@@ -403,6 +498,7 @@ class SansAgent:
         admin: bool,
         sender: dict | None = None,
         llm_override: Any = None,
+        current_message: str | None = None,
     ) -> tuple[str, list | None, dict[str, Any]]:
         """Execute the LangGraph StateGraph for one conversational turn."""
         turn_start = time.monotonic()
@@ -412,13 +508,15 @@ class SansAgent:
             or str(user_id)
         )
         effects: dict[str, Any] = {'tool_calls': []}
-        raw_tools = self._make_tools(chat_id, user_id, admin, sender, effects)
+        raw_tools = self._make_tools(chat_id, user_id, admin, sender, effects, current_message or body)
 
         # Wrap tools to log every tool invocation and its output
         tools = raw_tools
 
         if llm_override is not None:
             llm = llm_override.bind_tools(tools) if hasattr(llm_override, 'bind_tools') else llm_override
+            llms = [llm]
+            models = ['override']
         else:
             llm = ChatOpenAI(
                 model=self.bot.config.ai_model,
@@ -427,7 +525,19 @@ class SansAgent:
                 temperature=0.2,
                 max_retries=1,
                 timeout=35,
-            ).bind_tools(tools)
+            )
+            models = list(dict.fromkeys(
+                (self.bot.config.ai_model,) + tuple(self.bot.config.ai_fallback_models)))
+            llms = [llm.bind_tools(tools)]
+            for fallback_model in models[1:]:
+                llms.append(type(llm)(
+                    model=fallback_model,
+                    api_key=self.bot.config.ai_key,
+                    base_url=self.bot.config.ai_url,
+                    temperature=0.2,
+                    max_retries=1,
+                    timeout=35,
+                ).bind_tools(tools))
 
         snapshot = self._build_live_snapshot(chat_id, user_id, admin, sender)
         # Do NOT append self.bot.system_prompt (which instructs legacy JSON-only output).
@@ -437,10 +547,43 @@ class SansAgent:
             + snapshot
         )
 
+        working = {'index': 0}
+
         def call_model(state: MessagesState):
             t0 = time.monotonic()
             messages = [SystemMessage(content=sys_text)] + state['messages']
-            response = llm.invoke(messages)
+            # Start from the model that last answered; within one turn there are
+            # usually two model calls (tool round + final answer) and there is no
+            # reason to retry a model that already failed in this turn.
+            order = list(range(len(llms)))
+            start = working['index']
+            order = order[start:] + order[:start]
+            response = None
+            last_error = None
+            for position, index in enumerate(order):
+                try:
+                    response = llms[index].invoke(messages)
+                    working['index'] = index
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if position + 1 >= len(order):
+                        break
+                    failed, nxt = models[index], models[order[position + 1]]
+                    LOG.warning('LLM model %s failed (%s); trying fallback %s', failed, exc, nxt)
+                    self.bot.db.log_agent_event(
+                        chat_id,
+                        user_id,
+                        sender_name,
+                        'LLM_FALLBACK',
+                        summary=f'{failed} -> {nxt}',
+                        details={'failed_model': failed, 'fallback_model': nxt,
+                                 'error': f'{type(exc).__name__}: {exc}'[:300]},
+                    )
+            if response is None:
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError('no AI model is configured')
             dt_ms = int((time.monotonic() - t0) * 1000)
             tcalls = getattr(response, 'tool_calls', None) or []
             if tcalls:

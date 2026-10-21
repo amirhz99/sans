@@ -97,3 +97,8 @@ python3 -m unittest discover -s tests -t . -v
 python3 -m compileall -q app tests
 git diff --check
 ```
+
+## Notes
+
+- SPEC-007 supersedes the implicit player creation in `set_attendance`; the
+  agent now asks for a full name instead of adding a new player row.
