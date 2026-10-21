@@ -96,8 +96,11 @@ cp .env.example .env && chmod 600 .env
 .venv/bin/python3 run.py
 ```
 
-`BALE_BOT_TOKEN`، `ADMIN_GROUP_ID` و کلید/مدل AI را در `.env` بگذارید. فایل `.env`، پوشهٔ `data/` و همهٔ `*.sqlite3*` در git نیستند؛ برای کار روی دادهٔ واقعی، `data/sans.sqlite3` را جداگانه (مثلاً با `scp`) کپی کنید و همان مقدار `DATABASE_PATH` را تنظیم کنید. تست‌ها توکن و شبکه لازم ندارند:
+روی ویندوز، مسیر مفسر `.venv\Scripts\python.exe` است (مثلاً `.venv\Scripts\python.exe run.py`).
 
+`BALE_BOT_TOKEN`، `ADMIN_GROUP_ID` و کلید/مدل AI را در `.env` بگذارید. فایل `.env`، پوشهٔ `data/` و همهٔ `*.sqlite3*` در git نیستند؛ برای کار روی دادهٔ واقعی، `data/sans.sqlite3` را جداگانه (مثلاً با `scp`) کپی کنید و همان مقدار `DATABASE_PATH` را تنظیم کنید (فایل `data/sans.sqlite3.lock` را کپی نکنید). روی ویندوز، بستهٔ `tzdata` در `requirements.txt` لازم است تا `Asia/Tehran` شناسایی شود.
+
+تست‌ها توکن و شبکه لازم ندارند:
 ```bash
 python3 -m unittest discover -s tests -t . -v
 python3 -m compileall -q app tests

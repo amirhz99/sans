@@ -3,3 +3,6 @@
 langchain-core==1.6.11
 langchain-openai==1.7.2
 langgraph==1.2.15
+# Windows (and other systems without a system tz database) needs this for
+# zoneinfo.ZoneInfo('Asia/Tehran'); harmless where the system database exists.
+tzdata>=2024.1
