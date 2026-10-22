@@ -18,11 +18,26 @@ from .clients import AIClient, APIError, BaleClient
 from .config import Config, ROOT, load_env
 from .db import Database
 from .service import UserError, integer, normalize, text
+from .turns import TurnBuffer
 
 LOG = logging.getLogger('sans')
 ACKNOWLEDGEMENT = 'پیامتان دریافت شد؛ در حال بررسی هستم…'
 # SPEC-013: how often the polling loop looks for expired proposal cards.
 SWEEP_INTERVAL = 300
+# SPEC-018: how long two back-to-back messages from one person are merged into a
+# single turn.  ``0`` disables coalescing and restores one reply per message.
+TURN_COALESCE_SECONDS = 1.2
+
+
+def coalesce_seconds():
+    """Read the coalescing window from the environment, clamped and safe."""
+    raw = os.getenv('TURN_COALESCE_SECONDS', '').strip()
+    if not raw:
+        return TURN_COALESCE_SECONDS
+    try:
+        return min(10.0, max(0.0, float(raw)))
+    except ValueError:
+        return TURN_COALESCE_SECONDS
 
 
 @contextmanager
@@ -278,6 +293,8 @@ def run(db, config):
         db.set_setting('bot_id', me['id'])
         db.set_setting('bot_username', me.get('username', ''))
     bot = Bot(db, config, AIClient(config))
+    # SPEC-018: merge rapid fragments into one turn instead of answering each one.
+    turns = TurnBuffer(coalesce_seconds())
     # SPEC-013: close proposals that expired while the bot was not running, then
     # keep doing it on a bounded interval. No API request is involved.
     with db.conn:
@@ -296,8 +313,33 @@ def run(db, config):
                     LOG.info('Closed %s expired proposals', closed)
             bot.remind()
             flush_outbox(db, client)
-            updates = client.call('getUpdates', {'offset': int(db.setting('offset', '0')), 'timeout': 20, 'limit': 50})
+            # SPEC-018: deliver the turns whose short window has closed before
+            # asking for new updates, so a reply never waits on the long poll.
+            for turn in turns.ready(time.time()):
+                bot.process(turn, turn.get('_ack'))
+                flush_outbox(db, client)
+            # A pending turn must not sit behind the 20 second long poll.
+            poll_timeout = 20 if not len(turns) else 1
+            updates = client.call('getUpdates', {'offset': int(db.setting('offset', '0')),
+                                                 'timeout': poll_timeout, 'limit': 50})
             for update in sorted(updates or [], key=lambda u: u['update_id']):
+                state = turns.add(update, time.time())
+                if state == 'joined':
+                    continue
+                if state == 'new':
+                    # Acknowledge the first fragment immediately; the reply comes
+                    # once the person stops typing for the window.
+                    chat_id = bot.acknowledgement_chat(update)
+                    if chat_id is not None:
+                        message_id = send_acknowledgement(client, chat_id)
+                        if message_id is not None:
+                            update['_ack'] = {'chat_id': chat_id, 'message_id': message_id}
+                    continue
+                # Not coalesced (command, receipt, contact): keep this person's
+                # earlier fragments ahead of it so order is preserved.
+                for pending in turns.flush_key(update):
+                    bot.process(pending, pending.get('_ack'))
+                    flush_outbox(db, client)
                 chat_id = bot.acknowledgement_chat(update)
                 acknowledgement = None
                 if chat_id is not None:

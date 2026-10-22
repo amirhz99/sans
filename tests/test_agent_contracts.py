@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from app.ai_context import AIContextBuilder
 from app.agent import AGENT_SYSTEM_PROMPT, SansAgent
+from app.clients import AIClient
 from app.content import DEFAULTS, SYSTEM_PROMPT
 from app.db import Database
 from app.domain import ConversationState, EntityRef, EntityType, Intent, ResponseLevel
@@ -1115,6 +1116,49 @@ class SessionDefaultsContextTests(unittest.TestCase):
 
         self.assertEqual(context['session_defaults']['location'], DEFAULTS['location'])
         self.assertEqual(context['session_defaults']['person_fee'], DEFAULTS['person_fee'])
+
+
+class ChatMemoryWindowTests(unittest.TestCase):
+    """SPEC-018: memory depth is bounded and named, not scattered."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp.name) / 'memory.sqlite3')
+        self.service = Service(self.db)
+        self.bot = Bot(self.db, SimpleNamespace(admin_group=-100, bot_name='sans',
+                                               reminder_hours=0, admins=frozenset({1})), None)
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def test_snapshot_is_bounded(self):
+        with self.db.conn:
+            for index in range(60):
+                self.db.log_message(-100, 1, 'ادمین', f'پیام {index}', 'user')
+
+        snapshot = json.loads(SansAgent(self.bot)._build_live_snapshot(-100, 1, True, None))
+
+        self.assertEqual(len(snapshot['recent_chat_messages']), 20)
+        self.assertEqual(snapshot['recent_chat_messages'][-1]['text'], 'پیام 59')
+        self.assertLessEqual(len(snapshot['recent_chat_messages']), 30)
+
+    def test_legacy_route_sends_a_deeper_but_capped_history(self):
+        config = SimpleNamespace(ai_url='https://example.com/v1', ai_key='fake-key',
+                                 ai_model='fake-model', ai_fallback_models=())
+        history = [{'role': 'user' if index % 2 == 0 else 'assistant',
+                    'content': f'{index} ' + ('x' * 2000)} for index in range(20)]
+
+        with patch('app.clients.post_json',
+                   return_value={'choices': [{'message': {'content': '{"action":"card","args":{}}'}}]}) as post:
+            AIClient(config).parse('کارت', history, {'role': 'player'})
+
+        payload = json.loads(post.call_args.args[1]['messages'][1]['content'])
+        self.assertEqual(len(payload['history']), 8)
+        self.assertTrue(all(len(item['content']) <= 1000 for item in payload['history']))
+        # The tail, not the head, of the conversation is replayed.
+        self.assertTrue(payload['history'][0]['content'].startswith('12 '))
+        self.assertTrue(payload['history'][-1]['content'].startswith('19 '))
 
 
 if __name__ == '__main__':

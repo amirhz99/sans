@@ -192,6 +192,11 @@ class Bot:
         uid = update.get('update_id')
         if not isinstance(uid, int):
             return
+        # SPEC-018: a coalesced turn represents several real updates; mark every
+        # one of them processed so a restart cannot replay a fragment.
+        coalesced = [ident for ident in (update.get('_coalesced') or [])
+                     if isinstance(ident, int) and not isinstance(ident, bool)]
+        offset = max([uid, *coalesced]) + 1
         # All domain changes, update offset, and outbound messages commit atomically.
         with self.db.conn:
             # An explicit outer transaction is essential: RELEASE of a root SAVEPOINT
@@ -204,7 +209,7 @@ class Bot:
                 # an unauthorized group.  This is infrastructure bookkeeping,
                 # not message, conversation, or domain persistence.
                 self.db.execute('INSERT INTO processed_updates(update_id) VALUES (?)', (uid,))
-                self.db.set_setting('offset', uid + 1)
+                self.db.set_setting('offset', offset)
                 return
             callback = update.get('callback_query')
             if callback:
@@ -212,7 +217,10 @@ class Bot:
             elif update.get('message'):
                 self.message(update['message'], acknowledgement)
             self.db.execute('INSERT INTO processed_updates(update_id) VALUES (?)', (uid,))
-            self.db.set_setting('offset', uid + 1)
+            for ident in coalesced:
+                self.db.execute('INSERT OR IGNORE INTO processed_updates(update_id) VALUES (?)',
+                                (ident,))
+            self.db.set_setting('offset', offset)
 
     def new_pending(self, kind, payload, user_id, chat_id):
         ident = uuid.uuid4().hex[:16]

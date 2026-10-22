@@ -17,6 +17,13 @@ from .service import MAX_BATCH, TEHRAN, UserError, integer, setting_value_is_exp
 
 LOG = logging.getLogger('sans.agent')
 
+# SPEC-018: how much conversation the agent may look at.  The database keeps
+# HISTORY_LIMIT entries; the agent reads this window and sends a shorter tail to
+# the model so a long chat cannot inflate the prompt without bound.
+CHAT_MEMORY_WINDOW = 30
+SNAPSHOT_MESSAGES = 20
+CONVERSATION_HISTORY = 20
+
 
 AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمند، صمیمی، دقیق و همه‌فن‌حریفِ مدیریت سانس فوتبال در پیام‌رسان بله.
 تو یک ربات خشک و قالبی نیستی؛ مثل یک مسئول واقعی سانس فوتبال فکر می‌کنی، گفتگوهای گروه و پی‌وی را می‌فهمی، با ابزارهایت دیتابیس را می‌خوانی یا آپدیت می‌کنی و همیشه طبیعی، کوتاه و شفاف به فارسی جواب می‌دهی.
@@ -104,7 +111,7 @@ class SansAgent:
         open_sessions = db.all('SELECT * FROM sessions WHERE finalized=0 ORDER BY id DESC LIMIT 5')
         recent_sessions = db.all('SELECT * FROM sessions ORDER BY id DESC LIMIT 8')
         players_count = db.one('SELECT COUNT(*) n FROM players')['n']
-        chat_log = db.recent_messages(chat_id, limit=14)
+        chat_log = db.recent_messages(chat_id, limit=CHAT_MEMORY_WINDOW)
         defaults = service.session_defaults()
 
         snapshot = {
@@ -137,7 +144,7 @@ class SansAgent:
             # AGENTS.md: never send the complete player directory to the model.
             # The agent reads names or balances on demand through query_database.
             'players_count': players_count,
-            'recent_chat_messages': chat_log[-10:],
+            'recent_chat_messages': chat_log[-SNAPSHOT_MESSAGES:],
         }
         return json.dumps(snapshot, ensure_ascii=False)
 
@@ -812,7 +819,7 @@ class SansAgent:
         graph = builder.compile()
 
         lc_messages = []
-        for item in history[-10:]:
+        for item in history[-CONVERSATION_HISTORY:]:
             role = item.get('role')
             content = str(item.get('content', ''))
             if not content:

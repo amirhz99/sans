@@ -51,6 +51,9 @@ class BaleClient:
 # Kept as a module-level alias for callers that imported the old name.
 PROMPT = SYSTEM_PROMPT
 
+# SPEC-018: how many stored turns the legacy JSON route replays.
+HISTORY_TAIL = 8
+
 
 class AIClient:
     use_langgraph = True
@@ -70,9 +73,11 @@ class AIClient:
     def parse(self, message, history, context):
         # The model only needs a short tail for linguistic continuity.  The
         # structured context is the source of truth for identity and entities.
+        # SPEC-018: a deeper tail than the original four turns, still capped so a
+        # long chat cannot inflate the prompt.
         compact_history = [
             {'role': item.get('role'), 'content': str(item.get('content', ''))[:1000]}
-            for item in (history or [])[-4:]
+            for item in (history or [])[-HISTORY_TAIL:]
             if isinstance(item, dict) and item.get('role') in ('user', 'assistant')
         ]
         messages = [

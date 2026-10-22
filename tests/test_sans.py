@@ -22,6 +22,7 @@ from app.main import ACKNOWLEDGEMENT, flush_outbox, import_players, instance_loc
 from app.presentation import SessionView
 from app.prompt_loader import PromptLoader
 from app.service import Service, UserError, integer, normalize, normalize_phone, parse_session_datetime
+from app.turns import TurnBuffer
 
 
 class FakeAI:
@@ -2452,6 +2453,140 @@ class SessionDefaultsTests(BaseCase):
 
         self.assertEqual(self.db.all("SELECT * FROM pending WHERE kind='commands'"), [])
         self.assertNotIn('session_time', self.service.session_defaults())
+
+
+class ChatMemoryTests(BaseCase):
+    """SPEC-018: deeper bounded memory and one turn for rapid fragments."""
+
+    def update(self, ident, text, user=10, chat=10, **extra):
+        message = {'message_id': ident, 'chat': {'id': chat, 'type': 'private' if chat > 0 else 'group'},
+                   'from': {'id': user}, 'text': text, **extra}
+        return {'update_id': ident, 'message': message}
+
+    def test_back_to_back_messages_become_one_turn(self):
+        self.seed()
+        buffer = TurnBuffer(window=1.2)
+
+        self.assertEqual(buffer.add(self.update(1, 'سانس فردا'), 100.0), 'new')
+        self.assertEqual(buffer.add(self.update(2, 'ساعت ۹ شب لغو شد'), 100.4), 'joined')
+        self.assertEqual(buffer.add(self.update(3, 'به همه بگو'), 100.8), 'joined')
+        self.assertEqual(buffer.ready(101.0), [])
+
+        turns = buffer.ready(102.1)
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]['message']['text'], 'سانس فردا\nساعت ۹ شب لغو شد\nبه همه بگو')
+        self.assertEqual(turns[0]['_coalesced'], [1, 2, 3])
+        self.assertEqual(len(buffer), 0)
+
+    def test_fragments_from_different_people_are_never_merged(self):
+        buffer = TurnBuffer(window=1.2)
+
+        self.assertEqual(buffer.add(self.update(1, 'من می‌آیم', user=10, chat=10), 100.0), 'new')
+        self.assertEqual(buffer.add(self.update(2, 'من نمی‌آیم', user=11, chat=10), 100.2), 'new')
+        self.assertEqual(buffer.add(self.update(3, 'من هم', user=10, chat=-100), 100.3), 'new')
+
+        turns = buffer.ready(102.0)
+
+        self.assertEqual([turn['message']['text'] for turn in turns],
+                         ['من می‌آیم', 'من نمی‌آیم', 'من هم'])
+        self.assertTrue(all('_coalesced' not in turn for turn in turns))
+
+    def test_buffer_releases_the_turn_after_the_window(self):
+        buffer = TurnBuffer(window=2.0)
+        buffer.add(self.update(1, 'سلام'), 100.0)
+
+        self.assertEqual(buffer.ready(101.9), [])
+        self.assertEqual(len(buffer), 1)
+
+        turns = buffer.ready(102.0)
+        self.assertEqual([turn['update_id'] for turn in turns], [1])
+        self.assertEqual(len(buffer), 0)
+
+    def test_media_and_commands_are_never_coalesced(self):
+        buffer = TurnBuffer(window=1.2)
+
+        photo = self.update(1, 'رسید')
+        photo['message']['photo'] = [{'file_id': 'f', 'file_unique_id': 'f'}]
+        contact = self.update(2, '')
+        contact['message']['contact'] = {'user_id': 10, 'phone_number': '09121234567'}
+        callback = {'update_id': 3, 'callback_query': {'id': 'c', 'data': 'yes:x',
+                                                       'from': {'id': 1},
+                                                       'message': {'chat': {'id': -100}}}}
+
+        for update in (photo, contact, callback, self.update(4, '/cancel'), self.update(5, '   ')):
+            with self.subTest(update=update.get('update_id')):
+                self.assertIsNone(buffer.add(update, 100.0))
+        self.assertEqual(len(buffer), 0)
+
+    def test_buffer_is_bounded(self):
+        buffer = TurnBuffer(window=60.0, max_messages=3)
+
+        buffer.add(self.update(1, 'یک'), 100.0)
+        buffer.add(self.update(2, 'دو'), 100.1)
+        buffer.add(self.update(3, 'سه'), 100.2)
+
+        turns = buffer.ready(100.3)
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]['_coalesced'], [1, 2, 3])
+        self.assertEqual(len(buffer), 0)
+
+    def test_coalesced_updates_are_marked_processed(self):
+        self.seed()
+        self.ai.answer = {'action': 'clarify', 'args': {}, 'question': 'کدام سانس؟'}
+        update = self.update(7, 'سانس فردا\nساعت ۹ شب لغو شد')
+        update['_coalesced'] = [5, 6, 7]
+
+        self.bot.process(update)
+
+        processed = {row['update_id'] for row in self.db.all('SELECT update_id FROM processed_updates')}
+        self.assertTrue({5, 6, 7} <= processed)
+        self.assertEqual(self.db.setting('offset'), '8')
+        self.assertEqual(len(self.ai.calls), 1)
+        self.assertIn('ساعت ۹ شب لغو شد', self.ai.calls[0][0])
+
+    def test_zero_window_disables_coalescing(self):
+        buffer = TurnBuffer(window=0)
+
+        self.assertIsNone(buffer.add(self.update(1, 'سلام'), 100.0))
+        self.assertEqual(len(buffer), 0)
+
+    def test_a_command_flushes_the_pending_fragments_of_that_sender(self):
+        buffer = TurnBuffer(window=5.0)
+        buffer.add(self.update(1, 'سانس فردا'), 100.0)
+        buffer.add(self.update(2, 'ساعت ۹'), 100.1)
+
+        pending = buffer.flush_key(self.update(3, '/cancel'))
+
+        self.assertEqual([turn['update_id'] for turn in pending], [2])
+        self.assertEqual(pending[0]['message']['text'], 'سانس فردا\nساعت ۹')
+        # A second call has nothing left to return for this sender.
+        self.assertEqual(buffer.flush_key(self.update(3, '/cancel')), [])
+        self.assertEqual(len(buffer), 0)
+
+    def test_conversation_history_keeps_the_last_forty_turns(self):
+        history = [{'role': 'user' if index % 2 == 0 else 'assistant', 'content': f'پیام {index}'}
+                   for index in range(120)]
+
+        with self.db.conn:
+            self.db.save_conversation(10, 10, {}, history)
+
+        stored = json.loads(self.db.one('SELECT history FROM conversations')['history'])
+        self.assertEqual(len(stored), 40)
+        self.assertEqual(stored[-1]['content'], 'پیام 119')
+        self.assertEqual(stored[0]['content'], 'پیام 80')
+
+    def test_coalesced_turn_is_stored_once(self):
+        self.seed()
+        self.ai.answer = {'action': 'clarify', 'args': {}, 'question': 'کدام سانس؟'}
+        update = self.update(9, 'سانس فردا\nساعت ۹ شب')
+        update['_coalesced'] = [8, 9]
+
+        self.bot.process(update)
+
+        rows = self.db.all("SELECT text FROM chat_messages WHERE role='user'")
+        self.assertEqual([row['text'] for row in rows], ['سانس فردا\nساعت ۹ شب'])
 
 
 if __name__ == '__main__':

@@ -7,6 +7,11 @@ def dumps(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
 
+# SPEC-018: deeper conversational memory, still bounded so one chat cannot grow
+# without limit.  The agent and the legacy JSON route each read a shorter tail.
+HISTORY_LIMIT = 40
+
+
 class Database:
     def __init__(self, path):
         path = Path(path)
@@ -115,7 +120,7 @@ class Database:
     def save_conversation(self, chat_id, user_id, state, history):
         self.execute('''INSERT INTO conversations VALUES (?,?,?,?)
             ON CONFLICT(chat_id,user_id) DO UPDATE SET state=excluded.state,history=excluded.history''',
-                     (chat_id, user_id, dumps(state), dumps(history[-20:])))
+                     (chat_id, user_id, dumps(state), dumps(history[-HISTORY_LIMIT:])))
 
     def log_message(self, chat_id, user_id, sender_name, text, role='user'):
         if not text or not str(text).strip():
