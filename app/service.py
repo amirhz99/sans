@@ -195,7 +195,13 @@ def parse_session_datetime(value, now=None):
 
 ADMIN_ACTIONS = {'new_player', 'new_session', 'update_session', 'attendance',
                  'finalize', 'adjustment', 'settings', 'player_note', 'settle',
-                 'player_rename', 'player_merge', 'player_delete'}
+                 'player_rename', 'player_merge', 'player_delete', 'broadcast'}
+
+# SPEC-012/014: one card never carries more than this many commands or
+# recipients; a longer request is a sign of a parsing mistake.
+MAX_BATCH = 30
+MAX_RECIPIENTS = 200
+BROADCAST_LIMIT = 3500
 
 SETTING_LABELS = {'card': 'شماره کارت', 'payment_note': 'پیام راهنمای پرداخت',
                   'approval_required': 'بررسی رسید توسط ادمین'}
@@ -597,6 +603,41 @@ class Service:
     def card(self):
         return self.db.setting('card') or 'شماره کارت هنوز ثبت نشده؛ از ادمین‌ها می‌پرسم.'
 
+    def broadcast_recipients(self, player_ids=None):
+        """Return (recipients, unreachable names) for a proactive message.
+
+        Only a player with a linked Bale account can be addressed directly; an
+        unlinked name is reported instead of being guessed (SPEC-014).
+        """
+        if player_ids is None:
+            rows = self.db.all('SELECT id, name, bale_id FROM players ORDER BY id')
+        else:
+            rows = [self.player(ident) for ident in player_ids]
+        recipients, unreachable = [], []
+        for row in rows:
+            chat_id = row['bale_id']
+            if isinstance(chat_id, int) and not isinstance(chat_id, bool) and chat_id > 0:
+                recipients.append({'player': row['id'], 'name': row['name'], 'chat_id': chat_id})
+            else:
+                unreachable.append(row['name'])
+        return recipients, unreachable
+
+    def touch_contact(self, user_id, chat_id, display_name='', username='', phone=None):
+        """Remember a private chat address without touching domain state."""
+        if (isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0
+                or isinstance(chat_id, bool) or not isinstance(chat_id, int) or chat_id <= 0):
+            return None
+        self.db.execute(
+            '''INSERT INTO contacts(user_id,chat_id,display_name,username,phone) VALUES (?,?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,
+                 display_name=excluded.display_name, username=excluded.username,
+                 phone=COALESCE(NULLIF(excluded.phone,''), contacts.phone),
+                 updated_at=CURRENT_TIMESTAMP''',
+            (user_id, chat_id, str(display_name or '')[:200], str(username or '').lstrip('@')[:100],
+             str(phone or '')[:100]),
+        )
+        return user_id
+
     def session_info(self, ref=None, admin=False, level='summary'):
         """Render session information through the presentation layer.
 
@@ -738,6 +779,31 @@ class Service:
                 raise UserError('این حساب بدهی مثبت ندارد و قبلاً تسویه است.')
             a['amount'] = balance
             a['note'] = 'تسویه کامل توسط ادمین'
+        elif action == 'broadcast':
+            # SPEC-014: the audience is resolved from the database here, never
+            # taken from the model, and nothing is delivered before approval.
+            a['text'] = text(args.get('text'), 'متن پیام', limit=BROADCAST_LIMIT)
+            raw = args.get('players')
+            if raw is None or (isinstance(raw, str) and not raw.strip()) or raw == []:
+                a['players'] = None
+            elif isinstance(raw, str) and normalize(raw) in ('all', 'همه', 'همه بازیکن ها', 'همه بازیکن‌ها'):
+                a['players'] = None
+            else:
+                refs = (raw if isinstance(raw, list)
+                        else [ref for ref in re.split(r'[,،\n]+', str(raw)) if ref.strip()])
+                if len(refs) > MAX_RECIPIENTS:
+                    raise UserError(f'در هر ارسال حداکثر {MAX_RECIPIENTS} بازیکن مجاز است.')
+                ids = []
+                for ref in refs:
+                    ident = self.player(ref)['id']
+                    if ident not in ids:
+                        ids.append(ident)
+                if not ids:
+                    raise UserError('گیرنده‌ای مشخص نشد؛ نام بازیکن‌ها را بفرستید یا «همه» را بگویید.')
+                a['players'] = ids
+            recipients, _ = self.broadcast_recipients(a['players'])
+            if not recipients:
+                raise UserError('هیچ بازیکن متصلی برای دریافت پیام وجود ندارد؛ ابتدا بازیکن‌ها با /identify یا /bind به بله متصل شوند.')
         elif action == 'settings':
             key = args.get('key')
             if key not in ('card', 'payment_note', 'approval_required'):
@@ -751,6 +817,47 @@ class Service:
                 value = text(value, 'مقدار', False)
             a = {'key': key, 'value': value}
         return {'action': action, 'args': a}
+
+    def guard(self, command):
+        """Return the facts a proposal preview depends on (SPEC-011).
+
+        The fingerprint is stored with the proposal and recomputed right before
+        it is applied.  A mismatch means the world moved on since the admin saw
+        the preview, so the proposal expires instead of applying a stale amount.
+        Only identifiers, amounts, counts, and current values are returned; no
+        message text or private note is included.
+        """
+        action, a = command['action'], command['args']
+        if action == 'settle':
+            return {'balance': self.balance(a['player'])}
+        if action == 'finalize':
+            session = self.session(a['session'])
+            attendance = [[row['player_id'], row['guests']] for row in self.db.all(
+                'SELECT player_id, guests FROM attendance WHERE session_id=? ORDER BY player_id',
+                (session['id'],))]
+            return {'finalized': int(session['finalized']), 'person_fee': session['person_fee'],
+                    'attendance': attendance}
+        if action == 'settings':
+            return {'value': self.db.setting(a['key'])}
+        if action == 'attendance':
+            row = self.db.one('SELECT guests FROM attendance WHERE session_id=? AND player_id=?',
+                              (a['session'], a['player']))
+            return {'finalized': int(self.session(a['session'])['finalized']),
+                    'guests': None if row is None else row['guests']}
+        if action == 'update_session':
+            session = self.session(a['session'])
+            return {key: session[key] for key in sorted(a) if key != 'session'}
+        if action in ('player_note', 'player_rename'):
+            key = 'note' if action == 'player_note' else 'name'
+            return {key: self.player(a['player'])[key]}
+        if action == 'player_merge':
+            return {'source': a['source'], 'target': a['target']}
+        if action in ('adjustment', 'declare_debt', 'player_delete'):
+            return {'player': a['player']}
+        if action == 'broadcast':
+            recipients, _ = self.broadcast_recipients(a['players'])
+            return {'recipients': sorted(r['player'] for r in recipients), 'text': a['text']}
+        return {}
 
     def setting_display(self, key, value):
         """Render a stored setting value for a human reader."""
@@ -793,6 +900,18 @@ class Service:
             p = self.player(a['player'])
             return '\n'.join(['حذف بازیکن', f"#{p['id']} {p['name']}",
                               'این بازیکن هیچ حضور، تراکنش یا رسیدی ندارد.'])
+        if action == 'broadcast':
+            recipients, unreachable = self.broadcast_recipients(a['players'])
+            names = '، '.join(r['name'] for r in recipients[:10])
+            if len(recipients) > 10:
+                names += f' و {len(recipients) - 10} نفر دیگر'
+            lines = ['ارسال پیام به بازیکنان', a['text'], '',
+                     f'گیرندگان ({len(recipients)} نفر): {names}']
+            if unreachable:
+                lines.append(f'بدون حساب متصل و بدون دریافت پیام ({len(unreachable)} نفر): ' +
+                             '، '.join(unreachable[:10]))
+            lines.append('پیام فقط پس از تأیید شما ارسال می‌شود.')
+            return '\n'.join(lines)
         labels = {'new_player': 'ثبت بازیکن', 'new_session': 'ثبت سانس', 'update_session': 'تکمیل سانس',
                   'attendance': 'ثبت/اصلاح حضور', 'finalize': 'نهایی‌سازی بدهی سانس',
                   'adjustment': 'اصلاح حساب', 'declare_debt': 'ثبت بدهی اعلام‌شده',
@@ -823,7 +942,7 @@ class Service:
         return '\n'.join(lines)
 
     def apply(self, command, actor, source):
-        """Caller must hold a transaction and check proposal revision / authorization."""
+        """Caller must hold a transaction and check proposal guard / authorization."""
         action, a = command['action'], command['args']
         # Revalidate after confirmation as a defense in depth.
         raw = dict(a)
@@ -870,6 +989,19 @@ class Service:
         elif action == 'adjustment':
             self.db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',
                             (a['player'], a['amount'], a['note'], source))
+        elif action == 'broadcast':
+            # SPEC-014: one outreach row per recipient so delivery is traceable,
+            # and one private outbox row per message. Nothing is sent here.
+            recipients, _ = self.broadcast_recipients(a['players'])
+            for recipient in recipients:
+                outreach_id = self.db.execute(
+                    "INSERT INTO outreach(player_id,chat_id,text,status) VALUES (?,?,?,'queued')",
+                    (recipient['player'], recipient['chat_id'], a['text'])).lastrowid
+                self.db.queue('sendMessage', {'chat_id': recipient['chat_id'], 'text': a['text']},
+                              ref=f'outreach:{outreach_id}')
+            self.db.audit(actor, action, {'recipients': len(recipients), 'players': a['players'],
+                                          'text_length': len(a['text'])})
+            return
         elif action == 'settings':
             self.db.set_setting(a['key'], a['value'])
         elif action == 'player_note':

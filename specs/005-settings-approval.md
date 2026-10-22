@@ -56,8 +56,9 @@ until an admin in the configured admin group presses «تأیید».
 - `Bot.confirm` applies a `commands` proposal inside `SAVEPOINT
   apply_commands` and marks it `approved` or `rejected` exactly once. A second
   click on the same proposal fails closed.
-- A proposal expires after 24 hours or when `db.revision` changed since it was
-  created; the expired proposal applies nothing.
+- A proposal expires after 24 hours, or when its own underlying facts changed
+  since it was created (SPEC-011 replaced the former global `db.revision`
+  check); the expired proposal applies nothing.
 - Callbacks are accepted only from a member of `ADMIN_GROUP_ID`; a callback in
   a private chat or another group cannot apply the setting.
 - The model never writes `settings` directly; the tool only creates a proposal
@@ -85,8 +86,9 @@ until an admin in the configured admin group presses «تأیید».
   attaches the approval markup instead of calling `db.set_setting`.
 - [x] AC-007: `/setcard` is available to admins only, requires a value in the
   same message, and goes through the same proposal/approval flow.
-- [x] AC-008: A proposal whose `db.revision` changed expires and applies
-  nothing.
+- [x] AC-008: A proposal whose own underlying facts changed expires and applies
+  nothing. (Superseded by SPEC-011 AC-005: the expiry trigger is the proposal's
+  guard fingerprint, not the global `db.revision`.)
 - [x] AC-009: A callback from a private chat or another group cannot approve a
   settings proposal.
 - [x] AC-010: `/pending` shows a readable Persian settings summary instead of
@@ -103,7 +105,7 @@ until an admin in the configured admin group presses «تأیید».
 - AC-006 -> `tests/test_agent_contracts.py::AgentContractTests::test_langgraph_update_settings_creates_approval_proposal`
   and `tests/test_agent_contracts.py::AgentContractTests::test_langgraph_setting_proposal_applies_only_on_admin_approval`
 - AC-007 -> `tests/test_sans.py::SettingsApprovalTests::test_setcard_requires_admin_and_explicit_value`
-- AC-008 -> `tests/test_sans.py::SettingsApprovalTests::test_setting_proposal_expires_after_revision_change`
+- AC-008 -> `tests/test_sans.py::SettingsApprovalTests::test_setting_proposal_expires_when_value_changed`
 - AC-009 -> `tests/test_sans.py::SettingsApprovalTests::test_private_callback_cannot_approve_setting`
 - AC-010 -> `tests/test_sans.py::SettingsApprovalTests::test_pending_summary_shows_readable_setting_preview`
 

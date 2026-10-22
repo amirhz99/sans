@@ -21,6 +21,8 @@ from .service import UserError, integer, normalize, text
 
 LOG = logging.getLogger('sans')
 ACKNOWLEDGEMENT = 'پیامتان دریافت شد؛ در حال بررسی هستم…'
+# SPEC-013: how often the polling loop looks for expired proposal cards.
+SWEEP_INTERVAL = 300
 
 
 @contextmanager
@@ -195,8 +197,33 @@ def flush_outbox(db, client, limit=20, pace=0.15):
             break
         try:
             payload = json.loads(row['payload'])
-            client.call(row['method'], payload)
+            result = client.call(row['method'], payload)
         except APIError as exc:
+            chat_id = payload.get('chat_id') if isinstance(payload, dict) else None
+            if (row['method'] == 'sendMessage' and isinstance(chat_id, int)
+                    and not isinstance(chat_id, bool) and chat_id > 0
+                    and exc.code in (400, 403)):
+                # SPEC-014: the recipient blocked the bot or the chat no longer
+                # exists. Retrying can never succeed and would stall the queue
+                # for every other chat, so drop it and record the failure.
+                with db.conn:
+                    db.execute('DELETE FROM outbox WHERE id=?', (row['id'],))
+                    db.mark_delivery_failed(row['ref'])
+                LOG.warning('Outbox %s private send dropped (%s)', row['id'], exc)
+                if pace:
+                    time.sleep(pace)
+                continue
+            if row['method'] == 'answerCallbackQuery':
+                # A callback acknowledgement is a best-effort UI toast. The
+                # provider expires callback query ids quickly, so a rejected
+                # acknowledgement can never succeed on retry; the real response
+                # is a separate outbox row. Drop it instead of retrying forever.
+                with db.conn:
+                    db.execute('DELETE FROM outbox WHERE id=?', (row['id'],))
+                LOG.warning('Outbox %s answerCallbackQuery dropped (%s)', row['id'], exc)
+                if pace:
+                    time.sleep(pace)
+                continue
             if row['method'] == 'editMessageText':
                 # Editing is a presentation optimization. If it is rejected
                 # (for example because the provider no longer considers the
@@ -219,6 +246,12 @@ def flush_outbox(db, client, limit=20, pace=0.15):
         else:
             with db.conn:
                 db.execute('DELETE FROM outbox WHERE id=?', (row['id'],))
+                # SPEC-013/014: remember the provider message id of a proposal
+                # card or a proactive player message.
+                message_id = payload.get('message_id') if isinstance(payload, dict) else None
+                if isinstance(message_id, bool) or not isinstance(message_id, int):
+                    message_id = result.get('message_id') if isinstance(result, dict) else None
+                db.record_delivery(row['ref'], message_id)
         if pace:
             time.sleep(pace)
 
@@ -245,9 +278,22 @@ def run(db, config):
         db.set_setting('bot_id', me['id'])
         db.set_setting('bot_username', me.get('username', ''))
     bot = Bot(db, config, AIClient(config))
+    # SPEC-013: close proposals that expired while the bot was not running, then
+    # keep doing it on a bounded interval. No API request is involved.
+    with db.conn:
+        closed = bot.sweep_proposals()
+    if closed:
+        LOG.info('Closed %s expired proposals at startup', closed)
+    last_sweep = time.time()
     LOG.info('Bot started; polling enabled')
     while True:
         try:
+            if time.time() - last_sweep >= SWEEP_INTERVAL:
+                last_sweep = time.time()
+                with db.conn:
+                    closed = bot.sweep_proposals()
+                if closed:
+                    LOG.info('Closed %s expired proposals', closed)
             bot.remind()
             flush_outbox(db, client)
             updates = client.call('getUpdates', {'offset': int(db.setting('offset', '0')), 'timeout': 20, 'limit': 50})

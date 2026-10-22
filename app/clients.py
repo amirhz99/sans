@@ -10,9 +10,11 @@ LOG = logging.getLogger('sans.ai')
 
 
 class APIError(RuntimeError):
-    def __init__(self, message, retry_after=5):
+    def __init__(self, message, retry_after=5, code=None):
         super().__init__(message)
         self.retry_after = retry_after
+        # HTTP/provider status when known; ``None`` means "unknown, keep retrying".
+        self.code = code if isinstance(code, int) and not isinstance(code, bool) else None
 
 
 def post_json(url, payload, headers=None, timeout=45):
@@ -29,7 +31,7 @@ def post_json(url, payload, headers=None, timeout=45):
         except (ValueError, TypeError, AttributeError):
             pass
         # Never log URLs, headers, receipt text or provider bodies: they can contain secrets.
-        raise APIError(f'HTTP {exc.code}', retry) from None
+        raise APIError(f'HTTP {exc.code}', retry, code=exc.code) from None
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         raise APIError('Network error or invalid JSON response') from None
 
@@ -42,7 +44,7 @@ class BaleClient:
         result = post_json(f'{self.base}/{method}', payload)
         if not isinstance(result, dict) or not result.get('ok'):
             code = result.get('error_code', 'unknown') if isinstance(result, dict) else 'unknown'
-            raise APIError(f'Bale API error {code}')
+            raise APIError(f'Bale API error {code}', code=code)
         return result.get('result')
 
 

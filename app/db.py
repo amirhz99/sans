@@ -20,6 +20,19 @@ class Database:
         columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(sessions)')}
         if 'session_at' not in columns:
             self.conn.execute('ALTER TABLE sessions ADD COLUMN session_at TEXT')
+        # SPEC-011: proposals expire on their own facts, not on the global revision.
+        # Rows written before this column exists get '[]', which skips only the
+        # fingerprint check and keeps the 24 hour TTL behavior.
+        pending_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(pending)')}
+        if 'guard' not in pending_columns:
+            self.conn.execute("ALTER TABLE pending ADD COLUMN guard TEXT NOT NULL DEFAULT '[]'")
+        # SPEC-013: remember the delivered chat message of an approval card so a
+        # sweep can remove its buttons when the proposal expires.
+        if 'message_id' not in pending_columns:
+            self.conn.execute('ALTER TABLE pending ADD COLUMN message_id INTEGER')
+        outbox_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(outbox)')}
+        if 'ref' not in outbox_columns:
+            self.conn.execute('ALTER TABLE outbox ADD COLUMN ref TEXT')
         # Drop legacy trigger if present so incomplete/historical sessions work freely.
         self.conn.execute('DROP TRIGGER IF EXISTS sessions_require_session_at')
         self.conn.commit()
@@ -53,17 +66,38 @@ class Database:
                      (str(actor), action, dumps(details)))
         self.set_setting('revision', self.revision + 1)
 
-    def queue(self, method, payload):
-        self.execute('INSERT INTO outbox(method,payload) VALUES (?,?)', (method, dumps(payload)))
+    def queue(self, method, payload, ref=None):
+        self.execute('INSERT INTO outbox(method,payload,ref) VALUES (?,?,?)',
+                     (method, dumps(payload), ref))
 
-    def say(self, chat_id, text, buttons=None):
+    def say(self, chat_id, text, buttons=None, ref=None):
         # Bale's text limit is 4096. Keep chunks small; markup belongs on the last chunk.
         chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)] or ['—']
         for index, chunk in enumerate(chunks):
+            last = index == len(chunks) - 1
             payload = {'chat_id': chat_id, 'text': chunk}
-            if buttons and index == len(chunks) - 1:
+            if buttons and last:
                 payload['reply_markup'] = {'inline_keyboard': buttons}
-            self.queue('sendMessage', payload)
+            # SPEC-013: only the chunk that carries the keyboard identifies the card.
+            self.queue('sendMessage', payload, ref if last else None)
+
+    def record_delivery(self, ref, message_id):
+        """Store the provider message id of a referenced outbound row (SPEC-013/014)."""
+        if not ref or isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            return
+        kind, _, ident = str(ref).partition(':')
+        if kind == 'proposal':
+            self.execute('UPDATE pending SET message_id=? WHERE id=? AND message_id IS NULL',
+                         (message_id, ident))
+        elif kind == 'outreach':
+            self.execute("UPDATE outreach SET status='sent', message_id=?, delivered_at=CURRENT_TIMESTAMP "
+                         "WHERE id=? AND status='queued'", (message_id, ident))
+
+    def mark_delivery_failed(self, ref):
+        """Record a permanent delivery failure without touching financial state."""
+        kind, _, ident = str(ref or '').partition(':')
+        if kind == 'outreach':
+            self.execute("UPDATE outreach SET status='failed' WHERE id=? AND status='queued'", (ident,))
 
     def conversation(self, chat_id, user_id):
         row = self.one('SELECT * FROM conversations WHERE chat_id=? AND user_id=?', (chat_id, user_id))

@@ -18,6 +18,14 @@ from .service import ADMIN_ACTIONS, Service, UserError, integer, normalize, text
 # greeting that the model tried to turn into an operation.
 GREETING_REPLY = 'سلام! در خدمتم؛ بفرمایید چه کاری برایتان انجام دهم؟ برای راهنما /help را بفرستید.'
 
+# SPEC-011: a proposal stays trustworthy for one day.  Staleness is decided by
+# the proposal's own facts (see ``Service.guard``), never by the global revision
+# counter, so approving one card cannot expire its siblings.
+PROPOSAL_TTL = 86400
+
+# SPEC-014: a private reply to a proactive notice is handed back to the admins.
+RELAY_CONFIRMATION = 'پیام شما برای ادمین‌ها ارسال شد ✅'
+
 
 def buttons(yes, no):
     return [[{'text': 'تأیید', 'callback_data': yes}, {'text': 'رد', 'callback_data': no}]]
@@ -148,6 +156,27 @@ class Bot:
             return None
         return chat_id if (not body.startswith('/') or self.is_admin(chat_id, user_id)) else None
 
+    def proactive_answer(self, msg, chat_id, user_id):
+        """Return the outreach row when ``msg`` answers a proactive notice.
+
+        Only a reply to a message this bot delivered as outreach qualifies, and
+        only plain text: a photo or a contact is still handled by the receipt
+        and identity flows (SPEC-014).
+        """
+        if user_id in self.config.admins:
+            return None
+        if msg.get('contact') or msg.get('photo') or msg.get('document'):
+            return None
+        body = (msg.get('text') or '').strip()
+        reply_to = msg.get('reply_to_message')
+        if not body or not isinstance(reply_to, dict):
+            return None
+        message_id = reply_to.get('message_id')
+        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            return None
+        return self.db.one('SELECT * FROM outreach WHERE chat_id=? AND message_id=?',
+                           (chat_id, message_id))
+
     def process(self, update, acknowledgement=None):
         uid = update.get('update_id')
         if not isinstance(uid, int):
@@ -176,8 +205,13 @@ class Bot:
 
     def new_pending(self, kind, payload, user_id, chat_id):
         ident = uuid.uuid4().hex[:16]
-        self.db.execute('INSERT INTO pending(id,kind,payload,requester,chat_id,revision,created_at) VALUES (?,?,?,?,?,?,?)',
-                        (ident, kind, dumps(payload), user_id, chat_id, self.db.revision, int(time.time())))
+        # SPEC-011: store the facts this proposal depends on so a later approval
+        # can tell "my facts changed" apart from "somebody else changed anything".
+        guard = [self.service.guard(command) for command in payload] if kind == 'commands' else []
+        self.db.execute('INSERT INTO pending(id,kind,payload,requester,chat_id,revision,guard,created_at) '
+                        'VALUES (?,?,?,?,?,?,?,?)',
+                        (ident, kind, dumps(payload), user_id, chat_id, self.db.revision,
+                         dumps(guard), int(time.time())))
         return ident
 
     def propose_settings(self, changes, user_id, chat_id):
@@ -196,6 +230,45 @@ class Bot:
         return (preview + f'\n\nاین تغییر با تأیید شما اعمال می‌شود. کد: {ident}',
                 buttons('yes:' + ident, 'no:' + ident))
 
+    def propose_commands(self, commands, user_id, chat_id):
+        """Create one approval card for one or more already prepared commands.
+
+        Both the ordinary route and the multi-player settle route go through
+        here, so a batch request produces exactly one card and one click
+        (SPEC-011).
+        """
+        if not isinstance(commands, list) or not 1 <= len(commands) <= 30:
+            raise UserError('هر کارت بین ۱ تا ۳۰ دستور می‌پذیرد.')
+        # Duplicate targets in a batch are almost always a parsing mistake.
+        targets = [(c['action'], c['args'].get('session'), c['args'].get('player'),
+                    normalize(c['args'].get('name', ''))) for c in commands]
+        if len(set(targets)) != len(targets):
+            raise UserError('درخواست مورد تکراری دارد؛ لطفاً اصلاح کنید.')
+        ident = self.new_pending('commands', commands, user_id, chat_id)
+        preview = '\n\n'.join(self.service.preview(c) for c in commands)
+        tail = f'\n\nثبت شود؟ کد: {ident}'
+        if any(c['action'] != 'broadcast' for c in commands):
+            tail += '\nتمام مبلغ‌ها تومان هستند.'
+        return preview + tail, buttons('yes:' + ident, 'no:' + ident)
+
+    @staticmethod
+    def card_ref(markup):
+        """Return ``proposal:<id>`` when a reply carries an approval card.
+
+        Only the chunk that owns the «تأیید/رد» keyboard is tagged, so the
+        delivered message id can be recorded against the proposal (SPEC-013).
+        """
+        if not isinstance(markup, list) or not markup:
+            return None
+        try:
+            data = markup[0][0]['callback_data']
+        except (IndexError, KeyError, TypeError):
+            return None
+        if not isinstance(data, str):
+            return None
+        kind, _, ident = data.partition(':')
+        return 'proposal:' + ident if kind in ('yes', 'no') and ident else None
+
     def propose(self, command, user_id, chat_id):
         if command['action'] == 'settings':
             args = command.get('args', {})
@@ -211,14 +284,7 @@ class Bot:
                 commands.append(self.service.prepare(item['action'], item.get('args', {})))
         else:
             commands = [self.service.prepare(command['action'], command.get('args', {}))]
-        # Duplicate targets in a batch are almost always a parsing mistake.
-        targets = [(c['action'], c['args'].get('session'), c['args'].get('player'),
-                    normalize(c['args'].get('name', ''))) for c in commands]
-        if len(set(targets)) != len(targets):
-            raise UserError('درخواست دسته‌ای مورد تکراری دارد؛ لطفاً اصلاح کنید.')
-        ident = self.new_pending('commands', commands, user_id, chat_id)
-        preview = '\n\n'.join(self.service.preview(c) for c in commands)
-        return preview + f'\n\nثبت شود؟ کد: {ident}\nتمام مبلغ‌ها تومان هستند.', buttons('yes:' + ident, 'no:' + ident)
+        return self.propose_commands(commands, user_id, chat_id)
 
     def context(self, chat_id, user_id, admin, reply_to=None):
         state, _ = self.db.conversation(chat_id, user_id)
@@ -253,6 +319,10 @@ class Bot:
                        or sender.get('username', '') or str(user_id))
         if body and body.split('@')[0] != '/id':
             self.db.log_message(chat_id, user_id, sender_name, body, 'user')
+        if private:
+            # SPEC-014: remember the private address (and its latest profile
+            # name) so the bot can report who it is talking to.
+            self.service.touch_contact(user_id, chat_id, sender_name, sender.get('username', ''))
         reply_to = msg.get('reply_to_message') if isinstance(msg.get('reply_to_message'), dict) else None
         reply_body = ((reply_to or {}).get('text') or (reply_to or {}).get('caption') or '').strip()
         processing_body = body
@@ -260,6 +330,24 @@ class Bot:
             processing_body += '\n\n[متن پیام مورد پاسخ؛ فقط برای زمینه]\n' + reply_body[:2000]
         if body.split('@')[0] == '/id':
             self.db.say(chat_id, f'شناسهٔ گفتگو: {chat_id}\nشناسهٔ شما: {user_id}')
+            return
+        # SPEC-014: an answer to a proactive notice goes back to the admins
+        # instead of being routed to the model as a brand new question.
+        relayed = self.proactive_answer(msg, chat_id, user_id) if private else None
+        if relayed:
+            state, history = self.db.conversation(chat_id, user_id)
+            self.db.log_agent_event(
+                chat_id, user_id, sender_name, 'RELAYED_TO_ADMIN',
+                summary=body[:200],
+                details={'outreach': relayed['id'], 'player': relayed['player_id']},
+            )
+            self.db.say(self.config.admin_group,
+                        f'پاسخ {sender_name} (شناسهٔ بله {user_id}) به پیام شما:\n{body[:3000]}')
+            self.db.say(chat_id, RELAY_CONFIRMATION)
+            history += [{'role': 'user', 'content': body[:4000]},
+                        {'role': 'assistant', 'content': RELAY_CONFIRMATION}]
+            self.db.save_conversation(chat_id, user_id, state, history)
+            self.db.log_message(chat_id, 0, self.config.bot_name, RELAY_CONFIRMATION, 'assistant')
             return
         # In the admin group, don't interpret every ordinary conversation as a command.
         if not private and not self.addressed(msg, body):
@@ -372,6 +460,10 @@ class Bot:
                             if bare_greeting:
                                 raise UserError(GREETING_REPLY) from None
                             raise UserError('هوش مصنوعی فقط می‌تواند یک درخواست معتبر از ربات استخراج کند؛ دوباره واضح‌تر بنویسید.') from None
+                        # SPEC-014: `broadcast` is deliberately absent from the
+                        # domain Action enum, so the legacy JSON route can never
+                        # create one; only the agent tool and an explicit admin
+                        # click can.
                         allowed = ADMIN_ACTIONS | {'batch', 'card', 'config', 'debt', 'help', 'session_info', 'clarify',
                                                    'identify', 'payment_amount', 'declare_debt', 'admin_receipt',
                                                    'list_players', 'list_sessions', 'report'}
@@ -452,8 +544,11 @@ class Bot:
                 elif action == 'report':
                     reply = self.service.report()
                 elif action == 'pending':
+                    closed = self.expire_stale_proposals()
                     rows = self.db.all("SELECT * FROM pending WHERE status='pending' ORDER BY created_at DESC LIMIT 30")
                     reply = '\n\n'.join(self.pending_summary(r) for r in rows) or 'درخواست منتظری نیست.'
+                    if closed:
+                        reply += f'\n\n{closed} کارت قدیمی‌تر از ۲۴ ساعت بسته شد.'
                 elif action in ('confirm', 'deny'):
                     reply = self.confirm(args.get('id'), action == 'confirm', user_id)
                 elif action in ('approve', 'reject'):
@@ -492,9 +587,9 @@ class Bot:
             payload = {'chat_id': edit_chat, 'message_id': edit_message, 'text': reply}
             if markup:
                 payload['reply_markup'] = {'inline_keyboard': markup}
-            self.db.queue('editMessageText', payload)
+            self.db.queue('editMessageText', payload, self.card_ref(markup))
         else:
-            self.db.say(chat_id, reply, markup)
+            self.db.say(chat_id, reply, markup, self.card_ref(markup))
 
     @staticmethod
     def parse_amount(body):
@@ -619,6 +714,8 @@ class Bot:
 
     def receive_contact(self, contact, user_id, chat_id, state):
         phone = self._contact_phone(contact, user_id)
+        # SPEC-014: keep the verified phone in the address book as well.
+        self.service.touch_contact(user_id, chat_id, phone=phone)
         pending = self.db.one("SELECT * FROM pending WHERE requester=? AND chat_id=? "
                               "AND kind IN ('identity','claim') AND status='pending' "
                               "ORDER BY created_at DESC LIMIT 1", (user_id, chat_id))
@@ -801,6 +898,74 @@ class Bot:
         if changed:
             self.db.save_conversation(chat_id, user_id, state, history)
 
+    def expire_proposal(self, ident):
+        """Mark one proposal expired without touching any business state."""
+        self.db.execute("UPDATE pending SET status='expired' WHERE id=? AND status='pending'", (ident,))
+
+    def expire_stale_proposals(self, now=None):
+        """Close proposals older than ``PROPOSAL_TTL`` and report how many.
+
+        Called by /pending and by the periodic sweep so both share one rule
+        (SPEC-011 AC-007, SPEC-013).
+        """
+        return self.sweep_proposals(now)
+
+    def proposal_staleness(self, now=None):
+        """Return the cards the sweep must close (SPEC-013)."""
+        cutoff = int(time.time() if now is None else now) - PROPOSAL_TTL
+        rows = self.db.all("SELECT id, chat_id, message_id FROM pending "
+                           "WHERE status='pending' AND kind='commands' AND created_at < ? "
+                           "ORDER BY created_at", (cutoff,))
+        return [dict(row) for row in rows]
+
+    def sweep_proposals(self, now=None):
+        """Expire every stale card and remove the buttons of delivered ones.
+
+        Bookkeeping only: no ledger, player, session, or receipt row is touched.
+        The caller owns the transaction, so this can run inside ``process``.
+        """
+        stale = self.proposal_staleness(now)
+        for row in stale:
+            self.expire_proposal(row['id'])
+            message_id = row.get('message_id')
+            if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0:
+                self.db.queue('editMessageReplyMarkup', {
+                    'chat_id': row['chat_id'], 'message_id': message_id,
+                    'reply_markup': {'inline_keyboard': []},
+                })
+        if stale:
+            self.db.set_setting('last_sweep', int(time.time() if now is None else now))
+        return len(stale)
+
+    def assert_proposal_current(self, row, payload):
+        """Fail closed when a card is too old or its own facts changed.
+
+        Two distinct reasons produce two distinct messages, so the admin knows
+        whether to ask again or simply to approve a sibling card.
+        """
+        if time.time() - row['created_at'] > PROPOSAL_TTL:
+            self.expire_proposal(row['id'])
+            raise UserError('این کارت بیش از ۲۴ ساعت پیش ساخته شده و منقضی شده است؛ '
+                            'درخواست را دوباره بفرستید تا کارت تازه ساخته شود.')
+        try:
+            stored = json.loads(row['guard'] or '[]')
+        except (TypeError, ValueError):
+            stored = []
+        if not isinstance(stored, list):
+            stored = []
+        if not stored:
+            # Rows written before SPEC-011 have no fingerprint; the TTL above is
+            # the only rule they can be held to.
+            return
+        try:
+            current = [self.service.guard(command) for command in payload]
+        except (UserError, KeyError, TypeError):
+            current = None
+        if stored != current:
+            self.expire_proposal(row['id'])
+            raise UserError('از زمان ساخت این کارت، مانده یا اطلاعات مرتبط تغییر کرده است؛ '
+                            'برای دیدن وضعیت تازه دوباره درخواست بدهید.')
+
     def confirm(self, ident, approve, actor):
         ident = text(ident, 'کد درخواست', limit=32)
         row = self.db.one('SELECT * FROM pending WHERE id=?', (ident,))
@@ -810,9 +975,7 @@ class Bot:
         settings_change = (row['kind'] == 'commands' and isinstance(payload, list)
                            and any(isinstance(c, dict) and c.get('action') == 'settings' for c in payload))
         if approve and row['kind'] == 'commands':
-            if time.time() - row['created_at'] > 86400 or row['revision'] != self.db.revision:
-                self.db.execute("UPDATE pending SET status='expired' WHERE id=?", (ident,))
-                raise UserError('از زمان پیشنهاد، اطلاعات تغییر کرده یا ۲۴ ساعت گذشته است؛ برای دیدن خلاصهٔ تازه دوباره درخواست بدهید.')
+            self.assert_proposal_current(row, payload)
             self.db.execute('SAVEPOINT apply_commands')
             try:
                 for index, command in enumerate(payload):
@@ -839,7 +1002,7 @@ class Bot:
                     for player in self.db.all('''SELECT p.id,p.bale_id FROM attendance a JOIN players p ON p.id=a.player_id
                                                 WHERE a.session_id=? AND p.bale_id IS NOT NULL''', (command['args']['session'],)):
                         self.db.say(player['bale_id'], 'حساب سانس ثبت شد.\n' + self.service.debt(player['id']))
-            if not settings_change:
+            if not settings_change and not any(c.get('action') == 'broadcast' for c in payload):
                 self.ask_missing()
         if settings_change:
             return 'تنظیمات اعمال شد ✅' if approve else 'تغییر تنظیمات رد شد؛ هیچ مقداری تغییر نکرد.'

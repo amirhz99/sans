@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -12,7 +13,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import tools_condition
 
-from .service import TEHRAN, UserError, integer, setting_value_is_explicit
+from .service import MAX_BATCH, TEHRAN, UserError, integer, setting_value_is_explicit
 
 LOG = logging.getLogger('sans.agent')
 
@@ -32,10 +33,19 @@ AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمن�
      * تغییر تنظیمات (`card`، `payment_note`، `approval_required`) را با عملیات `update_settings` فقط به‌صورت پیشنهاد با دکمهٔ تأیید بساز؛ مقدار باید صریحاً در پیام همین نوبت کاربر نوشته شده باشد و هرگز از حافظه، پیام قبلی یا پاسخ‌هایی مثل «آره» برداشت نشود.
      * اگر کاربر «بازیکن عادی» است: می‌تواند با `manage_records` خودش را معرفی کند (`identify`) یا حضور خودش را در سانس باز ثبت/لغو کند (`attendance_self`).
      * هویت بازیکن‌ها را تمیز نگه دار: هرگز برای یک نام کوتاه، ناقص یا با املای متفاوت بازیکن جدید نساز. اگر ابزار فهرست بازیکن‌های مشابه را برگرداند، همان‌ها را با #شناسه نشان بده و نام کامل را بپرس.
+     * فهرست کامل بازیکنان از قبل در بافت نمی‌آید؛ هر وقت به نام یا شناسهٔ بازیکنان نیاز داشتی، `query_database` با target='players' را صدا بزن.
      * تغییرنام (`rename_player`) با درخواست صریح ادمین مستقیم انجام می‌شود؛ ادغام (`merge_player`) و حذف (`delete_player`) فقط با شناسه یا نام دقیق و همیشه به‌صورت کارت تأیید.
      * برای یافتن نام‌های تکراری از `query_database` با target='duplicate_players' استفاده کن.
    - تغییرات مالی در دفترکل (`propose_financial_change`):
      * نهایی‌سازی بدهی سانس (`finalize`)، اصلاح دستی بدهی/طلب بازیکن (`adjustment`)، تسویه حساب (`settle`) و اعلام بدهی توسط بازیکن (`declare_debt`) حساس هستند. برای این‌ها از `propose_financial_change` استفاده کن تا کارت تأیید با دکمه شیشه‌ای ساخته شود.
+     * اگر درخواست تسویه چند نفره است («بدهی همه را صاف کن»، «حساب این سه نفر را تسویه کن»)، همهٔ نام‌ها را در آرگومان `players` و جداشده با کاما بده تا **یک کارت واحد** ساخته شود. هرگز برای هر نفر کارت جدا نساز و برای هر نفر جداگانه ابزار را صدا نزن.
+     * اصلاح حساب چند نفره با مبلغ یکسان: نام‌ها را در `players` و مبلغ مشترک را در `amount` بده.
+     * اصلاح حساب با مبلغ متفاوت برای هر نفر: `entries` را به‌صورت JSON بده؛ مثلاً `[{{"player":"مهدی","amount":-150000}},{{"player":"رضا","amount":50000}}]`. هرگز `entries` را با `players` یا `amount` ترکیب نکن.
+     * در تسویهٔ گروهی، اعضایی که بدهی مثبت ندارند خودکار کنار گذاشته می‌شوند؛ لازم نیست آن‌ها را حذف کنی یا برایشان کارت بسازی.
+     * برای هر درخواست، حتی با ده نفر، فقط **یک بار** این ابزار را صدا بزن.
+   - پیام به بازیکنان (`message_players`):
+     * اگر ادمین خواست پیامی به یک یا چند بازیکن (یا همه) برسد («به همه بگو سانس فردا لغو شد»، «به مهدی و رضا بگو کارت عوض شد»)، متن دقیق پیام را در `text` و نام‌ها را در `players` بده. خالی گذاشتن `players` یعنی همهٔ بازیکنانِ متصل به بله.
+     * این ابزار فقط کارت تأیید می‌سازد؛ ارسال واقعی بعد از تأیید ادمین انجام می‌شود. پیام را خودت دوباره نفرست و برای هر نفر جداگانه صدا نزن. بازیکنان بدون حساب متصل پیام نمی‌گیرند؛ همین را شفاف بگو.
    - پرسش از ادمین‌ها (`ask_admins`):
      * اگر بازیکنی در پی‌وی ادعا یا سوالی مطرح کرد که به نظر ادمین نیاز دارد یا اطلاعات سانس/کارت هنوز مشخص نیست، با `ask_admins` در گروه ادمین بپرس.
 
@@ -90,7 +100,7 @@ class SansAgent:
         linked = service.linked(user_id)
         open_sessions = db.all('SELECT * FROM sessions WHERE finalized=0 ORDER BY id DESC LIMIT 5')
         recent_sessions = db.all('SELECT * FROM sessions ORDER BY id DESC LIMIT 8')
-        players = db.all('SELECT id, name, bale_id, note FROM players ORDER BY id')
+        players_count = db.one('SELECT COUNT(*) n FROM players')['n']
         chat_log = db.recent_messages(chat_id, limit=14)
 
         snapshot = {
@@ -120,11 +130,9 @@ class SansAgent:
                 }
                 for s in recent_sessions
             ],
-            'players_summary': (
-                [{'id': p['id'], 'name': p['name'], 'balance': service.balance(p['id'])} for p in players]
-                if admin
-                else [{'id': p['id'], 'name': p['name']} for p in players]
-            ),
+            # AGENTS.md: never send the complete player directory to the model.
+            # The agent reads names or balances on demand through query_database.
+            'players_count': players_count,
             'recent_chat_messages': chat_log[-10:],
         }
         return json.dumps(snapshot, ensure_ascii=False)
@@ -438,10 +446,75 @@ class SansAgent:
             except Exception as exc:
                 return f'خطا در اجرای عملیات: {exc}'
 
+        # SPEC-012: one card can carry several players.  ``entries`` exists
+        # because ``integer()`` rejects thousands separators, so a comma list
+        # cannot hold an amount per name.
+        def batch_refs(raw):
+            if isinstance(raw, list):
+                raw = '\n'.join(str(item) for item in raw)
+            return [ref.strip() for ref in re.split(r'[,،\n]+', str(raw or '')) if ref.strip()]
+
+        def entry_amount(value):
+            if isinstance(value, bool) or value is None:
+                raise UserError('مبلغ هر نفر باید عدد تومان باشد.')
+            cleaned = str(value).replace(',', '').replace('٬', '').strip()
+            return integer(cleaned, 'مبلغ هر نفر', -10**12)
+
+        def batch_entries(raw):
+            if isinstance(raw, str):
+                raw = raw.strip()
+                if not raw:
+                    return []
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    raise UserError('قالب entries باید JSON معتبر باشد؛ مثلاً '
+                                    '[{"player":"مهدی","amount":-150000}].') from None
+            if not isinstance(raw, list):
+                raise UserError('entries باید آرایه‌ای از {"player":…,"amount":…} باشد.')
+            if not raw:
+                raise UserError('entries خالی است؛ برای هر نفر نام و مبلغ را مشخص کنید.')
+            if len(raw) > MAX_BATCH:
+                raise UserError(f'در هر کارت حداکثر {MAX_BATCH} نفر جا می‌شود؛ فهرست را کوتاه‌تر کنید.')
+            parsed = []
+            for item in raw:
+                if not isinstance(item, dict):
+                    raise UserError('هر مورد entries باید شامل player و amount باشد.')
+                extra = set(item) - {'player', 'amount'}
+                if extra:
+                    raise UserError('کلید ناشناخته در entries: ' + '، '.join(sorted(extra)))
+                ref = item.get('player')
+                if isinstance(ref, bool) or not isinstance(ref, (str, int)) or not str(ref).strip():
+                    raise UserError('نام یا شناسهٔ بازیکن در entries مشخص نیست.')
+                value = entry_amount(item.get('amount'))
+                if not value:
+                    raise UserError('مبلغ هر نفر در entries نباید صفر باشد.')
+                parsed.append((ref, value))
+            return parsed
+
+        def batch_reply(commands, skipped=()):
+            preview, markup = bot.propose_commands(commands, user_id, chat_id)
+            effects['markup'] = markup
+            effects['proposal_preview'] = preview
+            reply = (f'پیشنهاد برای {len(commands)} نفر آماده شد و دکمه‌های تأیید/رد ضمیمه گردید:'
+                     f'\n{preview}')
+            if skipped:
+                reply += '\nبدون بدهی و خارج از کارت: ' + '، '.join(skipped)
+            return reply
+
         @tool
-        def propose_financial_change(action: str, player: str = '', session: str = '', amount: int = 0, note: str = '') -> str:
+        def propose_financial_change(action: str, player: str = '', session: str = '',
+                                     amount: int = 0, note: str = '',
+                                     players: str = '', entries: str = '') -> str:
             """Create an admin-approval proposal (with inline Yes/No buttons) for financial mutations.
             action: 'finalize', 'adjustment', 'settle', 'declare_debt'.
+            One request is always ONE card, even for many players; never call this per person.
+            adjustment:
+              - `player` + `amount`: a single player.
+              - `players` (names or ids separated by , ، or newline) + one shared `amount`.
+              - `entries`: JSON array like [{"player":"مهدی","amount":-150000}] for a
+                different amount per person; it cannot be combined with `players`/`amount`.
+            settle: put every name in `players`; members without debt are skipped automatically.
             """
             try:
                 if action == 'declare_debt':
@@ -459,13 +532,67 @@ class SansAgent:
                 if action == 'finalize':
                     cmd = {'action': 'finalize', 'args': {'session': session or effects.get('last_session_id') or 'current'}}
                 elif action == 'adjustment':
+                    refs = batch_refs(players)
+                    has_entries = ((isinstance(entries, (list, tuple)) and bool(entries))
+                                   or (isinstance(entries, str) and bool(entries.strip())))
+                    if has_entries:
+                        if refs or amount:
+                            return ('برای اصلاح چندنفره یا entries بدهید یا players و amount؛ '
+                                    'ترکیب این دو مجاز نیست.')
+                        parsed = batch_entries(entries)
+                        if not parsed:
+                            return 'entries خالی است؛ برای هر نفر نام و مبلغ را مشخص کنید.'
+                        return batch_reply([service.prepare('adjustment', {
+                            'player': service.player(ref)['id'],
+                            'amount': value,
+                            'note': note or 'اصلاح حساب توسط ادمین',
+                        }) for ref, value in parsed])
+                    if refs:
+                        if len(refs) > MAX_BATCH:
+                            return (f'در هر کارت حداکثر {MAX_BATCH} بازیکن اصلاح می‌شود؛ '
+                                    'فهرست را کوتاه‌تر کنید.')
+                        value = entry_amount(amount)
+                        if not value:
+                            return 'مبلغ اصلاح نباید صفر باشد.'
+                        return batch_reply([service.prepare('adjustment', {
+                            'player': service.player(ref)['id'],
+                            'amount': value,
+                            'note': note or 'اصلاح حساب توسط ادمین',
+                        }) for ref in refs])
                     # A financial correction never creates a player as a side
                     # effect; an unknown or partial name must be clarified.
                     p = service.player(player)
-                    cmd = {'action': 'adjustment', 'args': {'player': p['id'], 'amount': amount, 'note': note or 'اصلاح حساب توسط ادمین'}}
+                    value = entry_amount(amount)
+                    if not value:
+                        return 'مبلغ اصلاح نباید صفر باشد.'
+                    cmd = {'action': 'adjustment', 'args': {'player': p['id'], 'amount': value,
+                                                           'note': note or 'اصلاح حساب توسط ادمین'}}
                 elif action == 'settle':
-                    p = service.player(player)
-                    cmd = {'action': 'settle', 'args': {'player': p['id']}}
+                    if ((isinstance(entries, (list, tuple)) and entries)
+                            or (isinstance(entries, str) and entries.strip())):
+                        return 'برای تسویه، مبلغ از ماندهٔ حساب محاسبه می‌شود؛ entries مجاز نیست.'
+                    # SPEC-011: a multi-player request becomes ONE card with one
+                    # command per player, so a single «تأیید» settles the batch.
+                    refs = batch_refs(players)
+                    if not refs and isinstance(player, str) and player.strip():
+                        refs = [player.strip()]
+                    if not refs:
+                        return 'کدام بازیکن تسویه شود؟ نام بازیکن را بفرستید.'
+                    if len(refs) > MAX_BATCH:
+                        return (f'در هر کارت حداکثر {MAX_BATCH} بازیکن تسویه می‌شود؛ '
+                                'فهرست را کوتاه‌تر کنید.')
+                    # SPEC-012: one already-settled member must not abort the
+                    # whole batch; it is reported and left out of the card.
+                    commands, skipped = [], []
+                    for ref in refs:
+                        p = service.player(ref)
+                        if service.balance(p['id']) <= 0:
+                            skipped.append(p['name'])
+                            continue
+                        commands.append(service.prepare('settle', {'player': p['id']}))
+                    if not commands:
+                        return 'این حساب‌ها بدهی مثبت ندارند و از قبل تسویه‌اند: ' + '، '.join(skipped)
+                    return batch_reply(commands, skipped)
                 else:
                     return 'نوع تغییر مالی نامعتبر است (finalize, adjustment, settle, declare_debt).'
 
@@ -479,6 +606,23 @@ class SansAgent:
                 return f'خطا در ساخت پیشنهاد مالی: {exc}'
 
         @tool
+        def message_players(text: str, players: str = '') -> str:
+            """Propose one proactive message to players' private chats (admin approval required).
+            text: the exact Persian message to deliver.
+            players: names or #ids separated by , ، or newline; empty means every linked player.
+            """
+            if not admin:
+                return 'ارسال پیام به بازیکنان فقط توسط ادمین ممکن است.'
+            try:
+                command = service.prepare('broadcast', {'text': text, 'players': players or None})
+                preview, markup = bot.propose_commands([command], user_id, chat_id)
+            except UserError as exc:
+                return str(exc)
+            effects['markup'] = markup
+            effects['proposal_preview'] = preview
+            return f'پیشنهاد ارسال پیام آماده شد و دکمه‌های تأیید/رد ضمیمه گردید:\n{preview}'
+
+        @tool
         def ask_admins(question: str) -> str:
             """Send a question or escalation note to the admin group when something is ambiguous or needs admin input."""
             if not question or not str(question).strip():
@@ -487,7 +631,7 @@ class SansAgent:
             db.say(bot.config.admin_group, prefix + str(question).strip())
             return 'سوال برای ادمین‌ها در گروه مدیریتی ارسال شد.'
 
-        return [query_database, manage_records, propose_financial_change, ask_admins]
+        return [query_database, manage_records, propose_financial_change, message_players, ask_admins]
 
     def run(
         self,

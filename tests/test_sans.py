@@ -4,13 +4,14 @@ import sqlite3
 from datetime import date, datetime, timedelta
 from dataclasses import replace
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from app import jalali
-from app.bot import Bot, GREETING_REPLY
+from app.bot import Bot, GREETING_REPLY, RELAY_CONFIRMATION
 from app.ai_context import AIContextBuilder
 from app.clients import AIClient, APIError
 from app.config import Config
@@ -535,9 +536,13 @@ class PermissionAndConversationTests(BaseCase):
         self.seed()
         self.send('/do {"action":"attendance","args":{"player":1}}', user=1, chat=-100)
         ident = self.proposal()
-        self.apply('player_note', player=1, note='تغییر دیگر')
+        # The session itself moved on while the card was waiting: it was
+        # finalized with a different attendance list.  That is a real conflict,
+        # so the card must expire instead of applying (SPEC-011).
+        self.apply('attendance', session=1, player=2)
+        self.apply('finalize', session=1)
         self.click('yes:' + ident)
-        self.assertFalse(self.db.all('SELECT * FROM attendance'))
+        self.assertIsNone(self.db.one('SELECT 1 FROM attendance WHERE player_id=1'))
         self.assertEqual(self.db.one('SELECT status FROM pending')['status'], 'expired')
 
     def test_group_only_responds_when_addressed(self):
@@ -1043,6 +1048,58 @@ class OperationalTests(BaseCase):
         flush_outbox(self.db, GoodClient(), pace=0)
         self.assertFalse(self.db.all('SELECT * FROM outbox'))
 
+    def test_failed_callback_acknowledgement_is_dropped_not_retried(self):
+        with self.db.conn:
+            self.db.queue('answerCallbackQuery', {'callback_query_id': 'secret-cb', 'text': 'ثبت شد'})
+            self.db.say(10, 'پاسخ اصلی')
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, payload):
+                self.calls.append(method)
+                if method == 'answerCallbackQuery':
+                    raise APIError('HTTP 400', 5)
+                return True
+
+        client = Client()
+        with self.assertLogs('sans', level='WARNING') as logs:
+            flush_outbox(self.db, client, pace=0)
+
+        self.assertEqual(client.calls, ['answerCallbackQuery', 'sendMessage'])
+        self.assertFalse(self.db.all("SELECT * FROM outbox WHERE method='answerCallbackQuery'"))
+        self.assertFalse(self.db.all('SELECT * FROM outbox'))
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('answerCallbackQuery', logs.output[0])
+        self.assertNotIn('secret-cb', logs.output[0])
+        self.assertNotIn('ثبت شد', logs.output[0])
+
+    def test_successful_callback_acknowledgement_is_removed(self):
+        with self.db.conn:
+            self.db.queue('answerCallbackQuery', {'callback_query_id': 'q', 'text': 'ok'})
+
+        class Client:
+            def call(self, method, payload):
+                return True
+
+        flush_outbox(self.db, Client(), pace=0)
+        self.assertFalse(self.db.all('SELECT * FROM outbox'))
+
+    def test_stale_callback_acknowledgements_are_drained(self):
+        with self.db.conn:
+            for index in range(4):
+                self.db.queue('answerCallbackQuery', {'callback_query_id': f'q{index}', 'text': 'x'})
+            self.db.execute('UPDATE outbox SET attempts=344, next_attempt=0')
+
+        class Client:
+            def call(self, method, payload):
+                raise APIError('HTTP 400', 5)
+
+        with self.assertLogs('sans', level='WARNING'):
+            flush_outbox(self.db, Client(), pace=0)
+        self.assertFalse(self.db.all('SELECT * FROM outbox'))
+
     def test_single_instance_lock(self):
         with instance_lock(self.path):
             with self.assertRaises(UserError):
@@ -1228,15 +1285,16 @@ class SettingsApprovalTests(BaseCase):
         self.assertEqual(self.last_payload()['reply_markup']['inline_keyboard'][0][0]['callback_data'],
                          'yes:' + rows[0]['id'])
 
-    def test_setting_proposal_expires_after_revision_change(self):
+    def test_setting_proposal_expires_when_value_changed(self):
         self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': self.CARD}}
         self.send(f'مسئول شماره کارت {self.CARD} را ثبت کن', user=1, chat=-100)
         ident = self.proposals()[0]['id']
 
-        self.apply('new_player', name='بازیکن دیگر')
+        # Someone wrote a newer value while this card was waiting for approval.
+        self.apply('settings', key='card', value='1111222233334444')
         self.click('yes:' + ident)
 
-        self.assertEqual(self.db.setting('card'), '')
+        self.assertEqual(self.db.setting('card'), '1111222233334444')
         self.assertEqual(self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status'], 'expired')
         self.assertIn('تغییر کرده', self.callback_texts()[-1])
 
@@ -1508,6 +1566,454 @@ class PlayerIdentityTests(BaseCase):
             created = self.service.ensure_player('موحد', allow_similar=True)
         self.assertEqual(created['name'], 'موحد')
         self.assertEqual(self.db.one('SELECT COUNT(*) n FROM players')['n'], 2)
+
+
+class ProposalStalenessTests(BaseCase):
+    """SPEC-011: a proposal expires on its own facts, not on the global revision."""
+
+    def card(self, *commands):
+        prepared = [self.service.prepare(c['action'], c.get('args', {})) for c in commands]
+        with self.db.conn:
+            return self.bot.propose_commands(prepared, 1, -100)
+
+    def card_id(self, markup):
+        return markup[0][0]['callback_data'].split(':', 1)[1]
+
+    def status(self, ident):
+        return self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status']
+
+    def callback_texts(self):
+        return [json.loads(row['payload']).get('text', '')
+                for row in self.db.all("SELECT payload FROM outbox WHERE method='answerCallbackQuery' ORDER BY id")]
+
+    def debt(self, player, amount):
+        self.apply('adjustment', player=player, amount=amount, note='بدهی قبلی')
+
+    def age(self, ident, seconds):
+        with self.db.conn:
+            self.db.execute('UPDATE pending SET created_at=? WHERE id=?',
+                            (int(time.time()) - seconds, ident))
+
+    def test_second_proposal_of_a_batch_still_applies(self):
+        self.seed()
+        self.debt(1, 200000)
+        self.debt(2, 300000)
+        # Both cards are created from the same batch, so they share one revision.
+        _, first = self.card({'action': 'settle', 'args': {'player': 1}})
+        _, second = self.card({'action': 'settle', 'args': {'player': 2}})
+        self.assertEqual(self.db.revision,
+                         self.db.one('SELECT revision FROM pending WHERE id=?', (self.card_id(first),))['revision'])
+        revision = self.db.revision
+
+        self.click('yes:' + self.card_id(first))
+        self.assertGreater(self.db.revision, revision)  # approving card #1 moved the global counter
+        self.assertEqual(self.service.balance(1), 0)
+
+        self.click('yes:' + self.card_id(second))
+        self.assertEqual(self.service.balance(2), 0)
+        self.assertEqual(self.status(self.card_id(second)), 'approved')
+
+    def test_unrelated_audit_does_not_expire_proposal(self):
+        self.seed()
+        self.debt(1, 200000)
+        _, markup = self.card({'action': 'settle', 'args': {'player': 1}})
+        self.apply('player_note', player=2, note='یادداشت تازه')
+        self.click('yes:' + self.card_id(markup))
+        self.assertEqual(self.service.balance(1), 0)
+        self.assertEqual(self.status(self.card_id(markup)), 'approved')
+
+    def test_settle_proposal_refuses_when_balance_changed(self):
+        self.seed()
+        self.debt(1, 200000)
+        _, markup = self.card({'action': 'settle', 'args': {'player': 1}})
+        ident = self.card_id(markup)
+        self.debt(1, 50000)
+        before = self.service.balance(1)
+
+        self.click('yes:' + ident)
+
+        self.assertEqual(before, 250000)
+        self.assertEqual(self.service.balance(1), 250000)
+        self.assertEqual(self.status(ident), 'expired')
+        self.assertIn('تغییر کرده', self.callback_texts()[-1])
+
+    def test_finalize_proposal_refuses_when_attendance_changed(self):
+        self.seed()
+        self.apply('attendance', session=1, player=1, guests=1)
+        _, markup = self.card({'action': 'finalize', 'args': {'session': 1}})
+        ident = self.card_id(markup)
+        self.apply('attendance', session=1, player=2, guests=0)
+
+        self.click('yes:' + ident)
+
+        self.assertEqual(self.service.balance(1), 0)
+        self.assertEqual(self.service.balance(2), 0)
+        self.assertEqual(self.status(ident), 'expired')
+        self.assertIn('تغییر کرده', self.callback_texts()[-1])
+        self.assertEqual(self.db.one('SELECT finalized FROM sessions WHERE id=1')['finalized'], 0)
+
+
+    def test_proposal_older_than_ttl_is_expired(self):
+        self.seed()
+        self.debt(1, 200000)
+        _, markup = self.card({'action': 'settle', 'args': {'player': 1}})
+        ident = self.card_id(markup)
+        # The fingerprint still matches; only the age makes the card unusable.
+        self.age(ident, 86401)
+
+        self.click('yes:' + ident)
+
+        self.assertEqual(self.service.balance(1), 200000)
+        self.assertEqual(self.status(ident), 'expired')
+        self.assertIn('۲۴ ساعت', self.callback_texts()[-1])
+
+    def test_pending_list_closes_old_proposals(self):
+        self.seed()
+        self.debt(1, 200000)
+        self.debt(2, 300000)
+        _, old_markup = self.card({'action': 'settle', 'args': {'player': 1}})
+        _, fresh_markup = self.card({'action': 'settle', 'args': {'player': 2}})
+        old, fresh = self.card_id(old_markup), self.card_id(fresh_markup)
+        self.age(old, 86401)
+
+        self.send('/pending', user=1, chat=-100)
+
+        self.assertEqual(self.status(old), 'expired')
+        self.assertEqual(self.status(fresh), 'pending')
+        reply = self.replies(-100)
+        self.assertIn('1 کارت قدیمی‌تر از ۲۴ ساعت بسته شد.', reply)
+        self.assertIn(fresh, reply)
+        self.assertNotIn(old, reply)
+
+    def test_multi_player_settle_card_applies_in_one_click(self):
+        self.seed()
+        self.apply('new_player', name='سعید مرادی')
+        for player in (1, 2, 3):
+            self.debt(player, 100000 * player)
+        _, markup = self.card(*[{'action': 'settle', 'args': {'player': p}} for p in (1, 2, 3)])
+        ident = self.card_id(markup)
+
+        self.assertEqual(len(self.db.all("SELECT * FROM pending WHERE kind='commands'")), 1)
+        self.assertEqual(len(json.loads(self.db.one(
+            'SELECT payload FROM pending WHERE id=?', (ident,))['payload'])), 3)
+
+        self.click('yes:' + ident)
+
+        self.assertEqual([self.service.balance(p) for p in (1, 2, 3)], [0, 0, 0])
+        self.assertEqual(self.status(ident), 'approved')
+
+    def test_multi_player_settle_card_is_atomic(self):
+        self.seed()
+        self.debt(1, 200000)
+        self.debt(2, 300000)
+        _, markup = self.card({'action': 'settle', 'args': {'player': 1}},
+                              {'action': 'settle', 'args': {'player': 2}})
+        ident = self.card_id(markup)
+        original = self.bot.service.apply
+
+        def failing(command, actor, source):
+            if command['args'].get('player') == 2:
+                raise UserError('خطای آزمایشی در دستور دوم')
+            return original(command, actor, source)
+
+        with patch.object(self.bot.service, 'apply', side_effect=failing):
+            self.click('yes:' + ident)
+
+        # The first settle was rolled back with the rest of the card.
+        self.assertEqual(self.service.balance(1), 200000)
+        self.assertEqual(self.service.balance(2), 300000)
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM ledger')['n'], 2)
+        self.assertEqual(self.status(ident), 'pending')
+        self.assertIn('خطای آزمایشی', self.callback_texts()[-1])
+
+    def test_current_settle_card_still_applies(self):
+        self.seed()
+        self.debt(1, 200000)
+        _, markup = self.card({'action': 'settle', 'args': {'player': 1}})
+        self.click('yes:' + self.card_id(markup))
+        self.assertEqual(self.service.balance(1), 0)
+        self.assertEqual(self.status(self.card_id(markup)), 'approved')
+class ProposalSweepTests(BaseCase):
+    """SPEC-013: expired cards are closed without waiting for a click."""
+
+    def card(self, player=1):
+        prepared = [self.service.prepare('settle', {'player': player})]
+        with self.db.conn:
+            text, markup = self.bot.propose_commands(prepared, 1, -100)
+            # Mirror the real delivery path so ``outbox.ref`` is set.
+            self.db.say(-100, text, markup, self.bot.card_ref(markup))
+        return markup[0][0]['callback_data'].split(':', 1)[1]
+
+    def debt(self, player, amount):
+        self.apply('adjustment', player=player, amount=amount, note='بدهی قبلی')
+
+    def age(self, ident, seconds):
+        with self.db.conn:
+            self.db.execute('UPDATE pending SET created_at=? WHERE id=?',
+                            (int(time.time()) - seconds, ident))
+
+    def status(self, ident):
+        return self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status']
+
+    def edits(self):
+        return [json.loads(row['payload'])
+                for row in self.db.all("SELECT payload FROM outbox WHERE method='editMessageReplyMarkup'")]
+
+    def test_sweep_closes_only_cards_older_than_the_ttl(self):
+        self.seed()
+        self.debt(1, 200000)
+        self.debt(2, 300000)
+        old, fresh = self.card(1), self.card(2)
+        self.age(old, 86401)
+
+        with self.db.conn:
+            closed = self.bot.sweep_proposals()
+
+        self.assertEqual(closed, 1)
+        self.assertEqual(self.status(old), 'expired')
+        self.assertEqual(self.status(fresh), 'pending')
+        self.assertEqual(self.service.balance(1), 200000)
+
+    def test_sweep_removes_buttons_of_a_delivered_card(self):
+        self.seed()
+        self.debt(1, 200000)
+        ident = self.card()
+        with self.db.conn:
+            self.db.execute('UPDATE pending SET message_id=? WHERE id=?', (77, ident))
+        self.age(ident, 86401)
+
+        with self.db.conn:
+            self.bot.sweep_proposals()
+
+        self.assertEqual(self.status(ident), 'expired')
+        self.assertEqual(self.edits(), [{'chat_id': -100, 'message_id': 77,
+                                         'reply_markup': {'inline_keyboard': []}}])
+
+    def test_sweep_tolerates_cards_without_a_message_id(self):
+        self.seed()
+        self.debt(1, 200000)
+        ident = self.card()
+        self.age(ident, 86401)
+
+        with self.db.conn:
+            closed = self.bot.sweep_proposals()
+
+        self.assertEqual(closed, 1)
+        self.assertEqual(self.status(ident), 'expired')
+        self.assertEqual(self.edits(), [])
+
+    def test_delivery_records_the_proposal_message_id(self):
+        self.seed()
+        self.debt(1, 200000)
+        ident = self.card()
+        row = self.db.one('SELECT ref FROM outbox ORDER BY id DESC LIMIT 1')
+        self.assertEqual(row['ref'], 'proposal:' + ident)
+
+        class Client:
+            def call(self, method, payload):
+                return {'message_id': 4242}
+
+        flush_outbox(self.db, Client(), pace=0)
+        self.assertEqual(self.db.one('SELECT message_id FROM pending WHERE id=?',
+                                     (ident,))['message_id'], 4242)
+
+    def test_existing_database_gains_the_new_columns(self):
+        legacy = Path(self.temp.name) / 'legacy.sqlite3'
+        conn = sqlite3.connect(legacy)
+        try:
+            conn.execute('''CREATE TABLE pending (id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+                payload TEXT NOT NULL, requester INTEGER NOT NULL, chat_id INTEGER NOT NULL,
+                revision INTEGER NOT NULL, guard TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL)''')
+            conn.execute('''CREATE TABLE outbox (id INTEGER PRIMARY KEY, method TEXT NOT NULL,
+                payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt REAL NOT NULL DEFAULT 0)''')
+            conn.commit()
+        finally:
+            conn.close()
+
+        upgraded = Database(legacy)
+        try:
+            pending = {row['name'] for row in upgraded.all('PRAGMA table_info(pending)')}
+            outbox = {row['name'] for row in upgraded.all('PRAGMA table_info(outbox)')}
+            self.assertIn('message_id', pending)
+            self.assertIn('ref', outbox)
+            self.assertTrue(upgraded.all("SELECT name FROM sqlite_master WHERE name='outreach'"))
+        finally:
+            upgraded.close()
+
+    def test_run_sweeps_before_polling(self):
+        from app.main import run
+
+        self.seed()
+        self.debt(1, 200000)
+        ident = self.card()
+        self.age(ident, 86401)
+
+        class Client:
+            def __init__(self, token):
+                self.calls = []
+
+            def call(self, method, payload):
+                self.calls.append(method)
+                if method == 'getWebhookInfo':
+                    return {'url': ''}
+                if method == 'getMe':
+                    return {'id': 999, 'username': 'test-bot'}
+                raise KeyboardInterrupt
+
+        with patch('app.main.BaleClient', Client), patch('app.main.AIClient', lambda config: None):
+            with self.assertRaises(KeyboardInterrupt):
+                run(self.db, self.config)
+
+        self.assertEqual(self.status(ident), 'expired')
+
+
+
+
+
+
+class OutreachTests(BaseCase):
+    """SPEC-014: proactive messages, delivery records, and reply relay."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.apply('new_player', name='سعید مرادی')
+        with self.db.conn:
+            self.service.bind(3, 30, 1)
+
+    def tools(self, admin=True, user=1):
+        from app.agent import SansAgent
+        effects = {}
+        agent = SansAgent(self.bot)
+        return {t.name: t for t in agent._make_tools(-100, user, admin, None, effects)}, effects
+
+    def broadcast(self, text='سانس فردا لغو شد', players=None):
+        with self.db.conn:
+            command = self.service.prepare('broadcast', {'text': text, 'players': players})
+            reply, markup = self.bot.propose_commands([command], 1, -100)
+        return markup[0][0]['callback_data'].split(':', 1)[1], reply
+
+    def private_sends(self):
+        payloads = [json.loads(row['payload'])
+                    for row in self.db.all("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id")]
+        return [p for p in payloads if isinstance(p.get('chat_id'), int) and p['chat_id'] > 0]
+
+    def test_private_message_records_and_updates_contact(self):
+        self.send('سلام', user=10, chat=10, sender={'id': 10, 'first_name': 'علی'})
+        row = self.db.one('SELECT * FROM contacts WHERE user_id=10')
+        self.assertEqual((row['chat_id'], row['display_name']), (10, 'علی'))
+
+        self.send('سلام دوباره', user=10, chat=10,
+                  sender={'id': 10, 'first_name': 'علی', 'last_name': 'رضایی', 'username': 'ali'})
+        row = self.db.one('SELECT * FROM contacts WHERE user_id=10')
+        self.assertEqual(row['display_name'], 'علی رضایی')
+        self.assertEqual(row['username'], 'ali')
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM contacts')['n'], 1)
+
+    def test_non_admin_cannot_message_players(self):
+        tools, _ = self.tools(admin=False, user=10)
+        reply = tools['message_players'].invoke({'text': 'سلام', 'players': ''})
+
+        self.assertIn('ادمین', reply)
+        self.assertEqual(self.db.all("SELECT * FROM pending WHERE kind='commands'"), [])
+
+    def test_approved_broadcast_reaches_linked_players_only(self):
+        ident, reply = self.broadcast(players='علی رضایی، سعید مرادی، رضا محمدی')
+        self.assertIn('2 نفر', reply)
+        self.assertIn('رضا محمدی', reply)  # reported as unreachable, not silently dropped
+
+        with self.db.conn:
+            self.bot.confirm(ident, True, 1)
+
+        sends = self.private_sends()
+        self.assertEqual(sorted(p['chat_id'] for p in sends), [10, 30])
+        self.assertTrue(all(p['text'] == 'سانس فردا لغو شد' for p in sends))
+        self.assertEqual(self.db.one("SELECT COUNT(*) n FROM outreach WHERE status='queued'")['n'], 2)
+        self.assertEqual(self.db.one("SELECT COUNT(*) n FROM outreach WHERE player_id=2")['n'], 0)
+
+    def test_broadcast_proposal_delivers_nothing(self):
+        self.broadcast()
+
+        self.assertEqual(self.private_sends(), [])
+        self.assertEqual(self.db.all('SELECT * FROM outreach'), [])
+        self.assertEqual(self.db.one("SELECT COUNT(*) n FROM pending WHERE status='pending'")['n'], 1)
+
+    def test_broadcast_fails_closed_without_a_valid_audience(self):
+        with self.assertRaises(UserError):
+            self.service.prepare('broadcast', {'text': '   ', 'players': None})
+        with self.assertRaises(UserError):
+            self.service.prepare('broadcast', {'text': 'سلام', 'players': 'بازیکن ناشناس'})
+
+        fresh = Database(Path(self.temp.name) / 'nobody.sqlite3')
+        try:
+            service = Service(fresh)
+            with fresh.conn:
+                service.apply(service.prepare('new_player', {'name': 'تنها بازیکن'}), 1, 'test:1')
+            with self.assertRaises(UserError):
+                service.prepare('broadcast', {'text': 'سلام', 'players': None})
+        finally:
+            fresh.close()
+        self.assertEqual(self.db.all("SELECT * FROM pending WHERE kind='commands'"), [])
+
+
+
+    def test_delivery_marks_outreach_sent(self):
+        ident, _ = self.broadcast(players='علی رضایی')
+        with self.db.conn:
+            self.bot.confirm(ident, True, 1)
+
+        class Client:
+            def call(self, method, payload):
+                return {'message_id': 501}
+
+        flush_outbox(self.db, Client(), pace=0)
+
+        row = self.db.one('SELECT * FROM outreach')
+        self.assertEqual((row['status'], row['message_id']), ('sent', 501))
+        self.assertTrue(row['delivered_at'])
+
+    def test_blocked_private_send_is_dropped_and_marked_failed(self):
+        ident, _ = self.broadcast(players='علی رضایی')
+        with self.db.conn:
+            self.bot.confirm(ident, True, 1)
+
+        class Blocked:
+            def call(self, method, payload):
+                if payload.get('chat_id') == 10:
+                    raise APIError('HTTP 403', 5, code=403)
+                return {'message_id': 1}
+
+        with self.assertLogs('sans', level='WARNING') as logs:
+            flush_outbox(self.db, Blocked(), pace=0)
+
+        self.assertEqual(self.db.one('SELECT status FROM outreach')['status'], 'failed')
+        self.assertEqual(self.private_sends(), [])
+        self.assertTrue(any('private send dropped' in line for line in logs.output))
+
+    def test_reply_to_proactive_message_is_relayed_to_admins(self):
+        with self.db.conn:
+            self.db.execute("INSERT INTO outreach(player_id,chat_id,text,status,message_id) "
+                            "VALUES (1,10,'سانس فردا لغو شد','sent',900)")
+
+        self.send('باشه، ممنون', user=10, chat=10,
+                  reply_to_message={'message_id': 900, 'from': {'id': 999}})
+
+        self.assertIn('باشه، ممنون', self.replies(-100))
+        self.assertIn('شناسهٔ بله 10', self.replies(-100))
+        self.assertIn(RELAY_CONFIRMATION, self.replies(10))
+        self.assertEqual(self.ai.calls, [])
+        self.assertEqual(self.db.one("SELECT COUNT(*) n FROM agent_logs WHERE event='RELAYED_TO_ADMIN'")['n'], 1)
+
+    def test_reply_to_other_bot_message_is_not_relayed(self):
+        self.ai.answer = {'action': 'help', 'args': {}}
+        self.send('یک سوال دارم', user=10, chat=10,
+                  reply_to_message={'message_id': 12345, 'from': {'id': 999}})
+
+        self.assertTrue(self.ai.calls)
+        self.assertNotIn('یک سوال دارم', self.replies(-100))
+
 
 
 if __name__ == '__main__':

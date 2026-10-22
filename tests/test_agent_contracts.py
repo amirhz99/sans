@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.ai_context import AIContextBuilder
-from app.agent import AGENT_SYSTEM_PROMPT
+from app.agent import AGENT_SYSTEM_PROMPT, SansAgent
 from app.content import SYSTEM_PROMPT
 from app.db import Database
 from app.domain import ConversationState, EntityRef, EntityType, Intent, ResponseLevel
@@ -82,6 +82,31 @@ class AgentContractTests(unittest.TestCase):
         self.assertNotIn('players', player)
         self.assertEqual([row['id'] for row in admin['sessions']], [1])
         self.assertEqual(missing['sessions'], [])
+
+    def test_agent_snapshot_withholds_complete_player_directory(self):
+        self.apply('new_player', name='علی رضایی')
+        self.apply('new_player', name='بازیکن مخفی')
+        with self.db.conn:
+            self.db.execute("UPDATE players SET note='یادداشت خصوصی' WHERE id=2")
+            self.service.bind(1, 10, 1)
+        agent = SansAgent(SimpleNamespace(db=self.db, service=self.service, content_defaults={}))
+
+        for admin, user_id in ((True, 1), (False, 10)):
+            with self.subTest(admin=admin):
+                raw = agent._build_live_snapshot(10, user_id, admin, {'first_name': 'تست'})
+                snapshot = json.loads(raw)
+                self.assertEqual(snapshot['players_count'], 2)
+                self.assertNotIn('players_summary', snapshot)
+                self.assertNotIn('بازیکن مخفی', raw)
+                self.assertNotIn('یادداشت خصوصی', raw)
+                self.assertNotIn('balance', raw)
+
+        own = json.loads(agent._build_live_snapshot(10, 10, False, None))
+        self.assertEqual(own['caller']['linked_player']['name'], 'علی رضایی')
+
+        effects = {}
+        tools = {t.name: t for t in agent._make_tools(10, 1, True, None, effects)}
+        self.assertIn('بازیکن مخفی', tools['query_database'].invoke({'target': 'players'}))
 
     def test_prompt_loader_supports_legacy_and_structured_shapes(self):
         legacy = {
@@ -737,6 +762,205 @@ class AgentContractTests(unittest.TestCase):
         self.assertIn('فقط ادمین', player_tools['query_database'].invoke({'target': 'duplicate_players'}))
         self.assertIn('فقط برای ادمین', player_tools['manage_records'].invoke(
             {'operation': 'merge_player', 'data_json': json.dumps({'source': 2, 'target': 1})}))
+
+
+    def test_langgraph_multi_player_settle_creates_one_card(self):
+        from langchain_core.messages import AIMessage
+        from app.config import Config
+
+        class ScriptedLangGraphLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, messages):
+                self.calls += 1
+                if self.calls == 1:
+                    return AIMessage(content='', tool_calls=[{
+                        'id': 'settle-1',
+                        'name': 'propose_financial_change',
+                        'args': {'action': 'settle', 'players': 'علی رضایی، رضا محمدی'},
+                    }])
+                return AIMessage(content='یک کارت تسویه برای هر دو نفر ساختم.')
+
+        class LangGraphDriver:
+            use_langgraph = True
+
+            def __init__(self):
+                self.llm_override = ScriptedLangGraphLLM()
+
+        self.apply('new_player', name='علی رضایی')
+        self.apply('new_player', name='رضا محمدی')
+        self.apply('adjustment', player=1, amount=200000, note='بدهی قبلی')
+        self.apply('adjustment', player=2, amount=300000, note='بدهی قبلی')
+        config = Config(
+            'fake-token', -100, frozenset({1}), 'https://example.invalid',
+            'fake-key', 'fake-model', Path(self.temp.name) / 'contracts.sqlite3',
+        )
+        bot = Bot(self.db, config, LangGraphDriver())
+
+        bot.process({
+            'update_id': 41,
+            'message': {
+                'message_id': 41,
+                'chat': {'id': -100, 'type': 'group'},
+                'from': {'id': 1},
+                'text': 'مسئول بدهی همهٔ بازیکن‌ها رو صاف کن',
+            },
+        })
+
+        pending = self.db.all("SELECT * FROM pending WHERE kind='commands' AND status='pending'")
+        self.assertEqual(len(pending), 1)
+        commands = json.loads(pending[0]['payload'])
+        self.assertEqual([(c['action'], c['args']['player']) for c in commands],
+                         [('settle', 1), ('settle', 2)])
+        # Creating the card must not move any balance.
+        self.assertEqual(self.service.balance(1), 200000)
+        self.assertEqual(self.service.balance(2), 300000)
+
+        with self.db.conn:
+            bot.confirm(pending[0]['id'], True, 1)
+
+        self.assertEqual(self.service.balance(1), 0)
+        self.assertEqual(self.service.balance(2), 0)
+
+
+class BatchFinancialToolTests(unittest.TestCase):
+    """SPEC-012: one card for a multi-player balance correction."""
+
+    def setUp(self):
+        from app.config import Config
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / 'batch.sqlite3'
+        self.db = Database(self.path)
+        self.service = Service(self.db)
+        self.config = Config('fake-token', -100, frozenset({1}), 'https://example.invalid',
+                             'fake-key', 'fake-model', self.path)
+        self.bot = Bot(self.db, self.config, SimpleNamespace(use_langgraph=False))
+        self.source = 0
+        self.apply('new_player', name='علی رضایی')
+        self.apply('new_player', name='رضا محمدی')
+        self.apply('new_player', name='سعید مرادی')
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def apply(self, action, **args):
+        self.source += 1
+        with self.db.conn:
+            self.service.apply(self.service.prepare(action, args), 1, f'batch-test:{self.source}')
+
+    def tools(self, admin=True, user=1):
+        effects = {}
+        agent = SansAgent(self.bot)
+        return {t.name: t for t in agent._make_tools(-100, user, admin, None, effects)}, effects
+
+    def call(self, **args):
+        tools, effects = self.tools()
+        return tools['propose_financial_change'].invoke(args), effects
+
+    def cards(self):
+        return self.db.all("SELECT * FROM pending WHERE kind='commands' AND status='pending'")
+
+    def commands(self):
+        cards = self.cards()
+        self.assertEqual(len(cards), 1)
+        return [(c['action'], c['args']['player'], c['args'].get('amount'))
+                for c in json.loads(cards[0]['payload'])]
+
+    def test_adjustment_with_shared_amount_creates_one_card(self):
+        reply, _ = self.call(action='adjustment', players='علی رضایی، رضا محمدی', amount=50000)
+
+        self.assertEqual(self.commands(),
+                         [('adjustment', 1, 50000), ('adjustment', 2, 50000)])
+        self.assertIn('2 نفر', reply)
+        # Nothing moves before the admin presses the button.
+        self.assertEqual([self.service.balance(p) for p in (1, 2, 3)], [0, 0, 0])
+    def test_adjustment_with_entries_uses_per_person_amounts(self):
+        entries = json.dumps([{'player': 'علی رضایی', 'amount': -150000},
+                              {'player': 'رضا محمدی', 'amount': 50000}], ensure_ascii=False)
+        self.call(action='adjustment', entries=entries)
+
+        self.assertEqual(self.commands(),
+                         [('adjustment', 1, -150000), ('adjustment', 2, 50000)])
+        with self.db.conn:
+            self.bot.confirm(self.cards()[0]['id'], True, 1)
+        self.assertEqual([self.service.balance(p) for p in (1, 2, 3)],
+                         [-150000, 50000, 0])
+
+    def test_entries_are_mutually_exclusive_with_players_and_amount(self):
+        entries = json.dumps([{'player': 'علی رضایی', 'amount': 1000}], ensure_ascii=False)
+        for args in ({'entries': entries, 'players': 'رضا محمدی'},
+                     {'entries': entries, 'amount': 1000}):
+            with self.subTest(args=args):
+                reply, _ = self.call(action='adjustment', **args)
+                self.assertIn('ترکیب', reply)
+                self.assertEqual(self.cards(), [])
+
+    def test_invalid_entries_fail_closed(self):
+        invalid = (
+            'not-json',
+            '[]',
+            '{"player":"علی رضایی","amount":1000}',
+            json.dumps([{'player': 'علی رضایی', 'amount': 0}], ensure_ascii=False),
+            json.dumps([{'player': 'علی رضایی', 'amount': 'abc'}], ensure_ascii=False),
+            json.dumps([{'player': 'علی رضایی', 'amount': 1000, 'extra': 1}], ensure_ascii=False),
+            json.dumps([{'amount': 1000}], ensure_ascii=False),
+            json.dumps([{'player': f'بازیکن {n}', 'amount': 1000} for n in range(31)],
+                       ensure_ascii=False),
+        )
+        for entries in invalid:
+            with self.subTest(entries=entries[:40]):
+                reply, _ = self.call(action='adjustment', entries=entries)
+                self.assertTrue(reply)
+                self.assertEqual(self.cards(), [])
+
+    def test_settle_skips_settled_players_and_still_builds_one_card(self):
+        self.apply('adjustment', player=1, amount=200000, note='بدهی قبلی')
+
+        reply, _ = self.call(action='settle', players='علی رضایی، رضا محمدی')
+
+        self.assertEqual(self.commands(), [('settle', 1, 200000)])
+        self.assertIn('رضا محمدی', reply)
+        self.assertIn('بدون بدهی', reply)
+        self.assertEqual(self.service.balance(2), 0)
+
+    def test_settle_without_positive_balance_creates_no_card(self):
+        reply, _ = self.call(action='settle', players='علی رضایی، رضا محمدی')
+
+        self.assertIn('تسویه', reply)
+        self.assertEqual(self.cards(), [])
+
+    def test_batch_card_moves_nothing_until_one_approval(self):
+        self.call(action='adjustment', players='علی رضایی، رضا محمدی، سعید مرادی',
+                  amount=100000)
+        self.assertEqual([self.service.balance(p) for p in (1, 2, 3)], [0, 0, 0])
+
+        ident = self.cards()[0]['id']
+        with self.db.conn:
+            self.bot.confirm(ident, True, 1)
+
+        self.assertEqual([self.service.balance(p) for p in (1, 2, 3)],
+                         [100000, 100000, 100000])
+        self.assertEqual(self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status'],
+                         'approved')
+
+    def test_unknown_player_fails_closed_without_a_card(self):
+        reply, _ = self.call(action='adjustment', players='علی رضایی، بازیکن ناشناس',
+                             amount=100000)
+
+        self.assertIn('پیدا نشد', reply)
+        self.assertEqual(self.cards(), [])
+
+    def test_settle_rejects_entries_because_amount_is_derived(self):
+        entries = json.dumps([{'player': 'علی رضایی', 'amount': 1000}], ensure_ascii=False)
+        reply, _ = self.call(action='settle', entries=entries)
+        self.assertIn('entries', reply)
+        self.assertEqual(self.cards(), [])
 
 
 if __name__ == '__main__':

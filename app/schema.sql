@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS pending (
     requester INTEGER NOT NULL,
     chat_id INTEGER NOT NULL,
     revision INTEGER NOT NULL,
+    guard TEXT NOT NULL DEFAULT '[]',
+    message_id INTEGER,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at INTEGER NOT NULL
 );
@@ -109,5 +111,26 @@ CREATE TABLE IF NOT EXISTS outbox (
     method TEXT NOT NULL,
     payload TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
-    next_attempt REAL NOT NULL DEFAULT 0
+    next_attempt REAL NOT NULL DEFAULT 0,
+    ref TEXT
 );
+CREATE TABLE IF NOT EXISTS contacts (
+    user_id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS outreach (
+    id INTEGER PRIMARY KEY,
+    player_id INTEGER NOT NULL REFERENCES players(id),
+    chat_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('queued', 'sent', 'failed')),
+    message_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    delivered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_outreach_chat ON outreach(chat_id, message_id);
