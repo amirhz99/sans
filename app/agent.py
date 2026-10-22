@@ -40,6 +40,8 @@ AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمن�
      * اگر کاربر «ادمین» است: ساخت و ویرایش بازیکنان، ساخت و ویرایش سانس‌ها (جدید یا قدیمی/ناقص)، و ثبت حضور و غیاب (تکی یا دسته‌جمعی برای چند نفر) را مستقیم و فوری با `manage_records` انجام بده و نتیجه را صمیمی گزارش کن.
      * تغییر تنظیمات (`card`، `payment_note`، `approval_required`) را با عملیات `update_settings` فقط به‌صورت پیشنهاد با دکمهٔ تأیید بساز؛ مقدار باید صریحاً در پیام همین نوبت کاربر نوشته شده باشد و هرگز از حافظه، پیام قبلی یا پاسخ‌هایی مثل «آره» برداشت نشود.
      * اگر کاربر «بازیکن عادی» است: می‌تواند با `manage_records` خودش را معرفی کند (`identify`) یا حضور خودش را در سانس باز ثبت/لغو کند (`attendance_self`).
+     * کاربر تازه‌وارد: ربات خودش پیام اول را فرستاده و نام کامل و شمارهٔ موبایل را خواسته است. اگر در بافت `needs_introduction` درست است، همان توضیح را تکرار نکن، دوباره شماره نخواه و از واژه‌های داخلی مثل «اتصال حساب»، «تطبیق هویت» یا «بازیکن» استفاده نکن.
+     * وقتی کاربر نام و نام خانوادگی‌اش را گفت، اول با `query_database` (target='players') ببین چنین بازیکنی هست یا نه؛ اگر یک تطبیق روشن بود همان را با #شناسه پیشنهاد بده و بعد از تأیید کاربر `identify` را با همان نام صدا بزن. اگر چند نام مشابه بود، نام کامل‌تر را بپرس. هرگز خودت نام نساز و بدون گفتن کاربر کارت هویت نساز. username را هم از او نپرس؛ خودت از پروفایل می‌خوانی.
      * هویت بازیکن‌ها را تمیز نگه دار: هرگز برای یک نام کوتاه، ناقص یا با املای متفاوت بازیکن جدید نساز. اگر ابزار فهرست بازیکن‌های مشابه را برگرداند، همان‌ها را با #شناسه نشان بده و نام کامل را بپرس.
      * فهرست کامل بازیکنان از قبل در بافت نمی‌آید؛ هر وقت به نام یا شناسهٔ بازیکنان نیاز داشتی، `query_database` با target='players' را صدا بزن.
      * تغییرنام (`rename_player`) با درخواست صریح ادمین مستقیم انجام می‌شود؛ ادغام (`merge_player`) و حذف (`delete_player`) فقط با شناسه یا نام دقیق و همیشه به‌صورت کارت تأیید.
@@ -124,6 +126,13 @@ class SansAgent:
         players_count = db.one('SELECT COUNT(*) n FROM players')['n']
         chat_log = db.recent_messages(chat_id, limit=CHAT_MEMORY_WINDOW)
         defaults = service.session_defaults()
+        profile = sender if isinstance(sender, dict) else {}
+        sender_name = ' '.join(
+            part.strip() for part in (profile.get('first_name', ''), profile.get('last_name', ''))
+            if isinstance(part, str) and part.strip())
+        has_pending_identity = bool(db.one(
+            "SELECT 1 FROM pending WHERE requester=? AND kind IN ('identity','claim') "
+            "AND status='pending'", (user_id,)))
 
         snapshot = {
             'now_tehran': now,
@@ -131,8 +140,13 @@ class SansAgent:
                 'user_id': user_id,
                 'chat_id': chat_id,
                 'role': 'admin' if admin else 'player',
-                'sender_name': (sender or {}).get('first_name', ''),
+                'sender_name': sender_name,
                 'linked_player': ({'id': linked['id'], 'name': linked['name']} if linked else None),
+                # SPEC-021: the bot already sent the first-contact text, so the
+                # model must not repeat it.  Only these two facts are exposed;
+                # the address book and any number stay out of the snapshot.
+                'needs_introduction': not admin and linked is None,
+                'has_pending_identity': has_pending_identity,
             },
             'settings': {
                 'card': db.setting('card') or 'ثبت نشده',
@@ -306,7 +320,9 @@ class SansAgent:
         def manage_records(operation: str, data_json: str) -> str:
             """Directly create or update non-financial records.
             Operations:
-            - 'identify': data_json='{"name": "نام کامل"}'
+            - 'identify': data_json='{"name": "نام کامل"}' — شمارهٔ کاربر، اگر قبلاً با دکمهٔ
+              «ارسال شمارهٔ من» فرستاده شده باشد، خودکار روی کارت ادمین می‌آید؛ آن را از
+              کاربر دوباره نپرس و در data_json نگذار.
             - 'attendance_self': data_json='{"present": true, "guests": 0, "session": ""}'
             - 'upsert_players': (admin) data_json='{"players": [{"name": "علی رضایی", "note": ""}]}'; a name similar to an existing player is refused unless force=true.
             - 'save_session': (admin) create/update new or historical session; date is accepted as an alias for when_text. Jalali («۹ خرداد ساعت ۲۱», «1405/03/09 21:00») and Gregorian (YYYY-MM-DD) dates are both accepted; a Jalali date without a year uses the current Jalali year.

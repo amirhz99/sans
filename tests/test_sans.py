@@ -11,7 +11,8 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from app import jalali
-from app.bot import Bot, CONTACT_BUTTON, GREETING_REPLY, RELAY_CONFIRMATION
+from app.bot import (Bot, CONTACT_BUTTON, GREETING_REPLY, RELAY_CONFIRMATION,
+                     WELCOME_COMPLETE, WELCOME_NAME_ONLY, WELCOME_NEW, WELCOME_PHONE_ONLY)
 from app.ai_context import AIContextBuilder
 from app.clients import AIClient, APIError
 from app.config import Config
@@ -69,7 +70,13 @@ class BaseCase(unittest.TestCase):
         self.apply('new_session', title='پنجشنبه ۲۳ مهر', when_text='پنجشنبه ساعت ۲۱',
                    location='زمین آزادی', venue_cost=2400000, person_fee=150000)
 
-    def send(self, body='', user=10, chat=10, sender=None, chat_type=None, **extra):
+    def send(self, body='', user=10, chat=10, sender=None, chat_type=None,
+             first_contact=False, **extra):
+        # SPEC-021: the first-contact welcome is once per account, so a test
+        # that is not about onboarding marks the account as already welcomed.
+        if not first_contact:
+            with self.db.conn:
+                self.db.set_setting(f'welcomed:{user}', 1)
         self.update_id += 1
         msg = {'message_id': self.update_id, 'chat': {'id': chat, 'type': chat_type or ('private' if chat > 0 else 'group')},
                'from': sender or {'id': user}, 'text': body, **extra}
@@ -673,6 +680,9 @@ class PermissionAndConversationTests(BaseCase):
         self.assertLessEqual(len(reply.splitlines()), 10)
 
     def test_private_start_gives_private_user_guidance_only(self):
+        # SPEC-021: the very first /start is the deterministic welcome; a later
+        # /start returns the short private help.
+        self.send('/start', user=10, chat=10, first_contact=True)
         self.send('/start', user=10, chat=10)
         reply = self.replies(10)
         self.assertIn('دستورات کاربران', reply)
@@ -2505,8 +2515,10 @@ class PlayerPhoneTests(BaseCase):
         self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'], '')
         self.assertEqual(self.db.one('SELECT phone FROM contacts WHERE user_id=10')['phone'],
                          '+989121234567')
-        self.assertIn('/identify', self.replies(10))
-        self.assertNotIn('ثبت شد', self.replies(10))
+        # SPEC-021: the number is kept, so the only remaining step is the name.
+        self.assertIn('شماره‌ات ثبت شد', self.replies(10))
+        self.assertIn('نام و نام خانوادگی کاملت را بنویس', self.replies(10))
+        self.assertNotIn('برای «', self.replies(10))
 
     def test_contact_for_another_user_never_reaches_a_player(self):
         self.seed()
@@ -2963,6 +2975,196 @@ class PrivateAdminTests(BaseCase):
         self.assertEqual(len(self.ai.calls), 1)
 
 
+class FirstContactTests(BaseCase):
+    """SPEC-021: the first private message is a deterministic welcome."""
+
+    def sent(self, chat):
+        payloads = (json.loads(row['payload']) for row in
+                    self.db.all("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id"))
+        return [payload for payload in payloads if payload.get('chat_id') == chat]
+
+    def test_first_private_message_asks_for_a_name_and_a_number(self):
+        self.seed(linked=False)
+
+        self.send('سلام', user=50, chat=50, first_contact=True)
+
+        reply = self.replies(50)
+        self.assertIn(WELCOME_NEW, reply)
+        self.assertIn('نام و نام خانوادگی کاملت', reply)
+        self.assertIn('شمارهٔ موبایلت', reply)
+        # No internal vocabulary and no player data on the first message.
+        self.assertNotIn('بازیکن', reply)
+        self.assertNotIn('وصل', reply)
+        self.assertEqual(self.sent(50)[-1]['reply_markup'],
+                         {'keyboard': [[{'text': CONTACT_BUTTON, 'request_contact': True}]]})
+        self.assertFalse(self.db.all('SELECT * FROM pending'))
+
+    def test_welcome_is_sent_once_per_account(self):
+        self.send('سلام', user=50, chat=50, first_contact=True)
+
+        self.send('بدهی من چقدره؟', user=50, chat=50)
+
+        self.assertEqual(self.replies(50).count('برای شروع این دو تا را برایم بفرست'), 1)
+        self.assertTrue(self.bot.welcomed(50))
+
+    def test_linked_player_without_a_number_is_asked_for_the_number_only(self):
+        self.seed()
+
+        self.send('سلام', user=10, chat=10, first_contact=True)
+
+        reply = self.replies(10)
+        self.assertIn(WELCOME_PHONE_ONLY.format(name='علی رضایی'), reply)
+        self.assertNotIn('نام و نام خانوادگی کاملت', reply)
+        self.assertEqual(self.sent(10)[-1]['reply_markup'],
+                         {'keyboard': [[{'text': CONTACT_BUTTON, 'request_contact': True}]]})
+
+    def test_complete_account_gets_a_plain_welcome_without_the_button(self):
+        self.seed()
+        with self.db.conn:
+            self.service.set_player_phone(1, '09121234567', 'test')
+
+        self.send('سلام', user=10, chat=10, first_contact=True)
+
+        reply = self.replies(10)
+        self.assertIn(WELCOME_COMPLETE.format(name='علی رضایی'), reply)
+        self.assertNotIn('شمارهٔ موبایلت', reply)
+        self.assertNotIn('reply_markup', self.sent(10)[-1])
+
+    def test_known_number_asks_for_the_name_only(self):
+        self.seed(linked=False)
+        with self.db.conn:
+            self.service.touch_contact(50, 50, phone='09121234567')
+
+        self.send('سلام', user=50, chat=50, first_contact=True)
+
+        reply = self.replies(50)
+        self.assertIn(WELCOME_NAME_ONLY, reply)
+        self.assertNotIn('شمارهٔ موبایلت را با دکمهٔ زیر بفرست', reply)
+        self.assertNotIn('reply_markup', self.sent(50)[-1])
+
+    def test_start_of_a_new_user_is_the_welcome_not_the_help(self):
+        self.send('/start', user=50, chat=50, first_contact=True)
+
+        reply = self.replies(50)
+        self.assertIn(WELCOME_NEW, reply)
+        self.assertNotIn('دستورات کاربران', reply)
+        self.assertEqual(self.ai.calls, [])
+        self.assertIsNone(self.bot.acknowledgement_chat({'update_id': 99, 'message': {
+            'chat': {'id': 50, 'type': 'private'}, 'from': {'id': 50}, 'text': '/start'}}))
+
+    def test_identity_request_as_a_first_message_gets_no_welcome(self):
+        self.seed(linked=False)
+
+        self.send('/identify علی رضایی', user=10, chat=10, first_contact=True)
+
+        self.assertNotIn('خوش آمدی', self.replies(10))
+        self.assertIn('درخواست شناسایی', self.replies(-100))
+        self.assertEqual(self.db.one('SELECT kind FROM pending')['kind'], 'identity')
+
+    def test_admin_and_group_messages_never_get_the_welcome(self):
+        self.bot.config = replace(self.config, admins=frozenset({1, 2}),
+                                  admin_access='allowlist')
+
+        self.send('/start', user=1, chat=1, first_contact=True)
+        self.send('مسئول سلام', user=50, chat=-100, first_contact=True)
+
+        self.assertNotIn('خوش آمدی', self.replies(1))
+        self.assertIn('دستورات ادمین', self.replies(1))
+        self.assertNotIn('خوش آمدی', self.replies(-100))
+        self.assertFalse(self.bot.welcomed(50))
+
+    def test_a_command_after_the_welcome_is_answered_normally(self):
+        self.send('سلام', user=50, chat=50, first_contact=True)
+
+        self.send('/help', user=50, chat=50)
+
+        reply = self.replies(50)
+        self.assertIn('دستورات کاربران', reply)
+        self.assertEqual(reply.count('برای شروع این دو تا را برایم بفرست'), 1)
+
+    def test_contact_before_the_name_asks_for_the_full_name(self):
+        self.send(sender={'id': 50}, contact={'user_id': 50, 'phone_number': '09121234567'},
+                  user=50, chat=50, first_contact=True)
+
+        reply = self.replies(50)
+        self.assertIn('شماره‌ات ثبت شد', reply)
+        self.assertIn('نام و نام خانوادگی کاملت را بنویس', reply)
+        self.assertEqual(self.sent(50)[-1]['reply_markup'], {'remove_keyboard': True})
+        self.assertEqual(self.db.one('SELECT phone FROM contacts WHERE user_id=50')['phone'],
+                         '+989121234567')
+        self.assertTrue(self.bot.welcomed(50))
+
+    def test_agent_identify_card_carries_the_saved_number(self):
+        from app.agent import SansAgent
+        self.seed(linked=False)
+        with self.db.conn:
+            self.service.touch_contact(50, 50, phone='09121234567')
+        agent = SansAgent(self.bot)
+        tools = {item.name: item for item in agent._make_tools(
+            50, 50, False, {'id': 50, 'username': 'ali'}, {})}
+
+        tools['manage_records'].invoke({
+            'operation': 'identify',
+            'data_json': json.dumps({'name': 'علی رضایی'}, ensure_ascii=False)})
+
+        admin = self.replies(-100)
+        self.assertIn('شماره تماس: +989121234567', admin)
+        self.assertIn('username: @ali', admin)
+
+    def test_approval_stores_the_number_the_card_carried(self):
+        self.seed(linked=False)
+        self.send('/identify علی رضایی', user=10, chat=10, first_contact=True)
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '09121234567'},
+                  user=10, chat=10)
+        ident = self.db.one("SELECT id FROM pending WHERE kind='identity'")['id']
+
+        self.click('yes:' + ident)
+
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'],
+                         '+989121234567')
+        self.assertEqual(self.db.one(
+            "SELECT COUNT(*) n FROM audit_logs WHERE action='set_player_phone'")['n'], 1)
+
+    def test_approval_does_not_overwrite_an_existing_number(self):
+        self.seed(linked=False)
+        with self.db.conn:
+            self.service.set_player_phone(1, '09121111111', 'test')
+        self.send('/identify علی رضایی', user=10, chat=10, first_contact=True)
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '09355555555'},
+                  user=10, chat=10)
+        ident = self.db.one("SELECT id FROM pending WHERE kind='identity'")['id']
+
+        self.click('yes:' + ident)
+
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'],
+                         '+989121111111')
+
+    def test_a_message_without_a_username_keeps_the_stored_one(self):
+        self.send('سلام', sender={'id': 50, 'first_name': 'علی', 'username': 'ali_rezaei'},
+                  user=50, chat=50, first_contact=True)
+
+        self.send('بدهی من چقدره؟', sender={'id': 50}, user=50, chat=50)
+
+        contact = self.db.one('SELECT * FROM contacts WHERE user_id=50')
+        self.assertEqual((contact['display_name'], contact['username']),
+                         ('علی', 'ali_rezaei'))
+
+    def test_welcome_makes_no_model_call(self):
+        self.send('سلام', user=50, chat=50, first_contact=True)
+
+        self.assertEqual(self.ai.calls, [])
+
+    def test_identity_card_lists_similar_names_for_the_admin(self):
+        self.seed(linked=False)
+        self.apply('new_player', name='رضا کریمی')
+
+        self.send('/identify رضا', user=10, chat=10, first_contact=True)
+
+        admin = self.replies(-100)
+        self.assertIn('نام‌های مشابه', admin)
+        self.assertIn('#2 رضا محمدی', admin)
+        self.assertIn('#3 رضا کریمی', admin)
+        self.assertIn('/link', admin)
 
 
 if __name__ == '__main__':

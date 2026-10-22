@@ -840,7 +840,8 @@ class Service:
         self.db.execute(
             '''INSERT INTO contacts(user_id,chat_id,display_name,username,phone) VALUES (?,?,?,?,?)
                ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,
-                 display_name=excluded.display_name, username=excluded.username,
+                 display_name=COALESCE(NULLIF(excluded.display_name,''), contacts.display_name),
+                 username=COALESCE(NULLIF(excluded.username,''), contacts.username),
                  phone=COALESCE(NULLIF(excluded.phone,''), contacts.phone),
                  updated_at=CURRENT_TIMESTAMP''',
             (user_id, chat_id, str(display_name or '')[:200], str(username or '').lstrip('@')[:100],

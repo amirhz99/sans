@@ -1322,5 +1322,55 @@ class OutreachPromptTests(unittest.TestCase):
         self.assertIn('دکمهٔ «ارسال شمارهٔ من» هم فرستاده می‌شود', reply)
 
 
+class OnboardingAgentContextTests(unittest.TestCase):
+    """SPEC-021: the model sees the newcomer state, never the address book."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp.name) / 'onboarding.sqlite3')
+        self.service = Service(self.db)
+        self.config = Config('fake-token', -100, frozenset({1}), 'https://example.com/v1',
+                             'fake-key', 'fake-model', Path(self.temp.name) / 'unused.sqlite3')
+        self.bot = Bot(self.db, self.config, SimpleNamespace())
+        with self.db.conn:
+            self.service.apply(self.service.prepare('new_player', {'name': 'علی رضایی'}), 1, 'test:1')
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def snapshot(self, user_id=50, sender=None):
+        agent = SansAgent(self.bot)
+        return json.loads(agent._build_live_snapshot(user_id, user_id, False, sender))
+
+    def test_prompt_tells_the_model_not_to_repeat_the_introduction(self):
+        self.assertIn('needs_introduction', AGENT_SYSTEM_PROMPT)
+        self.assertIn('ربات خودش پیام اول را فرستاده', AGENT_SYSTEM_PROMPT)
+        self.assertIn('username را هم از او نپرس', AGENT_SYSTEM_PROMPT)
+
+    def test_a_stranger_needs_introduction_and_no_number_is_exposed(self):
+        with self.db.conn:
+            self.service.touch_contact(50, 50, 'مهمان', 'guest', phone='09121234567')
+
+        caller = self.snapshot(50, {'id': 50, 'first_name': 'علی', 'last_name': 'رضایی'})['caller']
+
+        self.assertEqual(caller['sender_name'], 'علی رضایی')
+        self.assertTrue(caller['needs_introduction'])
+        self.assertFalse(caller['has_pending_identity'])
+        self.assertNotIn('989121234567', json.dumps(caller, ensure_ascii=False))
+
+    def test_a_linked_caller_and_an_open_request_are_reported(self):
+        with self.db.conn:
+            self.service.bind(1, 10, 1)
+            self.bot.new_pending('identity', {'name': 'علی رضایی', 'user_id': 10, 'player': 1},
+                                 10, 10)
+
+        caller = self.snapshot(10)['caller']
+
+        self.assertFalse(caller['needs_introduction'])
+        self.assertTrue(caller['has_pending_identity'])
+        self.assertEqual(caller['linked_player']['id'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

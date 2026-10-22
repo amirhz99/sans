@@ -42,6 +42,20 @@ MAX_EXPIRY_HOURS = 8760
 # SPEC-014: a private reply to a proactive notice is handed back to the admins.
 RELAY_CONFIRMATION = 'پیام شما برای ادمین‌ها ارسال شد ✅'
 
+# SPEC-021: the first private message is answered by the bot itself, never by the
+# model, so a stranger always sees the same short instruction and never an
+# internal term such as «اتصال حساب» or a provider error.
+WELCOME_NEW = ('سلام 👋 خوش آمدی.\n'
+               'برای شروع این دو تا را برایم بفرست:\n'
+               '• نام و نام خانوادگی کاملت (مثل «علی رضایی»)\n'
+               '• شمارهٔ موبایلت با دکمهٔ زیر')
+WELCOME_NAME_ONLY = ('سلام 👋 خوش آمدی. شماره‌ات را دارم ✅\n'
+                     'فقط نام و نام خانوادگی کاملت را بنویس.')
+WELCOME_PHONE_ONLY = ('سلام {name} 👋 خوش آمدی.\n'
+                      'فقط شمارهٔ موبایلت را با دکمهٔ زیر بفرست.')
+WELCOME_COMPLETE = ('سلام {name} 👋 خوش آمدی. هر کاری داشتی بگو:\n'
+                    'بدهی /debt، سانس /session، شمارهٔ کارت /card، راهنما /help.')
+
 
 def buttons(yes, no):
     return [[{'text': 'تأیید', 'callback_data': yes}, {'text': 'رد', 'callback_data': no}]]
@@ -172,6 +186,10 @@ class Bot:
             body = ''
         if body.split('@')[0] == '/id':
             return chat_id
+        # SPEC-021: `/start` is answered immediately by the welcome, so an extra
+        # "processing" notice would only add noise.
+        if body.split('@')[0] == '/start':
+            return None
         # A bare greeting is answered with a single short message, so an extra
         # "processing" notice would only add noise.
         if (not msg.get('contact') and not msg.get('photo') and not msg.get('document')
@@ -267,6 +285,56 @@ class Bot:
         """Return the linked player when a phone number is still missing."""
         player = self.service.linked(user_id)
         return player if player and not player['phone'] else None
+
+    def welcomed(self, user_id):
+        """Return whether this account already received the first-contact text."""
+        return bool(self.db.setting(f'welcomed:{user_id}'))
+
+    def pending_identity(self, user_id):
+        """Return the open identity request of this user, if any (SPEC-021)."""
+        return self.db.one("SELECT id FROM pending WHERE requester=? "
+                           "AND kind IN ('identity','claim') AND status='pending'", (user_id,))
+
+    def welcome(self, user_id):
+        """Return ``(text, keyboard)`` for the first private contact (SPEC-021).
+
+        The text depends only on what the database already knows, so it is
+        deterministic and needs no model call.  It never mentions players,
+        matching, or linking: the user is only asked for a name and a number.
+        """
+        linked = self.service.linked(user_id)
+        contact = self.db.one('SELECT phone FROM contacts WHERE user_id=?', (user_id,))
+        known_phone = bool(linked and linked['phone']) or bool(contact and contact['phone'])
+        if linked and known_phone:
+            return WELCOME_COMPLETE.format(name=linked['name']), None
+        if linked:
+            return WELCOME_PHONE_ONLY.format(name=linked['name']), self.contact_keyboard()
+        if known_phone:
+            return WELCOME_NAME_ONLY, None
+        return WELCOME_NEW, self.contact_keyboard()
+
+    def first_contact(self, msg, user_id, admin, private, body, state):
+        """Return ``(reply, keyboard, terminal)`` for a first private contact.
+
+        ``None`` means the message is handled exactly as before.  ``terminal``
+        tells the caller that the welcome is the whole answer, so ``/start``, a
+        bare greeting, and an empty body never reach the model.
+        """
+        if not private or admin:
+            return None
+        if msg.get('contact') or msg.get('photo') or msg.get('document'):
+            return None
+        if state.get('receipt'):
+            return None
+        if self.welcomed(user_id) or self.pending_identity(user_id):
+            return None
+        command = body.split('@')[0] if body.startswith('/') else ''
+        if command and command != '/start':
+            return None
+        reply, keyboard = self.welcome(user_id)
+        terminal = bool(command) or not body or self.short_greeting(
+            body, self.config.bot_name, self.db.setting('bot_username'))
+        return reply, keyboard, terminal
 
     def propose_settings(self, changes, user_id, chat_id):
         """Create one approval proposal for one or more settings changes.
@@ -376,14 +444,15 @@ class Bot:
         admin = self.is_admin(chat_id, user_id)
         body = (msg.get('text') or msg.get('caption') or '').strip()
         sender = msg.get('from') if isinstance(msg.get('from'), dict) else {}
-        sender_name = (' '.join(filter(None, [sender.get('first_name', ''), sender.get('last_name', '')]))
-                       or sender.get('username', '') or str(user_id))
+        profile_name = ' '.join(filter(None, [sender.get('first_name', ''), sender.get('last_name', '')]))
+        sender_name = profile_name or sender.get('username', '') or str(user_id)
         if body and body.split('@')[0] != '/id':
             self.db.log_message(chat_id, user_id, sender_name, body, 'user')
         if private:
-            # SPEC-014: remember the private address (and its latest profile
-            # name) so the bot can report who it is talking to.
-            self.service.touch_contact(user_id, chat_id, sender_name, sender.get('username', ''))
+            # SPEC-014/021: remember the private address and the latest profile
+            # name.  The numeric fallback stays a logging detail; the address
+            # book only ever receives a real name, so it cannot overwrite one.
+            self.service.touch_contact(user_id, chat_id, profile_name, sender.get('username', ''))
         reply_to = msg.get('reply_to_message') if isinstance(msg.get('reply_to_message'), dict) else None
         reply_body = ((reply_to or {}).get('text') or (reply_to or {}).get('caption') or '').strip()
         processing_body = body
@@ -445,6 +514,21 @@ class Bot:
         )
         state, history = self.db.conversation(chat_id, user_id)
         had_receipt_step = bool(state.get('receipt'))
+        # SPEC-021: the very first private message is answered by the bot itself.
+        # The text is deterministic, needs no model call, and is sent once per
+        # account.  `/start`, a bare greeting, and an empty body stop here; any
+        # other first question continues to the model after the welcome.
+        welcome = self.first_contact(msg, user_id, admin, private, body, state)
+        if welcome:
+            welcome_text, welcome_keyboard, terminal = welcome
+            self.db.say(chat_id, welcome_text, keyboard=welcome_keyboard)
+            self.db.set_setting(f'welcomed:{user_id}', int(time.time()))
+            self.db.log_message(chat_id, 0, self.config.bot_name, welcome_text, 'assistant')
+            if terminal:
+                history += [{'role': 'user', 'content': processing_body[:4000]},
+                            {'role': 'assistant', 'content': welcome_text[:2500]}]
+                self.db.save_conversation(chat_id, user_id, state, history)
+                return
         # A bare greeting is routed to the model like any other free message so
         # the conversation stays natural, but it may only ask a clarifying
         # question; see the dispatch guard below.
@@ -788,9 +872,10 @@ class Bot:
         except UserError:
             player = None
         payload = {'name': name, 'user_id': user_id, 'player': player['id'] if player else None,
-                   **self.identity_profile(sender, phone_number)}
+                   **self.identity_profile(sender, self.known_phone(user_id, phone_number))}
         ident = self.new_pending('identity' if player else 'claim', payload, user_id, chat_id)
-        note = self.identity_note(ident, payload, player)
+        similar = [] if player else self.service.similar_players(name)[:3]
+        note = self.identity_note(ident, payload, player, similar)
         markup = None
         if player:
             markup = buttons('yes:' + ident, 'no:' + ident)
@@ -798,6 +883,25 @@ class Bot:
             note += f'\nتطبیق قطعی پیدا نشد. با /players بررسی کنید؛ در صورت نیاز بازیکن بسازید و سپس:\n/link {ident} شناسه_بازیکن'
         self.db.say(self.config.admin_group, note, markup)
         return 'معرفی شما برای بررسی به ادمین‌ها ارسال شد؛ بعد از تأیید، بدهی حساب خودتان قابل مشاهده است.'
+
+    def known_phone(self, user_id, phone_number=None):
+        """Return one canonical number for an identity card (SPEC-021).
+
+        An explicit value wins; otherwise the number this user already shared
+        with the contact button is used.  An invalid value is dropped instead of
+        blocking the identity request, because the card is still useful without
+        a number.
+        """
+        candidate = phone_number
+        if not isinstance(candidate, str) or not candidate.strip():
+            contact = self.db.one('SELECT phone FROM contacts WHERE user_id=?', (user_id,))
+            candidate = contact['phone'] if contact else ''
+        if not isinstance(candidate, str) or not candidate.strip():
+            return None
+        try:
+            return normalize_phone(candidate)
+        except UserError:
+            return None
 
     @staticmethod
     def identity_profile(sender, phone_number=None):
@@ -846,8 +950,11 @@ class Bot:
                               "ORDER BY created_at DESC LIMIT 1", (user_id, chat_id))
         if not pending:
             state['identity_phone'] = phone
-            return ('شمارهٔ شما دریافت شد. حالا /identify نام کامل را بفرستید تا username و شماره '
-                    'برای ادمین‌ها ارسال شود.', None)
+            # SPEC-021: the number is saved, so the only missing piece is the
+            # name; the share keyboard is dismissed to keep the chat clean.
+            self.db.set_setting(f'welcomed:{user_id}', int(time.time()))
+            return ('شماره‌ات ثبت شد ✅ حالا نام و نام خانوادگی کاملت را بنویس '
+                    'تا برای بررسی برای ادمین بفرستم.', self.hide_keyboard())
         payload = json.loads(pending['payload'])
         payload['phone_number'] = phone
         self.db.execute('UPDATE pending SET payload=? WHERE id=?', (dumps(payload), pending['id']))
@@ -873,7 +980,7 @@ class Bot:
         return ('شماره‌ای برای شما ثبت نشده است. با دکمهٔ زیر شمارهٔ خودتان را بفرستید.',
                 self.contact_keyboard())
 
-    def identity_note(self, ident, payload, player=None):
+    def identity_note(self, ident, payload, player=None, similar=None):
         username = '@' + payload['username'] if payload.get('username') else 'ارسال نشده'
         phone = payload.get('phone_number') or 'ارسال نشده'
         display_name = payload.get('display_name') or 'ارسال نشده'
@@ -886,6 +993,11 @@ class Bot:
         if player:
             note += (f"\nتطبیق پیشنهادی: #{player['id']} {player['name']}"
                      '\nلطفاً هویت را مستقلاً بررسی کنید؛ نام، username و شماره به‌تنهایی اثبات هویت نیستند.')
+        # SPEC-021: a shortened or misspelled name should not force the admin to
+        # open /players.  These are suggestions only; nothing is linked here.
+        if similar:
+            note += ('\nنام‌های مشابه (برای اتصال: /link ' + ident + ' شناسه):\n'
+                     + '\n'.join(f"#{row['id']} {row['name']} — {row['reason']}" for row in similar))
         return note
 
     def pending_summary(self, row):
@@ -1190,6 +1302,10 @@ class Bot:
             self.repair_last_entity(row['chat_id'], row['requester'], payload)
         elif approve and row['kind'] in ('identity', 'binding'):
             self.service.bind(payload['player'], payload['user_id'], actor)
+            if row['kind'] == 'identity':
+                # SPEC-021: the number the user shared with the contact button
+                # lives in the payload; without this the approval throws it away.
+                self.attach_identity_phone(payload, actor)
         elif approve:
             raise UserError('ابتدا تطبیق بازیکن را با /link مشخص کنید.')
         self.db.execute('UPDATE pending SET status=? WHERE id=?', ('approved' if approve else 'rejected', ident))
@@ -1219,6 +1335,24 @@ class Bot:
                 c.get('action') in ('player_merge', 'player_delete') for c in payload):
             return 'انجام شد ✅ فهرست بازیکنان به‌روز شد؛ برای بررسی /players و /duplicates را بفرستید.'
         return 'ثبت شد ✅' if approve else 'درخواست رد شد؛ تغییری در حساب ایجاد نشد.'
+
+    def attach_identity_phone(self, payload, actor):
+        """Store the number an approved identity card carries (SPEC-021).
+
+        Never overwrites a number the player already has, and never raises: a
+        bad number must not roll back the binding that already succeeded.
+        """
+        try:
+            phone = normalize_phone(payload.get('phone_number'))
+        except UserError:
+            return None
+        player_id = payload.get('player')
+        if isinstance(player_id, bool) or not isinstance(player_id, int):
+            return None
+        player = self.db.one('SELECT * FROM players WHERE id=?', (player_id,))
+        if not player or player['phone']:
+            return None
+        return self.service.set_player_phone(player['id'], phone, actor)
 
     def request_self_debt(self, args, user_id, chat_id):
         player = self.service.linked(user_id)
