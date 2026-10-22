@@ -126,7 +126,91 @@ journalctl -u sans-bot.service -n 30 --no-pager
 
 پس از تغییر `/root/sans/.env`، دستور `systemctl restart sans-bot.service` را اجرا کنید. برای ورود CSV یا بکاپ، ابتدا `systemctl stop sans-bot.service` و پس از پایان `systemctl start sans-bot.service` بزنید. گزینهٔ `--discover-ids` یا polling مستقل را هم‌زمان با سرویس اجرا نکنید (`--discover-ids` گزینهٔ CLI است، نه فرمان ربات).
 
+این یونیت مخصوص اجرای root در `/root/sans` است. اگر مخزن در مسیر دیگری است یا ربات با کاربر عادی اجرا می‌شود، به‌جای آن بخش «اجرای دائمی بدون root» را ببینید؛ در آن حالت `systemctl` و `journalctl` هر دو پرچم `--user` می‌گیرند.
+
 اعتبار کلید یا دریافت فهرست مدل‌ها، تضمین موفقیت chat/completions نیست. در InferHub شناسهٔ مدل ممکن است به پیشوند ارائه‌دهنده مثل `ali/qwen3.8-flash` نیاز داشته باشد. خطای HTTP 402 با پیام `no provider's ask matches your max-per-mtok bid` به پیدا نشدن ارائه‌دهنده در سقف قیمت پیشنهادی اشاره دارد. تنظیمات قیمت/مسیریابی حساب را نزد سرویس بررسی کنید؛ ربات سقف هزینه را خودکار افزایش نمی‌دهد. در زمان خطای AI، فرمان‌های قطعی همچنان در دسترس‌اند.
+
+### اجرای دائمی بدون root (systemd --user)
+
+اگر ربات با کاربر عادی (نه root) اجرا می‌شود، از سرویس کاربر استفاده کنید تا هم به sudo نیاز نباشد و هم بعد از ریبوت خودکار بالا بیاید. مسیرها را با مسیر واقعی مخزن جایگزین کنید:
+
+```bash
+mkdir -p ~/.config/systemd/user
+$EDITOR ~/.config/systemd/user/sans-bot.service
+systemctl --user daemon-reload
+systemctl --user enable --now sans-bot.service
+loginctl enable-linger "$USER"      # بدون این، سرویس با خروج از سیستم می‌خوابد
+```
+
+نمونهٔ یونیت (مقادیر `WorkingDirectory`، `ExecStart` و مسیر لاگ را با مسیر خودتان تطبیق دهید):
+
+```ini
+[Unit]
+Description=Bale football session manager (sans)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/home/USER/projects/sans
+ExecStart=/home/USER/projects/sans/.venv/bin/python3 /home/USER/projects/sans/run.py
+Restart=always
+RestartSec=15
+TimeoutStopSec=20
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+# Bale مستقیم پاسخ می‌دهد ولی chat/completions ارائه‌دهندهٔ AI فقط از طریق
+# پروکسی محلی کار می‌کند؛ پس Bale از پروکسی مستثنا و AI از آن رد می‌شود.
+Environment=http_proxy=http://127.0.0.1:10808
+Environment=https_proxy=http://127.0.0.1:10808
+Environment=HTTP_PROXY=http://127.0.0.1:10808
+Environment=HTTPS_PROXY=http://127.0.0.1:10808
+Environment=no_proxy=tapi.bale.ai,localhost,127.0.0.1
+Environment=NO_PROXY=tapi.bale.ai,localhost,127.0.0.1
+StandardOutput=append:/home/USER/projects/sans/data/logs/bot.log
+StandardError=append:/home/USER/projects/sans/data/logs/bot.log
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user status sans-bot.service --no-pager
+tail -f data/logs/bot.log
+```
+
+سرویس کاربر محیط پوستهٔ شما را به ارث نمی‌برد؛ هر متغیری مثل پروکسی که ربات لازم دارد باید در خود یونیت با `Environment=` بیاید. اگر پروکسی محلی خاموش باشد، polling بله همچنان کار می‌کند (چون در `no_proxy` است) و فقط پاسخ‌های AI خطا می‌دهند.
+
+### تفکیک مسیر شبکه (بله مستقیم، AI با پروکسی)
+
+روی شبکه‌ای که در ۲۰۲۶-۱۰-۲۲ اندازه‌گیری شد:
+
+| مقصد | اتصال مستقیم | از طریق پروکسی محلی |
+|---|---|---|
+| `tapi.bale.ai` (`getMe`) | ۲۰۰ در ~۰٫۱ ثانیه | ۲۰۰ در ~۵ ثانیه |
+| `api.inferhub.dev` (`chat/completions`) | بدون پاسخ تا تایم‌اوت ۳۵ ثانیه | ۴۰۱ در ~۰٫۷ ثانیه |
+
+یعنی `no_proxy` نباید `api.inferhub.dev` را در بر بگیرد؛ اگر بگیرد، هر نوبت گفتگو پس از ۳۵ ثانیه تایماوت می‌خورد و مدل جایگزین هم همان سرنوشت را دارد. در لاگ این حالت به شکل `Retrying request` و سپس `LLM model ... failed (Request timed out.)` دیده می‌شود.
+
+### بازیابی پس از خاموشی غیرتمیز
+
+اگر ربات بدون `systemctl stop` کشته شود، ممکن است انتهای `data/logs/bot.log` با بایت‌های `NUL` پر شود. پیش از استارت دوباره فایل را جابه‌جا کنید:
+
+```bash
+mv data/logs/bot.log data/logs/bot.log.1
+```
+
+پیش از هر راه‌اندازی مجدد پس از حادثه، یک بکاپ بگیرید (ربات باید متوقف باشد، چون بکاپ قفل نصب را می‌گیرد):
+
+```bash
+systemctl --user stop sans-bot.service
+.venv/bin/python run.py --backup data/backups/pre-restart-$(date +%F).sqlite3
+systemctl --user start sans-bot.service
+```
+
+پیام‌هایی که در زمان خواب ربات رسیده‌اند از بین نمی‌روند: مقدار `offset` در جدول `settings` ذخیره می‌شود و اولین polling پس از استارت آن‌ها را پردازش می‌کند.
 
 ## ورود اطلاعات قبلی
 
