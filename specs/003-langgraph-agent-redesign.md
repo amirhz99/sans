@@ -78,6 +78,8 @@ confirmation for sensitive financial mutations.
 - AC-002 -> `tests/test_sans.py`
 - AC-003 -> `tests/test_agent_contracts.py`
 - AC-004 -> `tests/test_sans.py`
+- AC-005 -> `tests/test_agent_contracts.py::AgentContractTests::test_agent_logs_every_step_and_excludes_the_legacy_prompt`
+  and `tests/test_agent_contracts.py::AgentContractTests::test_langgraph_agent_unwraps_accidental_json_and_logs_skipped`
 - AC-006 -> `tests/test_agent_contracts.py::AgentContractTests::test_ai_prompts_reject_unrelated_requests_without_tools`
 
 ## Safety Constraints
@@ -102,3 +104,7 @@ git diff --check
 
 - SPEC-007 supersedes the implicit player creation in `set_attendance`; the
   agent now asks for a full name instead of adding a new player row.
+- 2026-10-22: `AC-005` had no test mapping at all. It is now mapped to
+  `test_agent_logs_every_step_and_excludes_the_legacy_prompt` (written for the
+  tool-call, tool-result, reply, and prompt-exclusion halves) and to the
+  existing skipped-message test.

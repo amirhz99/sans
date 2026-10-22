@@ -1642,6 +1642,33 @@ class ProposalStalenessTests(BaseCase):
         self.assertEqual(self.status(ident), 'expired')
         self.assertIn('تغییر کرده', self.callback_texts()[-1])
 
+    def test_setting_proposal_expires_when_value_changed(self):
+        """SPEC-011 AC-005: a settings card is guarded by its stored value."""
+        self.apply('settings', key='card', value='1111111111111111')
+        _, markup = self.card({'action': 'settings',
+                               'args': {'key': 'card', 'value': '2222222222222222'}})
+        ident = self.card_id(markup)
+        # Someone else changes the same setting before the admin presses «تأیید».
+        self.apply('settings', key='card', value='3333333333333333')
+
+        self.click('yes:' + ident)
+
+        self.assertEqual(self.db.setting('card'), '3333333333333333')
+        self.assertEqual(self.status(ident), 'expired')
+        self.assertIn('تغییر کرده', self.callback_texts()[-1])
+
+    def test_setting_proposal_still_applies_when_its_value_is_unchanged(self):
+        """SPEC-011 AC-010 for settings: an untouched value is not over-expired."""
+        self.apply('settings', key='payment_note', value='متن قبلی')
+        _, markup = self.card({'action': 'settings',
+                               'args': {'key': 'payment_note', 'value': 'متن تازه'}})
+        ident = self.card_id(markup)
+
+        self.click('yes:' + ident)
+
+        self.assertEqual(self.db.setting('payment_note'), 'متن تازه')
+        self.assertEqual(self.status(ident), 'approved')
+
     def test_finalize_proposal_refuses_when_attendance_changed(self):
         self.seed()
         self.apply('attendance', session=1, player=1, guests=1)

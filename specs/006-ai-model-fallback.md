@@ -77,8 +77,7 @@ model before reporting a failure to the user.
 - AC-003 -> `tests/test_agent_contracts.py::AgentContractTests::test_langgraph_falls_back_to_secondary_model`
 - AC-004 -> `tests/test_agent_contracts.py::AgentContractTests::test_legacy_ai_client_raises_when_every_model_fails`
   and `tests/test_agent_contracts.py::AgentContractTests::test_langgraph_raises_when_every_model_fails`
-- AC-005 -> the same tests assert the shared configuration values and the
-  absence of any schema/table change.
+- AC-005 -> `tests/test_agent_contracts.py::AgentContractTests::test_fallback_reuses_the_same_provider_configuration`
 
 ## Safety Constraints
 
@@ -112,3 +111,8 @@ The primary model is still tried first, which costs one fast failed request per
 turn while it is unavailable. Operators can promote a healthy model by changing
 `AI_MODEL`, and may list several fallbacks separated by commas. Restart
 `sans-bot.service` after changing `.env`.
+
+2026-10-22: `AC-005` was mapped to prose instead of a test. It now points at
+`test_fallback_reuses_the_same_provider_configuration`, which asserts that the
+fallback instances share `api_key`, `base_url`, `temperature`, `timeout`, and
+`max_retries` with the primary and that no table is created.

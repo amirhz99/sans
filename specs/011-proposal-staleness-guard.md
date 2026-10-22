@@ -163,3 +163,9 @@ git diff --check
 - The 37 stale proposals on the live database become closable through
   `/pending`; they are intentionally not applied because their balances moved
   since they were created.
+- 2026-10-22: `AC-005` was ticked but its mapped test
+  (`test_setting_proposal_expires_when_value_changed`) did not exist. The test is
+  written now, together with
+  `test_setting_proposal_still_applies_when_its_value_is_unchanged` for the
+  over-expiry direction, and `SpecContractTests` now fails when a mapping points
+  at a missing test.

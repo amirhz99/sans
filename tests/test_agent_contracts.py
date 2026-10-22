@@ -649,6 +649,55 @@ class AgentContractTests(unittest.TestCase):
         events = [row['event'] for row in self.db.recent_agent_logs(30)]
         self.assertIn('LLM_FALLBACK', events)
 
+    def test_fallback_reuses_the_same_provider_configuration(self):
+        """SPEC-006 AC-005: only the model name changes on the fallback path."""
+        from langchain_core.messages import AIMessage
+        from app.config import Config
+        from app import agent as agent_module
+
+        created = []
+
+        class RecordingModel:
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+                self.model = kwargs.get('model')
+
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, messages):
+                if self.model == 'primary-model':
+                    raise RuntimeError('HTTP 402')
+                return AIMessage(content='پاسخ از مدل جایگزین')
+
+        tables_before = {row['name'] for row in self.db.all(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+        config = Config('fake-token', -100, frozenset({1}), 'https://example.invalid/v1',
+                        'fake-key', 'primary-model',
+                        Path(self.temp.name) / 'contracts.sqlite3',
+                        ai_fallback_models=('fallback-model', 'third-model'))
+        bot = Bot(self.db, config, SimpleNamespace(use_langgraph=True))
+        chat_model = next(name for name in dir(agent_module)
+                          if name.startswith('Chat') and name.endswith('AI'))
+        with patch.object(agent_module, chat_model, side_effect=lambda **kwargs: RecordingModel(**kwargs)):
+            bot.process({
+                'update_id': 42,
+                'message': {'message_id': 42, 'chat': {'id': -100, 'type': 'group'},
+                            'from': {'id': 1}, 'text': 'مسئول گزارش مالی را بگو'},
+            })
+
+        self.assertEqual([item['model'] for item in created],
+                         ['primary-model', 'fallback-model', 'third-model'])
+        shared = {key: item[key] for key in ('api_key', 'base_url', 'temperature', 'timeout', 'max_retries')
+                  for item in created[:1]}
+        for item in created:
+            for key, value in shared.items():
+                self.assertEqual(item[key], value, key)
+        self.assertEqual(set(shared), {'api_key', 'base_url', 'temperature', 'timeout', 'max_retries'})
+        tables_after = {row['name'] for row in self.db.all(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+        self.assertEqual(tables_before, tables_after)
+
     def test_langgraph_raises_when_every_model_fails(self):
         from app.config import Config
         from app import agent as agent_module
@@ -764,6 +813,53 @@ class AgentContractTests(unittest.TestCase):
         self.assertIn('فقط برای ادمین', player_tools['manage_records'].invoke(
             {'operation': 'merge_player', 'data_json': json.dumps({'source': 2, 'target': 1})}))
 
+
+    def test_agent_logs_every_step_and_excludes_the_legacy_prompt(self):
+        """SPEC-003 AC-005: message, skipped reason, tool call, and reply are logged."""
+        from langchain_core.messages import AIMessage
+        from app.config import Config
+
+        class ScriptedLangGraphLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, messages):
+                self.calls += 1
+                if self.calls == 1:
+                    return AIMessage(content='', tool_calls=[{
+                        'id': 'read-1', 'name': 'query_database',
+                        'args': {'target': 'players'},
+                    }])
+                return AIMessage(content='فهرست بازیکن‌ها را خواندم.')
+
+        class LangGraphDriver:
+            use_langgraph = True
+
+            def __init__(self):
+                self.llm_override = ScriptedLangGraphLLM()
+
+        self.apply('new_player', name='علی رضایی')
+        config = Config('fake-token', -100, frozenset({1}), 'https://example.invalid',
+                        'fake-key', 'fake-model', Path(self.temp.name) / 'contracts.sqlite3')
+        bot = Bot(self.db, config, LangGraphDriver())
+
+        bot.process({
+            'update_id': 71,
+            'message': {'message_id': 71, 'chat': {'id': -100, 'type': 'group'},
+                        'from': {'id': 1, 'first_name': 'ادمین'},
+                        'text': 'مسئول چند بازیکن داریم؟'},
+        })
+
+        events = [row['event'] for row in self.db.recent_agent_logs(30)]
+        for expected in ('INCOMING', 'LLM_TOOL_CALL', 'TOOL_RESULT', 'AGENT_REPLY'):
+            self.assertIn(expected, events)
+        # The legacy JSON-only prompt must never reach the agent.
+        self.assertIn('فقط یک JSON بدون markdown بده', SYSTEM_PROMPT)
+        self.assertNotIn('فقط یک JSON بدون markdown بده', AGENT_SYSTEM_PROMPT)
+        self.assertTrue((Path(self.temp.name) / 'logs' / 'agent.log').is_file())
 
     def test_langgraph_multi_player_settle_creates_one_card(self):
         from langchain_core.messages import AIMessage
