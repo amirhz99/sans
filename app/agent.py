@@ -105,6 +105,7 @@ class SansAgent:
         recent_sessions = db.all('SELECT * FROM sessions ORDER BY id DESC LIMIT 8')
         players_count = db.one('SELECT COUNT(*) n FROM players')['n']
         chat_log = db.recent_messages(chat_id, limit=14)
+        defaults = service.session_defaults()
 
         snapshot = {
             'now_tehran': now,
@@ -118,9 +119,9 @@ class SansAgent:
             'settings': {
                 'card': db.setting('card') or 'ثبت نشده',
                 'payment_note': db.setting('payment_note') or '',
-                'default_location': self.bot.content_defaults.get('location', ''),
-                'default_person_fee': self.bot.content_defaults.get('person_fee', 150000),
-                'default_venue_cost': self.bot.content_defaults.get('venue_cost', 2400000),
+                'default_location': defaults['location'],
+                'default_person_fee': defaults['person_fee'],
+                'default_venue_cost': defaults['venue_cost'],
             },
             'open_sessions': [dict(s) for s in open_sessions],
             'recent_sessions': [

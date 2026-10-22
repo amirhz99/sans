@@ -62,6 +62,10 @@ class AIContextBuilder:
             # never send the complete player directory to the model.
             'sessions': self._session_context(conversation.last_entity),
         }
+        if self.service:
+            # SPEC-017: the effective new-session defaults, so the model never
+            # relies on numbers hardcoded in the prompt.
+            context['session_defaults'] = self.service.session_defaults()
         if reply_to:
             sender = reply_to.get('from', {}) if isinstance(reply_to, dict) else {}
             context['reply_to_message'] = {

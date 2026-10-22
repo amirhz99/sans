@@ -22,6 +22,9 @@ GREETING_REPLY = 'سلام! در خدمتم؛ بفرمایید چه کاری ب�
 # SPEC-016: a contact card can only be obtained through a reply-keyboard button.
 CONTACT_BUTTON = '📱 ارسال شمارهٔ من'
 
+# SPEC-017: readable names for the values a new session may inherit.
+DEFAULT_LABELS = {'location': 'محل', 'venue_cost': 'هزینهٔ زمین', 'person_fee': 'سهم هر نفر'}
+
 # SPEC-011: a proposal stays trustworthy for one day.  Staleness is decided by
 # the proposal's own facts (see ``Service.guard``), never by the global revision
 # counter, so approving one card cannot expire its siblings.
@@ -276,6 +279,13 @@ class Bot:
         tail = f'\n\nثبت شود؟ کد: {ident}'
         if any(c['action'] != 'broadcast' for c in commands):
             tail += '\nتمام مبلغ‌ها تومان هستند.'
+        # SPEC-017: a default is never applied silently; name it and ask.
+        used = sorted({key for command in commands
+                       for key in (command['args'].get('defaults_used') or [])})
+        if used:
+            tail += ('\nمقادیر «' + '، '.join(DEFAULT_LABELS.get(key, key) for key in used) +
+                     '» از پیش‌فرض‌های تنظیم‌شده آمدند. اگر درست نیستند این کارت را رد کنید و '
+                     'مقدار دقیق را بنویسید؛ /defaults پیش‌فرض‌های فعلی را نشان می‌دهد.')
         return preview + tail, buttons('yes:' + ident, 'no:' + ident)
 
     @staticmethod
@@ -521,6 +531,11 @@ class Bot:
                     if not admin:
                         raise UserError('نمایش تنظیمات فقط برای ادمین‌های مجاز در گروه مدیریتی است.')
                     reply = self.service.configuration()
+                elif action == 'defaults':
+                    # SPEC-017: read-only, and admin-only like /config.
+                    if not admin:
+                        raise UserError('نمایش پیش‌فرض‌ها فقط برای ادمین‌های مجاز در گروه مدیریتی است.')
+                    reply = self.service.defaults_preview()
                 elif action == 'clarify':
                     reply = text(command.get('question'), 'سؤال', limit=1500)
                 elif action == 'card':
@@ -660,7 +675,8 @@ class Bot:
         name = parts[0].split('@')[0][1:]
         rest = parts[1].strip() if len(parts) > 1 else ''
         simple = {'start': 'help', 'help': 'help', 'card': 'card', 'cancel': 'cancel', 'config': 'config', 'report': 'report',
-                  'players': 'list_players', 'sessions': 'list_sessions', 'pending': 'pending', 'phone': 'phone'}
+                  'players': 'list_players', 'sessions': 'list_sessions', 'pending': 'pending', 'phone': 'phone',
+                  'defaults': 'defaults'}
         if name in simple:
             return {'action': simple[name], 'args': {}}
         if name in ('debt', 'session', 'identify', 'amount', 'confirm', 'deny', 'approve', 'reject'):
@@ -671,6 +687,14 @@ class Bot:
             if not rest:
                 raise UserError('/setcard شماره کارت و نام صاحب حساب')
             return {'action': 'settings', 'args': {'key': 'card', 'value': rest}}
+        if name == 'setdefault' and admin:
+            # SPEC-017: like /setcard, this only builds an approval card.
+            pieces = rest.split(maxsplit=1)
+            if len(pieces) != 2 or not pieces[1].strip():
+                raise UserError('/setdefault location|venue_cost|person_fee مقدار — '
+                                'مثلاً /setdefault person_fee 200000')
+            key, value = pieces
+            return {'action': 'settings', 'args': {'key': 'default_' + key.strip(), 'value': value.strip()}}
         if name == 'expire' and admin:
             # SPEC-015: closing cards is bookkeeping, so it needs no approval
             # card, but it stays inside the admin-group boundary like /setcard.

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from app.ai_context import AIContextBuilder
 from app.agent import AGENT_SYSTEM_PROMPT, SansAgent
-from app.content import SYSTEM_PROMPT
+from app.content import DEFAULTS, SYSTEM_PROMPT
 from app.db import Database
 from app.domain import ConversationState, EntityRef, EntityType, Intent, ResponseLevel
 from app.bot import Bot
@@ -1082,6 +1082,39 @@ class PlayerPhoneContextTests(unittest.TestCase):
             {'target': 'players'}))
         self.assertNotIn('+989121234567', player_tools['query_database'].invoke(
             {'target': 'players'}))
+
+
+class SessionDefaultsContextTests(unittest.TestCase):
+    """SPEC-017: the model receives the effective defaults, not file contents."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp.name) / 'defaults.sqlite3')
+        self.service = Service(self.db)
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def test_context_reports_effective_defaults(self):
+        with self.db.conn:
+            for key, value in (('default_location', 'سالن الغدیر'),
+                               ('default_venue_cost', '3000000'),
+                               ('default_person_fee', '200000')):
+                self.service.apply(self.service.prepare('settings', {'key': key, 'value': value}),
+                                   'test', f'defaults:{key}')
+
+        context = AIContextBuilder(self.db, self.service).build(10, 1, True)
+
+        self.assertEqual(context['session_defaults'],
+                         {'location': 'سالن الغدیر', 'venue_cost': 3000000, 'person_fee': 200000})
+        self.assertNotIn('150000', json.dumps(context, ensure_ascii=False))
+
+    def test_context_falls_back_to_content_defaults(self):
+        context = AIContextBuilder(self.db, self.service).build(10, 1, True)
+
+        self.assertEqual(context['session_defaults']['location'], DEFAULTS['location'])
+        self.assertEqual(context['session_defaults']['person_fee'], DEFAULTS['person_fee'])
 
 
 if __name__ == '__main__':

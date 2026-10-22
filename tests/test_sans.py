@@ -15,6 +15,7 @@ from app.bot import Bot, GREETING_REPLY, RELAY_CONFIRMATION
 from app.ai_context import AIContextBuilder
 from app.clients import AIClient, APIError
 from app.config import Config
+from app.content import DEFAULTS
 from app.db import Database
 from app.domain import ConversationState, EntityRef, Intent, ResponseLevel
 from app.main import ACKNOWLEDGEMENT, flush_outbox, import_players, instance_lock, send_acknowledgement
@@ -1119,8 +1120,11 @@ class OperationalTests(BaseCase):
             self.assertEqual(result['action'], 'card')
             self.assertEqual(post.call_args.args[0], 'https://example.com/v1/chat/completions')
             self.assertEqual(post.call_args.args[2]['Authorization'], 'Bearer fake-key')
-            self.assertIn('۲٬۵۰۰٬۰۰۰', post.call_args.args[1]['messages'][0]['content'])
-            self.assertIn('سالن فوتسال تیموری', post.call_args.args[1]['messages'][0]['content'])
+            # SPEC-017: the legacy prompt no longer hardcodes the money values;
+            # it points at the context that carries the effective defaults.
+            self.assertIn('session_defaults', post.call_args.args[1]['messages'][0]['content'])
+            self.assertNotIn('۲٬۵۰۰٬۰۰۰', post.call_args.args[1]['messages'][0]['content'])
+            self.assertNotIn('سالن فوتسال تیموری', post.call_args.args[1]['messages'][0]['content'])
         for invalid in ('not json', '[]', '{"action":"card","args":[]}'):
             with patch('app.clients.post_json', return_value={'choices': [{'message': {'content': invalid}}]}):
                 with self.assertRaises(APIError):
@@ -2318,6 +2322,136 @@ class PlayerPhoneTests(BaseCase):
         self.send('/players', user=1, chat=-100)
 
         self.assertIn('+989121234567', self.replies(-100))
+
+
+class SessionDefaultsTests(BaseCase):
+    """SPEC-017: session defaults are settings, and a default is always announced."""
+
+    def set_default(self, key, value):
+        self.apply('settings', key=key, value=value)
+
+    def prepared(self, **args):
+        return self.service.prepare('new_session', {'title': 'پنجشنبه ۲۳ مهر',
+                                                    'when_text': 'پنجشنبه ساعت ۲۱', **args})
+
+    def test_new_session_uses_the_stored_defaults(self):
+        self.set_default('default_location', 'سالن الغدیر')
+        self.set_default('default_venue_cost', '3000000')
+        self.set_default('default_person_fee', '200000')
+
+        command = self.prepared()
+
+        self.assertEqual(command['args']['location'], 'سالن الغدیر')
+        self.assertEqual(command['args']['venue_cost'], 3000000)
+        self.assertEqual(command['args']['person_fee'], 200000)
+        self.assertEqual(command['args']['defaults_used'],
+                         ['location', 'person_fee', 'venue_cost'])
+        preview = self.service.preview(command)
+        self.assertIn('سالن الغدیر', preview)
+        self.assertIn('از پیش‌فرض آمد', preview)
+
+    def test_explicit_values_win_over_defaults(self):
+        self.set_default('default_person_fee', '200000')
+
+        command = self.prepared(location='سالن آزادی', venue_cost=1000000, person_fee=250000)
+
+        self.assertEqual((command['args']['location'], command['args']['venue_cost'],
+                          command['args']['person_fee']), ('سالن آزادی', 1000000, 250000))
+        self.assertEqual(command['args']['defaults_used'], [])
+
+    def test_content_defaults_apply_without_settings(self):
+        defaults = self.service.session_defaults()
+
+        self.assertEqual(defaults, {'location': DEFAULTS['location'],
+                                    'venue_cost': DEFAULTS['venue_cost'],
+                                    'person_fee': DEFAULTS['person_fee']})
+        self.assertEqual(self.prepared()['args']['defaults_used'],
+                         ['location', 'person_fee', 'venue_cost'])
+
+    def test_corrupt_default_falls_back(self):
+        self.db.set_setting('default_venue_cost', 'خیلی زیاد')
+        self.db.set_setting('default_person_fee', '0')
+        self.db.set_setting('default_location', '   ')
+
+        defaults = self.service.session_defaults()
+
+        self.assertEqual(defaults['venue_cost'], DEFAULTS['venue_cost'])
+        self.assertEqual(defaults['person_fee'], DEFAULTS['person_fee'])
+        self.assertEqual(defaults['location'], DEFAULTS['location'])
+
+    def test_setdefault_only_builds_a_card(self):
+        self.send('/setdefault person_fee 200000', user=1, chat=-100)
+
+        self.assertEqual(self.db.setting('default_person_fee'), '')
+        rows = self.db.all("SELECT * FROM pending WHERE kind='commands'")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['status'], 'pending')
+        self.assertEqual(json.loads(rows[0]['payload']),
+                         [{'action': 'settings',
+                           'args': {'key': 'default_person_fee', 'value': '200000'}}])
+        reply = self.replies(-100)
+        self.assertIn('سهم هر نفر پیش‌فرض', reply)
+        self.assertIn('200,000 تومان', reply)
+
+    def test_approving_the_card_changes_the_next_session(self):
+        self.send('/setdefault person_fee 200000', user=1, chat=-100)
+        ident = self.proposal()
+
+        self.click('yes:' + ident)
+
+        self.assertEqual(self.db.setting('default_person_fee'), '200000')
+        self.assertEqual(self.prepared()['args']['person_fee'], 200000)
+        self.assertIn('تنظیمات اعمال شد', self.replies(-100))
+
+    def test_setdefault_refuses_invalid_input(self):
+        for body in ('/setdefault foo 1000', '/setdefault venue_cost -5',
+                     '/setdefault person_fee 0', '/setdefault person_fee'):
+            with self.subTest(body=body):
+                self.send(body, user=1, chat=-100)
+
+        self.assertEqual(self.db.all("SELECT * FROM pending WHERE kind='commands'"), [])
+        for key in ('default_location', 'default_venue_cost', 'default_person_fee'):
+            self.assertEqual(self.db.setting(key), '')
+        reply = self.replies(-100)
+        self.assertIn('تنظیم مجاز', reply)
+        self.assertIn('بین 0 و', reply)
+        self.assertIn('بین 1 و', reply)
+
+    def test_card_names_the_defaults_and_asks_to_confirm(self):
+        self.set_default('default_person_fee', '200000')
+        with self.db.conn:
+            reply, markup = self.bot.propose_commands([self.prepared()], 1, -100)
+
+        self.assertIn('سهم هر نفر', reply)
+        self.assertIn('از پیش‌فرض‌های تنظیم‌شده آمدند', reply)
+        self.assertIn('رد کنید', reply)
+        self.assertIn('/defaults', reply)
+        self.assertEqual(markup[0][0]['callback_data'].split(':', 1)[0], 'yes')
+
+    def test_defaults_command_lists_effective_values(self):
+        self.set_default('default_person_fee', '175000')
+
+        self.send('/defaults', user=1, chat=-100)
+
+        reply = self.replies(-100)
+        self.assertIn('175,000 تومان', reply)
+        self.assertIn('زمان سانس هرگز پیش‌فرض نمی‌شود', reply)
+        self.assertIn('/setdefault', reply)
+
+    def test_defaults_command_is_admin_only(self):
+        self.send('/defaults', user=10, chat=10)
+
+        self.assertIn('فقط برای ادمین', self.replies(10))
+        self.assertNotIn('تومان', self.replies(10))
+
+    def test_session_time_is_never_defaulted(self):
+        with self.assertRaises(UserError):
+            self.service.prepare('new_session', {'title': 'بدون زمان'})
+        with self.assertRaises(UserError):
+            self.service.prepare('new_session', {'title': 'زمان مبهم', 'when_text': 'ساعت ۹'})
+
+        self.assertEqual(self.db.all("SELECT * FROM pending WHERE kind='commands'"), [])
+        self.assertNotIn('session_time', self.service.session_defaults())
 
 
 if __name__ == '__main__':

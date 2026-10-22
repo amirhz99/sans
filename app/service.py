@@ -82,6 +82,11 @@ def setting_value_is_explicit(message, key, value):
         else:
             markers = ('خاموش', 'غیرفعال', 'غیر فعال', 'لازم نیست', 'بدون تایید', 'بدون تأیید')
         return any(normalize(marker) in body for marker in markers)
+    if key in ('default_venue_cost', 'default_person_fee'):
+        # SPEC-017: a numeric default must appear as a number in this message;
+        # «آره همون قبلی» is not an explicit new value.
+        digits = ''.join(char for char in str(value) if char.isdigit())
+        return bool(digits) and digits in ''.join(char for char in body if char.isdigit())
     if not isinstance(value, str) or not value.strip():
         return False
     candidate = normalize(value)
@@ -236,7 +241,13 @@ MAX_RECIPIENTS = 200
 BROADCAST_LIMIT = 3500
 
 SETTING_LABELS = {'card': 'شماره کارت', 'payment_note': 'پیام راهنمای پرداخت',
-                  'approval_required': 'بررسی رسید توسط ادمین'}
+                  'approval_required': 'بررسی رسید توسط ادمین',
+                  # SPEC-017: defaults for a new session, still settings rows.
+                  'default_location': 'محل پیش‌فرض',
+                  'default_venue_cost': 'هزینهٔ زمین پیش‌فرض',
+                  'default_person_fee': 'سهم هر نفر پیش‌فرض'}
+
+DEFAULT_SETTINGS = ('default_location', 'default_venue_cost', 'default_person_fee')
 
 
 class Service:
@@ -248,8 +259,50 @@ class Service:
             raise UserError('کلید و مقدار تنظیم را صریحاً در همین پیام بنویسید.')
         key = args.get('key')
         value = args.get('value')
-        if key not in ('card', 'payment_note', 'approval_required') or not setting_value_is_explicit(message, key, value):
+        if key not in SETTING_LABELS:
+            raise UserError('تنظیم مجاز: ' + '، '.join(SETTING_LABELS))
+        if not setting_value_is_explicit(message, key, value):
             raise UserError('مقدار تنظیم باید صریحاً در همین پیام نوشته شود؛ پاسخ‌هایی مثل «آره انجامش بده» کافی نیستند.')
+
+    def session_defaults(self):
+        """Return the effective defaults for a new session (SPEC-017).
+
+        A settings row wins over ``content/bot-content.json``.  A stored value
+        that cannot be parsed falls back instead of breaking the approval card;
+        the settings write path already validates, so this only guards against a
+        hand-edited database.
+        """
+        location = (self.db.setting('default_location') or '').strip() or DEFAULTS['location']
+        venue = self._numeric_default('default_venue_cost', DEFAULTS['venue_cost'], 0)
+        fee = self._numeric_default('default_person_fee', DEFAULTS['person_fee'], 1)
+        return {'location': location, 'venue_cost': venue, 'person_fee': fee}
+
+    def _numeric_default(self, key, fallback, minimum):
+        stored = (self.db.setting(key) or '').strip()
+        if not stored:
+            return fallback
+        try:
+            return integer(stored, SETTING_LABELS[key], minimum)
+        except UserError:
+            return fallback
+
+    def defaults_preview(self):
+        """Describe the effective new-session defaults for an admin."""
+        defaults = self.session_defaults()
+        stored = {key: self.db.setting(key) for key in DEFAULT_SETTINGS}
+        source = ('تنظیم‌شده با کارت تأیید' if any(stored.values())
+                  else 'مقدار فایل content/bot-content.json (هنوز تنظیمی ثبت نشده)')
+        return '\n'.join([
+            'پیش‌فرض‌های سانس جدید:',
+            f"• محل: {defaults['location']}",
+            f"• هزینهٔ زمین: {defaults['venue_cost']:,} تومان",
+            f"• سهم هر نفر: {defaults['person_fee']:,} تومان",
+            f'منبع: {source}',
+            '',
+            'زمان سانس هرگز پیش‌فرض نمی‌شود و همیشه باید دقیق اعلام شود؛ '
+            'چون ساعت اشتباه یک بدهی اشتباه می‌سازد.',
+            'برای تغییر: /setdefault person_fee 200000 — تغییر فقط با دکمهٔ تأیید اعمال می‌شود.',
+        ])
 
     def player(self, ref):
         if isinstance(ref, bool) or not isinstance(ref, (str, int)):
@@ -700,16 +753,19 @@ class Service:
         card = self.db.setting('card') or 'ثبت نشده'
         payment_note = self.db.setting('payment_note') or 'ثبت نشده'
         approval = 'فعال؛ رسید باید تأیید شود' if self.db.setting('approval_required', 'true') != 'false' else 'خاموش؛ رسید خودکار ثبت می‌شود'
+        # SPEC-017: report the effective defaults, not the content file.
+        defaults = self.session_defaults()
         lines = [
             'تنظیمات مرکزی ربات',
             f'فایل متن و prompt: {CONTENT_PATH}',
             '',
-            'پیش‌فرض سانس جدید (قابل تغییر برای هر سانس):',
-            f"• محل: {DEFAULTS['location']}",
-            f"• هزینهٔ زمین: {DEFAULTS['venue_cost']:,} تومان",
-            f"• سهم هر نفر: {DEFAULTS['person_fee']:,} تومان",
+            'پیش‌فرض سانس جدید (قابل تغییر برای هر سانس؛ /defaults):',
+            f"• محل: {defaults['location']}",
+            f"• هزینهٔ زمین: {defaults['venue_cost']:,} تومان",
+            f"• سهم هر نفر: {defaults['person_fee']:,} تومان",
             f"• فرمول بدهی: {DEFAULTS['formula']}",
             '• هزینهٔ زمین در بدهی بازیکن محاسبه نمی‌شود.',
+            '• زمان سانس پیش‌فرض ندارد و همیشه باید دقیق اعلام شود.',
             '',
             'پرداخت:',
             f'• شماره کارت: {card}',
@@ -764,18 +820,28 @@ class Service:
                 a['title'] = text(args.get('title'), 'عنوان سانس')
                 if self.db.one('SELECT id FROM sessions WHERE title=?', (a['title'],)):
                     raise UserError('عنوان سانس تکراری است؛ یک عنوان متمایز انتخاب کنید.')
-                a.update({'when_text': text(args.get('when_text'), 'تاریخ و ساعت سانس'),
-                          'location': DEFAULTS['location'], 'note': '',
-                          'venue_cost': DEFAULTS['venue_cost'], 'person_fee': DEFAULTS['person_fee']})
+                # SPEC-017: fill only what the admin did not state, and remember
+                # which keys those were so the card can ask for confirmation.
+                defaults = self.session_defaults()
+                a.update({'when_text': text(args.get('when_text'), 'تاریخ و ساعت سانس'), 'note': ''})
+                a['defaults_used'] = []
+                for key in ('location', 'venue_cost', 'person_fee'):
+                    raw = args.get(key)
+                    if raw is None or (isinstance(raw, str) and not raw.strip()):
+                        a[key] = defaults[key]
+                        a['defaults_used'].append(key)
+                a['defaults_used'].sort()
             else:
                 a['session'] = self.session(args.get('session'), draft=True)['id']
             for key in ('when_text', 'location', 'note'):
-                if key in args:
+                if key in args and args[key] is not None:
+                    if key != 'note' and not str(args[key]).strip():
+                        continue
                     a[key] = text(args[key], key, False)
             if action == 'new_session' or 'when_text' in a:
                 a['session_at'] = parse_session_datetime(a['when_text'])
             for key in ('venue_cost', 'person_fee'):
-                if key in args and args[key] is not None:
+                if key in args and args[key] is not None and str(args[key]).strip():
                     a[key] = integer(args[key], key, 1 if key == 'person_fee' else 0)
         elif action in ('attendance', 'finalize'):
             s = self.session(args.get('session'), draft=True)
@@ -853,13 +919,20 @@ class Service:
                 raise UserError('هیچ بازیکن متصلی برای دریافت پیام وجود ندارد؛ ابتدا بازیکن‌ها با /identify یا /bind به بله متصل شوند.')
         elif action == 'settings':
             key = args.get('key')
-            if key not in ('card', 'payment_note', 'approval_required'):
-                raise UserError('تنظیم مجاز: card، payment_note، approval_required')
+            if key not in SETTING_LABELS:
+                raise UserError('تنظیم مجاز: ' + '، '.join(SETTING_LABELS))
             value = args.get('value')
             if key == 'approval_required':
                 if not isinstance(value, bool):
                     raise UserError('وضعیت تأیید باید true یا false باشد.')
                 value = 'true' if value else 'false'
+            elif key == 'default_location':
+                value = text(value, 'محل پیش‌فرض', limit=200)
+            elif key in ('default_venue_cost', 'default_person_fee'):
+                # Stored as a plain integer string, the same shape as any other
+                # setting row (SPEC-017).
+                value = str(integer(value, SETTING_LABELS[key],
+                                    1 if key == 'default_person_fee' else 0))
             else:
                 value = text(value, 'مقدار', False)
             a = {'key': key, 'value': value}
@@ -911,6 +984,11 @@ class Service:
         if key == 'approval_required':
             return ('فعال؛ هر رسید توسط ادمین بررسی می‌شود' if value == 'true'
                     else 'غیرفعال؛ رسیدها خودکار تأیید می‌شوند')
+        if key in ('default_venue_cost', 'default_person_fee') and value:
+            try:
+                return f'{int(value):,} تومان'
+            except (TypeError, ValueError):
+                return str(value)
         return value or '—'
 
     def settings_preview(self, a):
@@ -969,6 +1047,8 @@ class Service:
                   'key': 'تنظیم', 'value': 'مقدار'}
         lines = [labels[action]]
         for key, value in a.items():
+            if key == 'defaults_used':
+                continue
             if key == 'player':
                 lines.append('بازیکن: ' + self.player(value)['name'])
             elif key == 'session':
@@ -977,6 +1057,10 @@ class Service:
                 lines.append('زمان تهران: ' + self.session_at_display(value))
             else:
                 lines.append(f'{fields.get(key, key)}: {value}')
+        used = a.get('defaults_used') or []
+        if used:
+            # SPEC-017: never hide a value that came from a default.
+            lines.append('از پیش‌فرض آمد: ' + '، '.join(fields.get(key, key) for key in used))
         if action == 'finalize':
             s = self.session(a['session'])
             total = 0
