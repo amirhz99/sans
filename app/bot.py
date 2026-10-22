@@ -23,6 +23,10 @@ GREETING_REPLY = 'سلام! در خدمتم؛ بفرمایید چه کاری ب�
 # counter, so approving one card cannot expire its siblings.
 PROPOSAL_TTL = 86400
 
+# SPEC-015: an admin may close cards younger than the TTL, but the accepted age
+# stays inside one year so a typo cannot look like an unbounded request.
+MAX_EXPIRY_HOURS = 8760
+
 # SPEC-014: a private reply to a proactive notice is handed back to the admins.
 RELAY_CONFIRMATION = 'پیام شما برای ادمین‌ها ارسال شد ✅'
 
@@ -543,12 +547,23 @@ class Bot:
                     reply = '\n'.join(f"#{s['id']} {s['title']} — {self.service.session_time_display(s)} — {'نهایی' if s['finalized'] else 'باز'}" for s in self.db.all('SELECT * FROM sessions ORDER BY id DESC')) or 'سانسی ثبت نشده.'
                 elif action == 'report':
                     reply = self.service.report()
+                elif action == 'expire':
+                    # SPEC-015: the admin asked in plain language or with
+                    # /expire; close the cards instead of answering that the
+                    # tool is missing. The slash-command path already required
+                    # admin, and this guard also covers the agent tool.
+                    if not admin:
+                        raise UserError('بستن کارت‌ها فقط برای ادمین‌های مجاز در گروه مدیریتی است.')
+                    hours = self.expiry_hours(args.get('older_than_hours'))
+                    reply = self.expiry_report(hours, self.expire_proposals(hours, user_id))
                 elif action == 'pending':
                     closed = self.expire_stale_proposals()
                     rows = self.db.all("SELECT * FROM pending WHERE status='pending' ORDER BY created_at DESC LIMIT 30")
                     reply = '\n\n'.join(self.pending_summary(r) for r in rows) or 'درخواست منتظری نیست.'
                     if closed:
                         reply += f'\n\n{closed} کارت قدیمی‌تر از ۲۴ ساعت بسته شد.'
+                    if rows:
+                        reply += '\n\nبرای بستن کارت‌ها /expire [ساعت] را بفرستید؛ /expire 0 همه را می‌بندد.'
                 elif action in ('confirm', 'deny'):
                     reply = self.confirm(args.get('id'), action == 'confirm', user_id)
                 elif action in ('approve', 'reject'):
@@ -615,6 +630,10 @@ class Bot:
             if not rest:
                 raise UserError('/setcard شماره کارت و نام صاحب حساب')
             return {'action': 'settings', 'args': {'key': 'card', 'value': rest}}
+        if name == 'expire' and admin:
+            # SPEC-015: closing cards is bookkeeping, so it needs no approval
+            # card, but it stays inside the admin-group boundary like /setcard.
+            return {'action': 'expire', 'args': {'older_than_hours': rest} if rest else {}}
         if name == 'link' and admin:
             pieces = rest.split(maxsplit=1)
             if len(pieces) != 2:
@@ -910,21 +929,22 @@ class Bot:
         """
         return self.sweep_proposals(now)
 
-    def proposal_staleness(self, now=None):
-        """Return the cards the sweep must close (SPEC-013)."""
-        cutoff = int(time.time() if now is None else now) - PROPOSAL_TTL
+    def proposal_staleness(self, now=None, cutoff=None):
+        """Return the cards the sweep must close (SPEC-013, SPEC-015)."""
+        if cutoff is None:
+            cutoff = int(time.time() if now is None else now) - PROPOSAL_TTL
         rows = self.db.all("SELECT id, chat_id, message_id FROM pending "
                            "WHERE status='pending' AND kind='commands' AND created_at < ? "
                            "ORDER BY created_at", (cutoff,))
         return [dict(row) for row in rows]
 
-    def sweep_proposals(self, now=None):
+    def sweep_proposals(self, now=None, cutoff=None):
         """Expire every stale card and remove the buttons of delivered ones.
 
         Bookkeeping only: no ledger, player, session, or receipt row is touched.
         The caller owns the transaction, so this can run inside ``process``.
         """
-        stale = self.proposal_staleness(now)
+        stale = self.proposal_staleness(now, cutoff)
         for row in stale:
             self.expire_proposal(row['id'])
             message_id = row.get('message_id')
@@ -936,6 +956,66 @@ class Bot:
         if stale:
             self.db.set_setting('last_sweep', int(time.time() if now is None else now))
         return len(stale)
+
+    def expiry_hours(self, value=None):
+        """Validate an admin supplied card age in hours (SPEC-015).
+
+        ``None`` or an empty value means the 24 hour TTL, so ``/expire`` alone
+        behaves exactly like the background sweep.  ``0`` is the explicit
+        "every open card" form.
+        """
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return PROPOSAL_TTL // 3600
+        if isinstance(value, bool):
+            raise UserError('بازهٔ زمانی باید عدد صحیح ساعت باشد؛ مثلاً /expire 0')
+        normalized = normalize(value).strip()
+        if not re.fullmatch(r'\d+', normalized):
+            raise UserError('بازهٔ زمانی باید عدد صحیح ساعت باشد؛ مثلاً /expire 12')
+        hours = int(normalized)
+        if hours > MAX_EXPIRY_HOURS:
+            raise UserError(f'بازهٔ زمانی حداکثر {MAX_EXPIRY_HOURS:,} ساعت (یک سال) است.')
+        return hours
+
+    def expiry_cutoff(self, hours, now=None):
+        """Turn an accepted age into an epoch cutoff (SPEC-015).
+
+        ``0`` means "every open card", so the cutoff sits one second ahead: a
+        card created in the same second as the request is not literally older
+        than zero hours, yet the admin clearly asked for it to be closed.
+        """
+        now = int(time.time() if now is None else now)
+        return now + 1 if hours == 0 else now - hours * 3600
+
+    def expire_proposals(self, older_than_hours=None, actor=None):
+        """Close open ``commands`` cards on an explicit admin request (SPEC-015).
+
+        Bookkeeping only: no ledger, player, session, attendance, or receipt row
+        is touched.  Identity, claim, and binding cards are a human decision and
+        are deliberately left ``pending``.
+        """
+        hours = self.expiry_hours(older_than_hours)
+        closed = self.sweep_proposals(cutoff=self.expiry_cutoff(hours))
+        if actor is not None:
+            self.db.audit(actor, 'expire_proposals', {'older_than_hours': hours, 'closed': closed})
+        return closed
+
+    def expiry_report(self, hours, closed):
+        """Describe what a manual expiry changed and what stayed open (SPEC-015)."""
+        cutoff = self.expiry_cutoff(hours)
+        remaining = self.db.one(
+            "SELECT COUNT(*) n FROM pending WHERE status='pending' AND kind='commands' "
+            "AND created_at >= ?", (cutoff,))['n']
+        identity = self.db.one(
+            "SELECT COUNT(*) n FROM pending WHERE status='pending' "
+            "AND kind IN ('identity','claim','binding')")['n']
+        lines = [f'{closed} کارت پیشنهاد بسته شد؛ هیچ حساب، سانس یا رسیدی تغییر نکرد.' if closed
+                 else 'کارت پیشنهادی برای بستن نبود؛ هیچ چیزی تغییر نکرد.']
+        if remaining:
+            lines.append(f'{remaining} کارت تازه‌تر از {hours} ساعت باز ماند؛ '
+                         'برای بستن همه /expire 0 را بفرستید.')
+        if identity:
+            lines.append(f'{identity} درخواست هویت/اتصال دست نخورد و برای بررسی ادمین باقی ماند.')
+        return '\n'.join(lines)
 
     def assert_proposal_current(self, row, payload):
         """Fail closed when a card is too old or its own facts changed.

@@ -36,6 +36,7 @@ AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمن�
      * فهرست کامل بازیکنان از قبل در بافت نمی‌آید؛ هر وقت به نام یا شناسهٔ بازیکنان نیاز داشتی، `query_database` با target='players' را صدا بزن.
      * تغییرنام (`rename_player`) با درخواست صریح ادمین مستقیم انجام می‌شود؛ ادغام (`merge_player`) و حذف (`delete_player`) فقط با شناسه یا نام دقیق و همیشه به‌صورت کارت تأیید.
      * برای یافتن نام‌های تکراری از `query_database` با target='duplicate_players' استفاده کن.
+     * بستن کارت‌های تأیید باز (`expire_proposals`): اگر ادمین گفت «کارت‌های منتظر را ببند»، «پیشنهادها را کنسل کن» یا «کارت‌های منقضی را ببند»، این عملیات را صدا بزن. `older_than_hours` را خالی بگذار یعنی فقط کارت‌های قدیمی‌تر از ۲۴ ساعت، و برای «همه» مقدار ۰ بده. این کار فقط کارت را می‌بندد و هیچ مالی اعمال نمی‌شود؛ همین را شفاف بگو. کارت هویت/اتصال را دست نزن.
    - تغییرات مالی در دفترکل (`propose_financial_change`):
      * نهایی‌سازی بدهی سانس (`finalize`)، اصلاح دستی بدهی/طلب بازیکن (`adjustment`)، تسویه حساب (`settle`) و اعلام بدهی توسط بازیکن (`declare_debt`) حساس هستند. برای این‌ها از `propose_financial_change` استفاده کن تا کارت تأیید با دکمه شیشه‌ای ساخته شود.
      * اگر درخواست تسویه چند نفره است («بدهی همه را صاف کن»، «حساب این سه نفر را تسویه کن»)، همهٔ نام‌ها را در آرگومان `players` و جداشده با کاما بده تا **یک کارت واحد** ساخته شود. هرگز برای هر نفر کارت جدا نساز و برای هر نفر جداگانه ابزار را صدا نزن.
@@ -244,6 +245,9 @@ class SansAgent:
             - 'merge_player': (admin) data_json='{"source": "#4", "target": "#15"}' — moves history and builds an approval card.
             - 'delete_player': (admin) data_json='{"player": "#4"}' — only for a player with no history; builds an approval card.
             - 'duplicates': (admin) list suspected duplicate or partial names.
+            - 'expire_proposals': (admin) close open approval cards; data_json='{"older_than_hours": 0}'
+              where 0 closes every open card and an omitted value means the 24 hour TTL.
+              This only removes the cards; nothing financial is applied.
             - 'update_settings': (admin) propose setting changes with approval buttons; data_json='{"card": "...", "payment_note": "...", "approval_required": true}'
             """
             try:
@@ -439,6 +443,17 @@ class SansAgent:
 
                 if operation == 'duplicates':
                     return service.duplicates_report()
+
+                if operation == 'expire_proposals':
+                    # SPEC-015: closing cards is bookkeeping, not a financial
+                    # change, so it needs no approval card. ``older_than_hours``
+                    # defaults to the 24 hour TTL; 0 closes every open card.
+                    unknown = set(data) - {'older_than_hours', 'hours'}
+                    if unknown:
+                        return 'کلید ناشناخته در بستن کارت‌ها: ' + '، '.join(sorted(unknown))
+                    hours = bot.expiry_hours(data.get('older_than_hours', data.get('hours')))
+                    closed = bot.expire_proposals(hours, user_id)
+                    return bot.expiry_report(hours, closed)
 
                 return f'عملیات {operation} شناخته نشد.'
             except UserError as exc:

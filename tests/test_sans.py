@@ -1733,6 +1733,171 @@ class ProposalStalenessTests(BaseCase):
         self.click('yes:' + self.card_id(markup))
         self.assertEqual(self.service.balance(1), 0)
         self.assertEqual(self.status(self.card_id(markup)), 'approved')
+class ProposalExpiryCommandTests(BaseCase):
+    """SPEC-015: an admin can close open cards on request."""
+
+    def card(self, player=1):
+        prepared = [self.service.prepare('settle', {'player': player})]
+        with self.db.conn:
+            preview, markup = self.bot.propose_commands(prepared, 1, -100)
+            # Mirror the real delivery path so ``outbox.ref`` is set.
+            self.db.say(-100, preview, markup, self.bot.card_ref(markup))
+        return markup[0][0]['callback_data'].split(':', 1)[1]
+
+    def debt(self, player, amount):
+        self.apply('adjustment', player=player, amount=amount, note='بدهی قبلی')
+
+    def age(self, ident, seconds):
+        with self.db.conn:
+            self.db.execute('UPDATE pending SET created_at=? WHERE id=?',
+                            (int(time.time()) - seconds, ident))
+
+    def status(self, ident):
+        return self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status']
+
+    def edits(self):
+        return [json.loads(row['payload'])
+                for row in self.db.all("SELECT payload FROM outbox WHERE method='editMessageReplyMarkup'")]
+
+    def callback_texts(self):
+        return [json.loads(row['payload']).get('text', '')
+                for row in self.db.all("SELECT payload FROM outbox WHERE method='answerCallbackQuery' ORDER BY id")]
+
+    def identity_card(self, ident='idcard'):
+        with self.db.conn:
+            self.db.execute("INSERT INTO pending(id,kind,payload,requester,chat_id,revision,status,created_at) "
+                            "VALUES (?,?,?,?,?,?,?,?)",
+                            (ident, 'identity', json.dumps({'name': 'کاربر', 'user_id': 10}), 10, 10, 0,
+                             'pending', int(time.time())))
+    def test_expire_zero_closes_every_open_card(self):
+        self.seed()
+        self.debt(1, 200000)
+        self.debt(2, 300000)
+        first, second = self.card(1), self.card(2)
+
+        self.send('/expire 0', user=1, chat=-100)
+
+        self.assertEqual([self.status(first), self.status(second)], ['expired', 'expired'])
+        # Bookkeeping only: the balances and the ledger are untouched.
+        self.assertEqual([self.service.balance(p) for p in (1, 2)], [200000, 300000])
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM ledger')['n'], 2)
+        reply = self.replies(-100)
+        self.assertIn('2 کارت پیشنهاد بسته شد', reply)
+        self.assertIn('هیچ حساب، سانس یا رسیدی تغییر نکرد', reply)
+
+    def test_expire_defaults_to_the_ttl(self):
+        self.seed()
+        self.debt(1, 200000)
+        self.debt(2, 300000)
+        old, fresh = self.card(1), self.card(2)
+        self.age(old, 86401)
+
+        self.send('/expire', user=1, chat=-100)
+
+        self.assertEqual(self.status(old), 'expired')
+        self.assertEqual(self.status(fresh), 'pending')
+        reply = self.replies(-100)
+        self.assertIn('1 کارت پیشنهاد بسته شد', reply)
+        self.assertIn('1 کارت تازه‌تر از 24 ساعت باز ماند', reply)
+
+    def test_expire_accepts_a_custom_threshold(self):
+        self.seed()
+        self.debt(1, 200000)
+        self.debt(2, 300000)
+        aged, fresh = self.card(1), self.card(2)
+        self.age(aged, 13 * 3600)
+        self.age(fresh, 11 * 3600)
+
+        # Persian digits are accepted like every other numeric argument.
+        self.send('/expire ۱۲', user=1, chat=-100)
+
+        self.assertEqual(self.status(aged), 'expired')
+        self.assertEqual(self.status(fresh), 'pending')
+
+    def test_expire_keeps_identity_cards_for_review(self):
+        self.seed()
+        self.debt(1, 200000)
+        command_card = self.card(1)
+        self.identity_card()
+
+        self.send('/expire 0', user=1, chat=-100)
+
+        self.assertEqual(self.status(command_card), 'expired')
+        self.assertEqual(self.status('idcard'), 'pending')
+        self.assertIn('1 درخواست هویت/اتصال دست نخورد', self.replies(-100))
+
+    def test_closed_card_cannot_be_approved_afterwards(self):
+        self.seed()
+        self.debt(1, 200000)
+        ident = self.card(1)
+        self.send('/expire 0', user=1, chat=-100)
+
+        self.click('yes:' + ident)
+
+        self.assertEqual(self.service.balance(1), 200000)
+        self.assertEqual(self.status(ident), 'expired')
+        self.assertIn('موجود نیست یا قبلاً', self.callback_texts()[-1])
+
+    def test_invalid_threshold_closes_nothing(self):
+        self.seed()
+        self.debt(1, 200000)
+        ident = self.card(1)
+
+        for value in ('-1', 'abc', '99999'):
+            self.send(f'/expire {value}', user=1, chat=-100)
+            self.assertEqual(self.status(ident), 'pending', value)
+
+        reply = self.replies(-100)
+        self.assertIn('عدد صحیح ساعت', reply)
+        self.assertIn('حداکثر 8,760 ساعت', reply)
+
+    def test_expire_is_admin_only(self):
+        self.seed()
+        self.debt(1, 200000)
+        ident = self.card(1)
+
+        # A private chat is outside the admin boundary: the command degrades to
+        # the ordinary help reply and no card is closed.
+        self.send('/expire 0', user=10, chat=10)
+        self.assertEqual(self.status(ident), 'pending')
+        self.assertNotIn('بسته شد', self.replies(10))
+
+        # The legacy JSON intent route cannot produce this action either.
+        self.ai.answer = {'action': 'expire', 'args': {'older_than_hours': 0}}
+        self.send('کارت‌های منتظر را ببند', user=10, chat=10)
+        self.assertEqual(self.status(ident), 'pending')
+
+    def test_expire_removes_buttons_only_when_the_message_is_known(self):
+        self.seed()
+        self.debt(1, 200000)
+        self.debt(2, 300000)
+        known, unknown = self.card(1), self.card(2)
+        with self.db.conn:
+            self.db.execute('UPDATE pending SET message_id=? WHERE id=?', (77, known))
+
+        self.send('/expire 0', user=1, chat=-100)
+
+        self.assertEqual([self.status(known), self.status(unknown)], ['expired', 'expired'])
+        self.assertEqual(self.edits(), [{'chat_id': -100, 'message_id': 77,
+                                         'reply_markup': {'inline_keyboard': []}}])
+
+    def test_expire_is_audited(self):
+        self.seed()
+        self.debt(1, 200000)
+        self.card(1)
+
+        self.send('/expire 0', user=1, chat=-100)
+
+        row = self.db.one("SELECT * FROM audit_logs WHERE action='expire_proposals' "
+                          'ORDER BY id DESC LIMIT 1')
+        self.assertIsNotNone(row)
+        self.assertEqual(row['actor'], '1')
+        self.assertEqual(json.loads(row['details']), {'older_than_hours': 0, 'closed': 1})
+
+
+
+
+
 class ProposalSweepTests(BaseCase):
     """SPEC-013: expired cards are closed without waiting for a click."""
 

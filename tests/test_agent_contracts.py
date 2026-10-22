@@ -963,5 +963,81 @@ class BatchFinancialToolTests(unittest.TestCase):
         self.assertEqual(self.cards(), [])
 
 
+class ExpireProposalsToolTests(unittest.TestCase):
+    """SPEC-015: the assistant closes cards instead of saying it lacks a tool."""
+
+    def setUp(self):
+        from app.config import Config
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / 'expire.sqlite3'
+        self.db = Database(self.path)
+        self.service = Service(self.db)
+        config = Config('t', -100, frozenset({1}), 'https://example.invalid/v1', 'k', 'm', self.path)
+        self.bot = Bot(self.db, config, SimpleNamespace(use_langgraph=True))
+        with self.db.conn:
+            for source, action, args in (
+                ('expire:1', 'new_player', {'name': 'علی رضایی'}),
+                ('expire:2', 'adjustment', {'player': 1, 'amount': 200000, 'note': 'بدهی قبلی'}),
+                ('expire:3', 'new_session', {'title': 'سانس', 'when_text': 'فردا ساعت ۲۱'}),
+            ):
+                self.service.apply(self.service.prepare(action, args), 1, source)
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def tools(self, admin=True, user=1):
+        return {tool.name: tool for tool in self.bot.agent._make_tools(-100, user, admin, None, {})}
+
+    def card(self):
+        with self.db.conn:
+            _, markup = self.bot.propose_commands(
+                [self.service.prepare('settle', {'player': 1})], 1, -100)
+        return markup[0][0]['callback_data'].split(':', 1)[1]
+
+    def status(self, ident):
+        return self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status']
+
+    def test_admin_closes_cards_through_the_tool(self):
+        ident = self.card()
+
+        reply = self.tools()['manage_records'].invoke(
+            {'operation': 'expire_proposals', 'data_json': json.dumps({'older_than_hours': 0})})
+
+        self.assertIn('1 کارت پیشنهاد بسته شد', reply)
+        self.assertIn('هیچ حساب، سانس یا رسیدی تغییر نکرد', reply)
+        self.assertEqual(self.status(ident), 'expired')
+        self.assertEqual(self.service.balance(1), 200000)
+
+    def test_tool_defaults_to_the_ttl(self):
+        ident = self.card()
+
+        reply = self.tools()['manage_records'].invoke(
+            {'operation': 'expire_proposals', 'data_json': '{}'})
+
+        self.assertIn('کارت پیشنهادی برای بستن نبود', reply)
+        self.assertEqual(self.status(ident), 'pending')
+
+    def test_non_admin_cannot_close_cards(self):
+        ident = self.card()
+
+        reply = self.tools(admin=False, user=10)['manage_records'].invoke(
+            {'operation': 'expire_proposals', 'data_json': json.dumps({'older_than_hours': 0})})
+
+        self.assertIn('فقط برای ادمین', reply)
+        self.assertEqual(self.status(ident), 'pending')
+
+    def test_unknown_keys_and_bad_hours_are_refused(self):
+        ident = self.card()
+        manage = self.tools()['manage_records']
+
+        self.assertIn('کلید ناشناخته', manage.invoke(
+            {'operation': 'expire_proposals', 'data_json': json.dumps({'everything': True})}))
+        self.assertIn('عدد صحیح ساعت', manage.invoke(
+            {'operation': 'expire_proposals', 'data_json': json.dumps({'older_than_hours': 'soon'})}))
+        self.assertEqual(self.status(ident), 'pending')
+
+
 if __name__ == '__main__':
     unittest.main()
