@@ -33,6 +33,11 @@ class Database:
         outbox_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(outbox)')}
         if 'ref' not in outbox_columns:
             self.conn.execute('ALTER TABLE outbox ADD COLUMN ref TEXT')
+        # SPEC-016: keep the number a player shares with the contact button on
+        # the player row, not only in the private-chat address book.
+        player_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(players)')}
+        if 'phone' not in player_columns:
+            self.conn.execute("ALTER TABLE players ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
         # Drop legacy trigger if present so incomplete/historical sessions work freely.
         self.conn.execute('DROP TRIGGER IF EXISTS sessions_require_session_at')
         self.conn.commit()
@@ -70,13 +75,17 @@ class Database:
         self.execute('INSERT INTO outbox(method,payload,ref) VALUES (?,?,?)',
                      (method, dumps(payload), ref))
 
-    def say(self, chat_id, text, buttons=None, ref=None):
+    def say(self, chat_id, text, buttons=None, ref=None, keyboard=None):
         # Bale's text limit is 4096. Keep chunks small; markup belongs on the last chunk.
         chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)] or ['—']
         for index, chunk in enumerate(chunks):
             last = index == len(chunks) - 1
             payload = {'chat_id': chat_id, 'text': chunk}
-            if buttons and last:
+            if keyboard and last:
+                # SPEC-016: a reply keyboard (request_contact / remove_keyboard)
+                # is sent verbatim; only an inline keyboard needs wrapping.
+                payload['reply_markup'] = keyboard
+            elif buttons and last:
                 payload['reply_markup'] = {'inline_keyboard': buttons}
             # SPEC-013: only the chunk that carries the keyboard identifies the card.
             self.queue('sendMessage', payload, ref if last else None)

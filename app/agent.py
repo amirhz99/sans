@@ -49,6 +49,8 @@ AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمن�
      * این ابزار فقط کارت تأیید می‌سازد؛ ارسال واقعی بعد از تأیید ادمین انجام می‌شود. پیام را خودت دوباره نفرست و برای هر نفر جداگانه صدا نزن. بازیکنان بدون حساب متصل پیام نمی‌گیرند؛ همین را شفاف بگو.
    - پرسش از ادمین‌ها (`ask_admins`):
      * اگر بازیکنی در پی‌وی ادعا یا سوالی مطرح کرد که به نظر ادمین نیاز دارد یا اطلاعات سانس/کارت هنوز مشخص نیست، با `ask_admins` در گروه ادمین بپرس.
+   - شمارهٔ تماس بازیکن:
+     * شماره فقط با دکمهٔ «ارسال شمارهٔ من» ثبت می‌شود. هرگز شماره‌ای را از متن پیام حدس نزن، از کاربر نخواه شماره را تایپ کند، و شمارهٔ یک بازیکن را برای کاربر دیگری بازگو نکن. اگر کسی شماره می‌خواهد، به /phone در پی‌وی راهنمایی کن.
 
 ۳. لحن و سبک پاسخ:
    - طبیعی، محترمانه، خودمانی و مختصر صحبت کن.
@@ -111,7 +113,7 @@ class SansAgent:
                 'chat_id': chat_id,
                 'role': 'admin' if admin else 'player',
                 'sender_name': (sender or {}).get('first_name', ''),
-                'linked_player': dict(linked) if linked else None,
+                'linked_player': ({'id': linked['id'], 'name': linked['name']} if linked else None),
             },
             'settings': {
                 'card': db.setting('card') or 'ثبت نشده',
@@ -163,7 +165,8 @@ class SansAgent:
                             bal = service.balance(p['id'])
                             lines.append(
                                 f"#{p['id']} {p['name']} | مانده: {bal:,} تومان | "
-                                f"متصل: {'بله' if p['bale_id'] else 'خیر'} | یادداشت: {p['note'] or '-'}"
+                                f"متصل: {'بله' if p['bale_id'] else 'خیر'} | "
+                                f"شماره: {p['phone'] or '-'} | یادداشت: {p['note'] or '-'}"
                             )
                         else:
                             lines.append(f"#{p['id']} {p['name']}")

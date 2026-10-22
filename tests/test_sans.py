@@ -20,7 +20,7 @@ from app.domain import ConversationState, EntityRef, Intent, ResponseLevel
 from app.main import ACKNOWLEDGEMENT, flush_outbox, import_players, instance_lock, send_acknowledgement
 from app.presentation import SessionView
 from app.prompt_loader import PromptLoader
-from app.service import Service, UserError, integer, normalize, parse_session_datetime
+from app.service import Service, UserError, integer, normalize, normalize_phone, parse_session_datetime
 
 
 class FakeAI:
@@ -2179,6 +2179,145 @@ class OutreachTests(BaseCase):
         self.assertTrue(self.ai.calls)
         self.assertNotIn('یک سوال دارم', self.replies(-100))
 
+
+
+class PlayerPhoneTests(BaseCase):
+    """SPEC-016: a player shares one canonical phone number with one button."""
+
+    def sends(self, method='sendMessage'):
+        return [json.loads(row['payload'])
+                for row in self.db.all('SELECT payload FROM outbox WHERE method=? ORDER BY id', (method,))]
+
+    def keyboards(self):
+        return [payload['reply_markup'] for payload in self.sends() if 'reply_markup' in payload]
+
+    def contact(self, phone='09121234567', user=10, owner=10):
+        self.send(sender={'id': user}, contact={'user_id': owner, 'phone_number': phone})
+
+    def test_phone_normalization_accepts_iranian_formats(self):
+        for value in ('+989121234567', '00989121234567', '989121234567', '09121234567',
+                      '9121234567', '۰۹۱۲ ۱۲۳ ۴۵۶۷', '+98 912-123-4567', '(0912) 123.4567'):
+            with self.subTest(value=value):
+                self.assertEqual(normalize_phone(value), '+989121234567')
+
+    def test_phone_normalization_rejects_invalid_numbers(self):
+        for value in ('', '   ', 'سلام', '0912123456', '091212345678', '08121234567',
+                      '+1 555 0100', 'abcdefghij', None, 9121234567, ['09121234567']):
+            with self.subTest(value=value), self.assertRaises(UserError):
+                normalize_phone(value)
+
+    def test_linked_player_contact_is_stored_on_the_player(self):
+        self.seed()
+        self.contact('+98 912 123 4567')
+
+        player = self.db.one('SELECT * FROM players WHERE id=1')
+        self.assertEqual(player['phone'], '+989121234567')
+        self.assertEqual(self.db.one('SELECT phone FROM contacts WHERE user_id=10')['phone'],
+                         '+989121234567')
+        self.assertIn('علی رضایی', self.replies(10))
+        self.assertIn('+989121234567', self.replies(10))
+        self.assertEqual(self.db.one("SELECT COUNT(*) n FROM ledger")['n'], 0)
+
+    def test_unlinked_contact_stays_in_the_address_book_only(self):
+        self.seed(linked=False)
+        self.contact('09121234567')
+
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'], '')
+        self.assertEqual(self.db.one('SELECT phone FROM contacts WHERE user_id=10')['phone'],
+                         '+989121234567')
+        self.assertIn('/identify', self.replies(10))
+        self.assertNotIn('ثبت شد', self.replies(10))
+
+    def test_contact_for_another_user_never_reaches_a_player(self):
+        self.seed()
+        self.contact(owner=99)
+
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'], '')
+        self.assertEqual(self.db.one('SELECT phone FROM contacts WHERE user_id=10')['phone'], '')
+        self.assertIn('فقط contact متعلق به خودتان پذیرفته می‌شود', self.replies(10))
+
+    def test_share_button_uses_documented_keyboard_only(self):
+        self.seed()
+        self.send('/phone')
+
+        keyboards = self.keyboards()
+        self.assertEqual(len(keyboards), 1)
+        self.assertEqual(keyboards[0], {'keyboard': [[{'text': keyboards[0]['keyboard'][0][0]['text'],
+                                                       'request_contact': True}]]})
+        self.assertNotIn('resize_keyboard', keyboards[0])
+        self.assertNotIn('one_time_keyboard', keyboards[0])
+        self.assertIn('شماره‌ای برای شما ثبت نشده', self.replies(10))
+
+    def test_debt_reply_offers_the_button_only_while_the_number_is_missing(self):
+        self.seed()
+        self.send('/debt')
+        self.assertIn('دکمهٔ زیر', self.replies(10))
+        self.assertEqual(len(self.keyboards()), 1)
+
+        with self.db.conn:
+            self.db.execute('DELETE FROM outbox')
+            self.service.set_player_phone(1, '09121234567', 1)
+
+        self.send('/debt')
+        self.assertIn('مانده:', self.replies(10))
+        self.assertNotIn('دکمهٔ زیر', self.replies(10))
+        self.assertEqual(self.keyboards(), [])
+
+    def test_storing_a_number_dismisses_the_button(self):
+        self.seed()
+        self.contact()
+
+        self.assertEqual(self.keyboards(), [{'remove_keyboard': True}])
+
+    def test_phone_command_reports_and_fails_closed(self):
+        self.seed(linked=False)
+        self.send('/phone')
+        self.assertIn('/identify', self.replies(10))
+        self.assertEqual(self.keyboards(), [])
+
+        with self.db.conn:
+            self.db.execute('DELETE FROM outbox')
+            self.service.bind(1, 10, 1)
+            self.service.set_player_phone(1, '09121234567', 1)
+
+        self.send('/phone')
+        self.assertIn('+989121234567', self.replies(10))
+        self.assertIn('علی رضایی', self.replies(10))
+        self.assertEqual(len(self.keyboards()), 1)
+
+    def test_phone_command_outside_a_private_chat_changes_nothing(self):
+        self.seed()
+        self.send('/phone', user=1, chat=-100)
+
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'], '')
+        self.assertIn('گفت‌وگوی خصوصی', self.replies(-100))
+
+    def test_setting_the_same_phone_again_is_idempotent(self):
+        self.seed()
+        self.contact('09121234567')
+        self.contact('+98 912 123 4567')
+
+        self.assertEqual(
+            self.db.one("SELECT COUNT(*) n FROM audit_logs WHERE action='set_player_phone'")['n'], 1)
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'],
+                         '+989121234567')
+
+    def test_invalid_contact_is_rejected_without_storing_anything(self):
+        self.seed()
+        self.contact('0912')
+
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'], '')
+        self.assertEqual(self.db.one('SELECT phone FROM contacts WHERE user_id=10')['phone'], '')
+        self.assertIn('شمارهٔ موبایل ایران', self.replies(10))
+
+    def test_admin_player_list_shows_the_number(self):
+        self.seed()
+        with self.db.conn:
+            self.service.set_player_phone(1, '09121234567', 1)
+
+        self.send('/players', user=1, chat=-100)
+
+        self.assertIn('+989121234567', self.replies(-100))
 
 
 if __name__ == '__main__':

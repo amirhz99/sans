@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS players (
     name TEXT NOT NULL,
     normalized_name TEXT NOT NULL UNIQUE,
     note TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
     bale_id INTEGER UNIQUE
 );
 CREATE TABLE IF NOT EXISTS sessions (

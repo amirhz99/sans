@@ -1039,5 +1039,50 @@ class ExpireProposalsToolTests(unittest.TestCase):
         self.assertEqual(self.status(ident), 'pending')
 
 
+class PlayerPhoneContextTests(unittest.TestCase):
+    """SPEC-016: a shared phone number never reaches the model."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp.name) / 'phone.sqlite3')
+        self.service = Service(self.db)
+        with self.db.conn:
+            player = self.service.ensure_player('علی رضایی', actor='test')
+            self.player_id = player['id']
+            self.service.bind(self.player_id, 10, 'test')
+            self.service.set_player_phone(self.player_id, '09121234567', 'test')
+        self.bot = Bot(self.db, SimpleNamespace(admin_group=-100, bot_name='sans',
+                                               reminder_hours=0, admins=frozenset({1})), None)
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def test_phone_is_not_part_of_the_model_context(self):
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=?', (self.player_id,))['phone'],
+                         '+989121234567')
+
+        context = AIContextBuilder(self.db, self.service).build(10, 10, False)
+        self.assertEqual(context['self'], {'id': self.player_id, 'name': 'علی رضایی'})
+        snapshot = SansAgent(self.bot)._build_live_snapshot(10, 10, False, None)
+
+        for payload in (context, snapshot):
+            serialized = json.dumps(payload, ensure_ascii=False)
+            self.assertNotIn('+989121234567', serialized)
+            self.assertNotIn('9121234567', serialized)
+
+    def test_admin_player_listing_exposes_the_number_to_admins_only(self):
+        effects = {}
+        admin_tools = {tool.name: tool for tool in SansAgent(self.bot)._make_tools(
+            -100, 1, True, None, effects)}
+        player_tools = {tool.name: tool for tool in SansAgent(self.bot)._make_tools(
+            10, 10, False, {}, {})}
+
+        self.assertIn('+989121234567', admin_tools['query_database'].invoke(
+            {'target': 'players'}))
+        self.assertNotIn('+989121234567', player_tools['query_database'].invoke(
+            {'target': 'players'}))
+
+
 if __name__ == '__main__':
     unittest.main()

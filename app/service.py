@@ -32,6 +32,38 @@ def text(value, label, required=True, limit=500):
     return value.strip()
 
 
+# SPEC-016: one canonical shape for a shared phone number.  ``normalize`` already
+# maps Persian/Arabic digits, so only separators have to be removed here.
+PHONE_SEPARATORS = str.maketrans('', '', ' -.()\u200c')
+
+
+def normalize_phone(value):
+    """Return ``+98XXXXXXXXXX`` for an Iranian mobile number.
+
+    Accepts the five shapes a phone card or a human actually produces
+    (``+98912…``, ``0098912…``, ``98912…``, ``0912…``, ``912…``) and refuses
+    everything else instead of guessing a digit.
+    """
+    if not isinstance(value, str):
+        raise UserError('شمارهٔ تماس معتبر نیست؛ شماره را با دکمهٔ «ارسال شمارهٔ من» بفرستید.')
+    digits = normalize(value).translate(PHONE_SEPARATORS)
+    if not digits:
+        raise UserError('شمارهٔ تماس خالی است؛ شماره را با دکمهٔ «ارسال شمارهٔ من» بفرستید.')
+    if digits.startswith('+98'):
+        core = digits[3:]
+    elif digits.startswith('0098'):
+        core = digits[4:]
+    elif len(digits) == 12 and digits.startswith('98'):
+        core = digits[2:]
+    elif len(digits) == 11 and digits.startswith('0'):
+        core = digits[1:]
+    else:
+        core = digits
+    if not core.isdigit() or len(core) != 10 or not core.startswith('9'):
+        raise UserError('شمارهٔ موبایل ایران باید ۱۰ رقم و با ۹ شروع شود؛ مثلاً ۰۹۱۲۱۲۳۴۵۶۷.')
+    return '+98' + core
+
+
 def setting_value_is_explicit(message, key, value):
     """Return whether a setting value is present in the current user message.
 
@@ -637,6 +669,21 @@ class Service:
              str(phone or '')[:100]),
         )
         return user_id
+
+    def set_player_phone(self, player_id, phone, actor):
+        """Store one canonical phone number on a player (SPEC-016).
+
+        Idempotent: repeating the stored value writes nothing and records no
+        audit row.  The audit row keeps the player id only, so the number is
+        not copied into a second table.
+        """
+        player = self.player(player_id)
+        canonical = normalize_phone(phone)
+        if player['phone'] == canonical:
+            return {'id': player['id'], 'name': player['name'], 'phone': canonical, 'changed': False}
+        self.db.execute('UPDATE players SET phone=? WHERE id=?', (canonical, player['id']))
+        self.db.audit(actor, 'set_player_phone', {'player': player['id']})
+        return {'id': player['id'], 'name': player['name'], 'phone': canonical, 'changed': True}
 
     def session_info(self, ref=None, admin=False, level='summary'):
         """Render session information through the presentation layer.

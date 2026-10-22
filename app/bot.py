@@ -11,12 +11,16 @@ from .content import ADMIN_HELP, DEFAULTS, HELP, SYSTEM_PROMPT
 from .db import dumps
 from .domain import ConversationState, EntityRef, Intent, ResponseLevel
 from .presentation import SessionView
-from .service import ADMIN_ACTIONS, Service, UserError, integer, normalize, text
+from .service import (ADMIN_ACTIONS, Service, UserError, integer, normalize,
+                      normalize_phone, text)
 
 # A greeting is answered by the model, but it is never allowed to trigger an
 # action.  This line is only the fail-closed fallback and the reply for a
 # greeting that the model tried to turn into an operation.
 GREETING_REPLY = 'سلام! در خدمتم؛ بفرمایید چه کاری برایتان انجام دهم؟ برای راهنما /help را بفرستید.'
+
+# SPEC-016: a contact card can only be obtained through a reply-keyboard button.
+CONTACT_BUTTON = '📱 ارسال شمارهٔ من'
 
 # SPEC-011: a proposal stays trustworthy for one day.  Staleness is decided by
 # the proposal's own facts (see ``Service.guard``), never by the global revision
@@ -218,6 +222,25 @@ class Bot:
                          dumps(guard), int(time.time())))
         return ident
 
+    @staticmethod
+    def contact_keyboard():
+        """Return the reply keyboard that asks for the sender's own contact.
+
+        Only ``keyboard`` is sent: ``resize_keyboard`` and ``one_time_keyboard``
+        are not documented for the Bale API (SPEC-016).
+        """
+        return {'keyboard': [[{'text': CONTACT_BUTTON, 'request_contact': True}]]}
+
+    @staticmethod
+    def hide_keyboard():
+        """Return the markup that dismisses the share-contact reply keyboard."""
+        return {'remove_keyboard': True}
+
+    def player_without_phone(self, user_id):
+        """Return the linked player when a phone number is still missing."""
+        player = self.service.linked(user_id)
+        return player if player and not player['phone'] else None
+
     def propose_settings(self, changes, user_id, chat_id):
         """Create one approval proposal for one or more settings changes.
 
@@ -394,11 +417,12 @@ class Bot:
                          and not state.get('receipt')
                          and self.short_greeting(body, self.config.bot_name, self.db.setting('bot_username')))
         reply, markup = '', None
+        keyboard = None
         try:
             if len(processing_body) > 6000:
                 raise UserError('پیام طولانی است؛ لطفاً در چند پیام کوتاه‌تر بفرستید.')
             if private and msg.get('contact'):
-                reply = self.receive_contact(msg['contact'], user_id, chat_id, state)
+                reply, keyboard = self.receive_contact(msg['contact'], user_id, chat_id, state)
             elif private and (msg.get('photo') or msg.get('document')):
                 if not self.service.linked(user_id):
                     raise UserError('قبل از ارسال رسید، با /identify نام کامل خودتان را معرفی کنید و منتظر تأیید ادمین بمانید.')
@@ -508,6 +532,13 @@ class Bot:
                     if not p:
                         raise UserError('ابتدا با /identify نام کامل خود را معرفی کنید و منتظر تأیید اتصال حساب بمانید.')
                     reply = self.service.debt(p['id'])
+                    if private and not p['phone']:
+                        # SPEC-016: offer the one button that can share a number.
+                        reply += ('\n\nبرای اینکه ادمین‌ها در صورت نیاز تماس بگیرند، '
+                                  'شمارهٔ خودتان را با دکمهٔ زیر بفرستید.')
+                        keyboard = self.contact_keyboard()
+                elif action == 'phone':
+                    reply, keyboard = self.phone_reply(user_id, private)
                 elif action == 'session_info':
                     try:
                         conversation = ConversationState.from_dict(state)
@@ -525,6 +556,10 @@ class Bot:
                 elif action == 'identify' and private:
                     reply = self.identify(args.get('name'), user_id, chat_id, msg.get('from'),
                                           state.pop('identity_phone', None))
+                    if self.player_without_phone(user_id):
+                        # SPEC-016: an already linked player may still be missing
+                        # a number, so offer the button instead of only a message.
+                        keyboard = self.contact_keyboard()
                 elif action == 'payment_amount' and private:
                     reply = self.submit_amount(args.get('amount'), state, user_id)
                 elif action == 'declare_debt' and private:
@@ -540,7 +575,11 @@ class Bot:
                         self.service.require_explicit_setting(body, args)
                     reply, markup = self.propose(command, user_id, chat_id)
                 elif action == 'list_players':
-                    reply = '\n'.join(f"#{p['id']} {p['name']}" for p in self.db.all('SELECT * FROM players')) or 'بازیکنی ثبت نشده.'
+                    # SPEC-016: the admin sees the shared phone number; a player
+                    # never reaches this branch.
+                    reply = '\n'.join(
+                        f"#{p['id']} {p['name']}" + (f" | {p['phone']}" if p['phone'] else '')
+                        for p in self.db.all('SELECT * FROM players')) or 'بازیکنی ثبت نشده.'
                     if admin and self.service.duplicate_players():
                         reply += '\n\n⚠️ نام‌های مشکوک به تکرار پیدا شد؛ /duplicates را ببینید.'
                 elif action == 'list_sessions':
@@ -597,6 +636,8 @@ class Bot:
                     and isinstance(edit_message, int) and not isinstance(edit_message, bool)
                     and edit_message > 0 and len(reply) <= 3500
                     and not had_receipt_step
+                    # SPEC-016: editMessageText cannot attach a reply keyboard.
+                    and not keyboard
                     and not msg.get('contact') and not msg.get('photo') and not msg.get('document'))
         if can_edit:
             payload = {'chat_id': edit_chat, 'message_id': edit_message, 'text': reply}
@@ -604,7 +645,7 @@ class Bot:
                 payload['reply_markup'] = {'inline_keyboard': markup}
             self.db.queue('editMessageText', payload, self.card_ref(markup))
         else:
-            self.db.say(chat_id, reply, markup, self.card_ref(markup))
+            self.db.say(chat_id, reply, markup, self.card_ref(markup), keyboard=keyboard)
 
     @staticmethod
     def parse_amount(body):
@@ -619,7 +660,7 @@ class Bot:
         name = parts[0].split('@')[0][1:]
         rest = parts[1].strip() if len(parts) > 1 else ''
         simple = {'start': 'help', 'help': 'help', 'card': 'card', 'cancel': 'cancel', 'config': 'config', 'report': 'report',
-                  'players': 'list_players', 'sessions': 'list_sessions', 'pending': 'pending'}
+                  'players': 'list_players', 'sessions': 'list_sessions', 'pending': 'pending', 'phone': 'phone'}
         if name in simple:
             return {'action': simple[name], 'args': {}}
         if name in ('debt', 'session', 'identify', 'amount', 'confirm', 'deny', 'approve', 'reject'):
@@ -732,15 +773,26 @@ class Bot:
         return phone.strip()[:100]
 
     def receive_contact(self, contact, user_id, chat_id, state):
-        phone = self._contact_phone(contact, user_id)
+        """Store a phone number the sender shared from their own contact card.
+
+        Returns ``(reply, keyboard)``.  The keyboard dismisses the share button
+        once a linked player's number is stored (SPEC-016).
+        """
+        phone = normalize_phone(self._contact_phone(contact, user_id))
         # SPEC-014: keep the verified phone in the address book as well.
         self.service.touch_contact(user_id, chat_id, phone=phone)
+        linked = self.service.linked(user_id)
+        if linked:
+            result = self.service.set_player_phone(linked['id'], phone, user_id)
+            return (f'شمارهٔ {result["phone"]} برای «{result["name"]}» ثبت شد ✅\n'
+                    'اگر شماره عوض شد، دوباره /phone را بفرستید.', self.hide_keyboard())
         pending = self.db.one("SELECT * FROM pending WHERE requester=? AND chat_id=? "
                               "AND kind IN ('identity','claim') AND status='pending' "
                               "ORDER BY created_at DESC LIMIT 1", (user_id, chat_id))
         if not pending:
             state['identity_phone'] = phone
-            return 'شمارهٔ شما دریافت شد. حالا /identify نام کامل را بفرستید تا username و شماره برای ادمین‌ها ارسال شود.'
+            return ('شمارهٔ شما دریافت شد. حالا /identify نام کامل را بفرستید تا username و شماره '
+                    'برای ادمین‌ها ارسال شود.', None)
         payload = json.loads(pending['payload'])
         payload['phone_number'] = phone
         self.db.execute('UPDATE pending SET payload=? WHERE id=?', (dumps(payload), pending['id']))
@@ -749,7 +801,22 @@ class Bot:
         self.db.say(self.config.admin_group, self.identity_note(pending['id'], payload, player) +
                     ('' if player else f'\nتطبیق قطعی پیدا نشد. با /players بررسی کنید؛ در صورت نیاز بازیکن بسازید و سپس:\n/link {pending["id"]} شناسه_بازیکن'),
                     markup)
-        return 'شمارهٔ شما به درخواست شناسایی اضافه و برای ادمین‌ها ارسال شد.'
+        return 'شمارهٔ شما به درخواست شناسایی اضافه و برای ادمین‌ها ارسال شد.', None
+
+    def phone_reply(self, user_id, private):
+        """Answer ``/phone`` without ever exposing another player's number."""
+        if not private:
+            raise UserError('ثبت شمارهٔ تماس فقط در گفت‌وگوی خصوصی انجام می‌شود.')
+        player = self.service.linked(user_id)
+        if not player:
+            raise UserError('ابتدا با /identify نام کامل خودتان را معرفی کنید؛ '
+                            'شماره فقط برای بازیکن متصل ثبت می‌شود.')
+        if player['phone']:
+            return (f'شمارهٔ ثبت‌شدهٔ شما برای «{player["name"]}»: {player["phone"]}\n'
+                    'برای تغییر، دکمهٔ زیر را بزنید و شمارهٔ جدید را بفرستید.',
+                    self.contact_keyboard())
+        return ('شماره‌ای برای شما ثبت نشده است. با دکمهٔ زیر شمارهٔ خودتان را بفرستید.',
+                self.contact_keyboard())
 
     def identity_note(self, ident, payload, player=None):
         username = '@' + payload['username'] if payload.get('username') else 'ارسال نشده'
