@@ -13,7 +13,8 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import tools_condition
 
-from .service import MAX_BATCH, TEHRAN, UserError, integer, setting_value_is_explicit
+from .service import (MAX_BATCH, TEHRAN, UserError, integer, normalize,
+                      setting_value_is_explicit)
 
 LOG = logging.getLogger('sans.agent')
 
@@ -51,13 +52,23 @@ AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمن�
      * اصلاح حساب با مبلغ متفاوت برای هر نفر: `entries` را به‌صورت JSON بده؛ مثلاً `[{{"player":"مهدی","amount":-150000}},{{"player":"رضا","amount":50000}}]`. هرگز `entries` را با `players` یا `amount` ترکیب نکن.
      * در تسویهٔ گروهی، اعضایی که بدهی مثبت ندارند خودکار کنار گذاشته می‌شوند؛ لازم نیست آن‌ها را حذف کنی یا برایشان کارت بسازی.
      * برای هر درخواست، حتی با ده نفر، فقط **یک بار** این ابزار را صدا بزن.
-   - پیام به بازیکنان (`message_players`):
-     * اگر ادمین خواست پیامی به یک یا چند بازیکن (یا همه) برسد («به همه بگو سانس فردا لغو شد»، «به مهدی و رضا بگو کارت عوض شد»)، متن دقیق پیام را در `text` و نام‌ها را در `players` بده. خالی گذاشتن `players` یعنی همهٔ بازیکنانِ متصل به بله.
-     * این ابزار فقط کارت تأیید می‌سازد؛ ارسال واقعی بعد از تأیید ادمین انجام می‌شود. پیام را خودت دوباره نفرست و برای هر نفر جداگانه صدا نزن. بازیکنان بدون حساب متصل پیام نمی‌گیرند؛ همین را شفاف بگو.
+   - پیام به بازیکنان و مخاطبان (`message_players`):
+     * این ربات می‌تواند و می‌کند که خودش شروع‌کنندهٔ پیام باشد: بعد از اینکه ادمین دکمهٔ «تأیید» کارت را بزند، پیام در پی‌وی گیرنده ارسال می‌شود. ربات «فقط پاسخ‌دهنده» نیست؛ هرگز به ادمین نگو «من نمی‌توانم پیام بفرستم»، «فقط به پیام‌هایی که به من می‌رسد جواب می‌دهم» یا «این کار از عهدهٔ من خارج است».
+     * اگر ادمین خواست پیامی به یک یا چند نفر برسد («به همه بگو سانس فردا لغو شد»، «به مهدی و رضا بگو کارت عوض شد»)، متن دقیق پیام را در `text` و نام‌ها/شناسه‌ها را در `players` بده.
+     * مخاطب دو حالت دارد و باید صریح انتخاب شود:
+       - `audience='players'` (پیش‌فرض): فقط بازیکن‌ها؛ هم بازیکن متصل به بله و هم بازیکنی که درخواست شناسایی باز دارد.
+       - `audience='all'`: هر کسی که ربات را در پی‌وی استارت کرده، حتی اگر بازیکن نباشد. برای «همهٔ مخاطبان»، «هر کسی که ربات را استارت کرده»، «به همه در پی‌وی بگو» این حالت را بده و `players` را خالی بگذار. این حالت را با فهرست نام‌ها ترکیب نکن.
+     * بازیکنی که هنوز به بله متصل نشده ولی درخواست شناسایی باز دارد، پیام می‌گیرد. کارت تأیید این گیرنده‌ها را با برچسب «بدون بازیکن تأییدشده» نشان می‌دهد؛ لازم نیست خودت هشدار بدهی، فقط کارت را بساز.
+     * اگر ادمین خواست همراه پیام شماره هم گرفته شود («شماره‌شان را بگیر»، «ازشون شماره بخواه»)، `request_phone=true` بده تا دکمهٔ «ارسال شمارهٔ من» هم با پیام برود.
+     * این ابزار فقط کارت تأیید می‌سازد؛ ارسال واقعی بعد از تأیید ادمین انجام می‌شود. پیام را خودت دوباره نفرست و برای هر نفر جداگانه صدا نزن. اگر ادمین پرسید چه کسی پیام می‌گیرد، `query_database` با target='contacts' یا target='players' را ببین و همان اعداد را بگو.
    - پرسش از ادمین‌ها (`ask_admins`):
      * اگر بازیکنی در پی‌وی ادعا یا سوالی مطرح کرد که به نظر ادمین نیاز دارد یا اطلاعات سانس/کارت هنوز مشخص نیست، با `ask_admins` در گروه ادمین بپرس.
-   - شمارهٔ تماس بازیکن:
-     * شماره فقط با دکمهٔ «ارسال شمارهٔ من» ثبت می‌شود. هرگز شماره‌ای را از متن پیام حدس نزن، از کاربر نخواه شماره را تایپ کند، و شمارهٔ یک بازیکن را برای کاربر دیگری بازگو نکن. اگر کسی شماره می‌خواهد، به /phone در پی‌وی راهنمایی کن.
+   - شمارهٔ تماس، username و شناسهٔ بلهٔ بازیکن:
+     * اگر کاربر «ادمین» است، این اطلاعات را آزادانه و کامل نشان بده: فهرست بازیکن‌ها (`query_database` target='players')، درخواست‌های شناسایی باز (target='identities') و مخاطبان ربات (target='contacts'). هرگز به ادمین نگو «نمی‌توانم شماره را نشان بدهم» یا «این اطلاعات محرمانه است».
+     * اگر کاربر «بازیکن عادی» است، شماره و username و شناسهٔ بلهٔ هیچ بازیکن دیگری را بازگو نکن و فقط شمارهٔ خودش را با /phone نشان بده.
+     * شماره فقط با دکمهٔ «ارسال شمارهٔ من» ثبت می‌شود. هرگز شماره‌ای را از متن پیام حدس نزن و از کاربر نخواه شماره را تایپ کند. اگر کسی شماره می‌خواهد، به /phone در پی‌وی راهنمایی کن.
+     * اگر ادمین شماره‌ای را در پیام خودش نوشت و خواست ثبت شود («شمارهٔ علی ۰۹۱۲۱۲۳۴۵۶۷ است، ثبتش کن»)، با `manage_records` و عملیات `set_phone` همان عدد را ثبت کن. شماره‌ای که در همین پیام نوشته نشده باشد قابل ثبت نیست.
+     * کد کارت تأیید باز (مثل `9b7898198d6e47ac`) را از target='pending' یا target='identities' بخوان؛ اگر ادمین به یک کارت ریپلای کرد، همان کد داخل متن کارت است.
 
 ۳. لحن و سبک پاسخ:
    - طبیعی، محترمانه، خودمانی و مختصر صحبت کن.
@@ -157,7 +168,8 @@ class SansAgent:
         @tool
         def query_database(target: str, reference: str = '') -> str:
             """Read data from the database.
-            target: 'overview', 'players', 'sessions', 'session_details', 'debt', 'pending', 'duplicate_players'.
+            target: 'overview', 'players', 'sessions', 'session_details', 'debt', 'pending',
+                    'duplicate_players', 'identities', 'contacts'.
             reference: optional player name/ID or session title/ID.
             """
             try:
@@ -239,6 +251,53 @@ class SansAgent:
                     if not admin:
                         return 'فقط ادمین به فهرست نام‌های تکراری دسترسی دارد.'
                     return service.duplicates_report()
+                if target == 'identities':
+                    # SPEC-019: the admin may read the phone number, username, and
+                    # Bale user id of an open identity request.  A player never can.
+                    if not admin:
+                        return 'فقط ادمین به درخواست‌های شناسایی دسترسی دارد.'
+                    rows = db.all("SELECT id, payload FROM pending "
+                                  "WHERE kind IN ('identity','claim') AND status='pending' "
+                                  "ORDER BY created_at LIMIT 50")
+                    if not rows:
+                        return 'درخواست شناسایی باز وجود ندارد.'
+                    lines = []
+                    for row in rows:
+                        try:
+                            payload = json.loads(row['payload'])
+                        except (TypeError, ValueError):
+                            payload = {}
+                        if not isinstance(payload, dict):
+                            payload = {}
+                        player = payload.get('player')
+                        lines.append(
+                            f"کد {row['id']} | نام اعلامی: {payload.get('name') or '-'} | "
+                            f"بازیکن پیشنهادی: {('#' + str(player)) if player else 'ندارد'} | "
+                            f"نام نمایشی: {payload.get('display_name') or '-'} | "
+                            f"username: {('@' + payload['username']) if payload.get('username') else '-'} | "
+                            f"شماره: {payload.get('phone_number') or '-'} | "
+                            f"شناسهٔ بله: {payload.get('user_id')}")
+                    return '\n'.join(lines)
+                if target == 'contacts':
+                    # SPEC-019: everybody who ever started the bot in private.
+                    if not admin:
+                        return 'فقط ادمین به فهرست مخاطبان دسترسی دارد.'
+                    rows = db.all('SELECT user_id, chat_id, display_name, username, phone, updated_at '
+                                  'FROM contacts ORDER BY updated_at DESC, user_id LIMIT 50')
+                    if not rows:
+                        return 'هنوز هیچ مخاطبی ربات را در پی‌وی استارت نکرده است.'
+                    bound = {p['bale_id']: p for p in
+                             db.all('SELECT id, name, bale_id FROM players WHERE bale_id IS NOT NULL')}
+                    lines = []
+                    for row in rows:
+                        player = bound.get(row['user_id'])
+                        lines.append(
+                            f"شناسهٔ بله: {row['user_id']} | "
+                            f"بازیکن: {(('#' + str(player['id']) + ' ' + player['name']) if player else 'غیربازیکن')} | "
+                            f"نام نمایشی: {row['display_name'] or '-'} | "
+                            f"username: {('@' + row['username']) if row['username'] else '-'} | "
+                            f"شماره: {row['phone'] or '-'} | آخرین تماس: {row['updated_at']}")
+                    return '\n'.join(lines)
                 return 'هدف جستجو نامعتبر است.'
             except Exception as exc:
                 return f'خطا در خواندن اطلاعات: {exc}'
@@ -256,6 +315,9 @@ class SansAgent:
             - 'merge_player': (admin) data_json='{"source": "#4", "target": "#15"}' — moves history and builds an approval card.
             - 'delete_player': (admin) data_json='{"player": "#4"}' — only for a player with no history; builds an approval card.
             - 'duplicates': (admin) list suspected duplicate or partial names.
+            - 'set_phone': (admin) data_json='{"player": "#15", "phone": "09121234567"}'
+              records a number the admin typed in this same message; a number from
+              memory or an earlier message is refused.
             - 'expire_proposals': (admin) close open approval cards; data_json='{"older_than_hours": 0}'
               where 0 closes every open card and an omitted value means the 24 hour TTL.
               This only removes the cards; nothing financial is applied.
@@ -290,6 +352,27 @@ class SansAgent:
 
                 if not admin:
                     return 'خطا: این عملیات مدیریتی فقط برای ادمین مجاز است.'
+
+                if operation == 'set_phone':
+                    # SPEC-020: an admin may record a number the player already
+                    # gave him.  The digits must be in this message, so a number
+                    # from memory or an earlier turn can never be stored.
+                    unknown = set(data) - {'player', 'phone'}
+                    if unknown:
+                        return 'کلید ناشناخته در درخواست شماره: ' + '، '.join(sorted(unknown))
+                    p = service.player(data.get('player', ''))
+                    phone = data.get('phone')
+                    if not isinstance(phone, str) or not phone.strip():
+                        return 'شمارهٔ تماس را صریحاً در همین پیام بنویسید.'
+                    digits = re.sub(r'\D', '', normalize(phone))
+                    if (len(digits) < 10
+                            or digits[-10:] not in re.sub(r'\D', '', normalize(current_message))):
+                        return ('شمارهٔ تماس باید صریحاً در همین پیام نوشته شود؛ شماره از حافظه '
+                                'یا پیام قبلی برداشت نمی‌شود.')
+                    result = service.set_player_phone(p['id'], phone, user_id)
+                    return (f"شمارهٔ {result['phone']} برای #{result['id']} «{result['name']}» ثبت شد."
+                            if result['changed'] else
+                            f"شمارهٔ «{result['name']}» از قبل همین بود؛ تغییری ثبت نشد.")
 
                 if operation == 'upsert_players':
                     unknown = set(data) - {'players', 'name', 'note', 'force'}
@@ -632,15 +715,25 @@ class SansAgent:
                 return f'خطا در ساخت پیشنهاد مالی: {exc}'
 
         @tool
-        def message_players(text: str, players: str = '') -> str:
-            """Propose one proactive message to players' private chats (admin approval required).
+        def message_players(text: str, players: str = '', audience: str = '',
+                            request_phone: bool = False) -> str:
+            """Propose one proactive message to private chats (admin approval required).
+
+            The bot does send this after the admin presses «تأیید»; it is not a
+            reply-only bot.
+
             text: the exact Persian message to deliver.
-            players: names or #ids separated by , ، or newline; empty means every linked player.
+            players: names or #ids separated by , ، or newline; empty means every player.
+            audience: 'players' (default) for players only, or 'all' for every person
+              who ever started the bot, including people who are not players.
+            request_phone: true to attach the «ارسال شمارهٔ من» button to the message.
             """
             if not admin:
                 return 'ارسال پیام به بازیکنان فقط توسط ادمین ممکن است.'
             try:
-                command = service.prepare('broadcast', {'text': text, 'players': players or None})
+                command = service.prepare('broadcast', {
+                    'text': text, 'players': players or None,
+                    'audience': audience, 'request_phone': request_phone})
                 preview, markup = bot.propose_commands([command], user_id, chat_id)
             except UserError as exc:
                 return str(exc)

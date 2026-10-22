@@ -126,7 +126,10 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 CREATE TABLE IF NOT EXISTS outreach (
     id INTEGER PRIMARY KEY,
-    player_id INTEGER NOT NULL REFERENCES players(id),
+    -- SPEC-019: a recipient is a private chat, not necessarily a player, so
+    -- ``player_id`` is nullable and the Bale user id is stored next to it.
+    player_id INTEGER REFERENCES players(id),
+    user_id INTEGER,
     chat_id INTEGER NOT NULL,
     text TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('queued', 'sent', 'failed')),

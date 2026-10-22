@@ -49,7 +49,8 @@ the admin group with the sender's identity.
 - No broadcast outside the configured admin group: only an admin can create the
   proposal, and the message is delivered only after approval.
 - No messaging of players without a linked Bale account; they are reported as
-  unreachable instead.
+  unreachable instead. **Superseded by SPEC-019**: a player with an open
+  identity request and any private starter are addressable now.
 - No change to receipt, ledger, session, or identity flows.
 
 ## Contracts
@@ -128,6 +129,10 @@ git diff --check
 - Relay needs the provider message id, so it only works for notices delivered
   after this change; older notices cannot be matched.
 - The private-send drop uses the HTTP status carried by `APIError.code`.
+- SPEC-019 widens the audience: `broadcast_recipients` now resolves a linked
+  account, one open identity request, or any private starter, and `outreach`
+  stores `user_id` with a nullable `player_id`. The rest of this specification
+  (approval card, delivery record, reply relay) is unchanged.
 
 ## Validation Result
 

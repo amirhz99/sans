@@ -11,7 +11,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from app import jalali
-from app.bot import Bot, GREETING_REPLY, RELAY_CONFIRMATION
+from app.bot import Bot, CONTACT_BUTTON, GREETING_REPLY, RELAY_CONFIRMATION
 from app.ai_context import AIContextBuilder
 from app.clients import AIClient, APIError
 from app.config import Config
@@ -529,7 +529,10 @@ class PermissionAndConversationTests(BaseCase):
         self.send('مسئول علی با دو مهمان اومد', user=1, chat=-100)
         self.assertFalse(self.db.all('SELECT * FROM attendance'))
         ident = self.proposal()
-        self.click('yes:' + ident, user=1, chat=1)
+        # SPEC-020: a private chat is admin only for an allowlisted user id, so
+        # this click uses a user outside the allowlist to keep proving that a
+        # callback from outside the admin boundary cannot apply anything.
+        self.click('yes:' + ident, user=77, chat=77)
         self.assertFalse(self.db.all('SELECT * FROM attendance'))
         self.click('yes:' + ident)
         self.assertEqual(self.db.one('SELECT guests FROM attendance')['guests'], 2)
@@ -2212,6 +2215,251 @@ class OutreachTests(BaseCase):
         self.assertNotIn('یک سوال دارم', self.replies(-100))
 
 
+class AudienceOutreachTests(BaseCase):
+    """SPEC-019: reach every known private chat and let admins read numbers."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()                              # player 1 is bound to user 10
+        self.apply('new_player', name='مهدی کریمی')   # player 3, not bound
+        self.apply('new_player', name='حسین نوری')    # player 4, not bound
+        # A private starter who is not a player at all.
+        self.send('سلام', user=50, chat=50, sender={'id': 50, 'first_name': 'مهمان'})
+        # Player 3 introduced himself, but the admin has not approved the match.
+        with self.db.conn:
+            self.identity = self.bot.new_pending('identity', {
+                'name': 'مهدی کریمی', 'user_id': 40, 'player': 3,
+                'display_name': 'مهدی', 'username': 'mehdi',
+                'phone_number': '+989121110000'}, 40, 40)
+            self.db.execute('DELETE FROM outbox')
+
+    def tools(self, admin=True, user=1):
+        from app.agent import SansAgent
+        effects = {}
+        agent = SansAgent(self.bot)
+        return {t.name: t for t in agent._make_tools(-100, user, admin, None, effects)}, effects
+
+    def broadcast(self, text='سانس فردا لغو شد', players=None, audience='', request_phone=False):
+        with self.db.conn:
+            command = self.service.prepare('broadcast', {'text': text, 'players': players,
+                                                         'audience': audience,
+                                                         'request_phone': request_phone})
+            reply, markup = self.bot.propose_commands([command], 1, -100)
+        return markup[0][0]['callback_data'].split(':', 1)[1], reply
+
+    def private_sends(self):
+        payloads = [json.loads(row['payload'])
+                    for row in self.db.all("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id")]
+        return [p for p in payloads if isinstance(p.get('chat_id'), int) and p['chat_id'] > 0]
+
+    def test_known_address_prefers_the_linked_account(self):
+        self.assertEqual(self.service.known_address(1),
+                         {'user_id': 10, 'chat_id': 10, 'source': 'bound'})
+        self.assertEqual(self.service.known_address(3),
+                         {'user_id': 40, 'chat_id': 40, 'source': 'identity'})
+        self.assertIsNone(self.service.known_address(2))
+        self.assertIsNone(self.service.known_address(4))
+
+    def test_ambiguous_identity_requests_are_not_addressed(self):
+        with self.db.conn:
+            self.bot.new_pending('identity', {'name': 'مهدی کریمی', 'user_id': 41, 'player': 3}, 41, 41)
+
+        self.assertIsNone(self.service.known_address(3))
+        recipients, unreachable = self.service.broadcast_recipients([3])
+        self.assertEqual(recipients, [])
+        self.assertEqual(unreachable, ['مهدی کریمی'])
+
+    def test_players_audience_reaches_an_identified_player(self):
+        recipients, unreachable = self.service.broadcast_recipients([1, 3, 2])
+
+        self.assertEqual([r['chat_id'] for r in recipients], [10, 40])
+        self.assertEqual([r['source'] for r in recipients], ['bound', 'identity'])
+        self.assertEqual([r['player'] for r in recipients], [1, 3])
+        self.assertEqual(unreachable, ['رضا محمدی'])
+
+    def test_all_audience_includes_every_starter_once(self):
+        recipients, unreachable = self.service.broadcast_recipients(None, 'all')
+
+        self.assertEqual(sorted(r['chat_id'] for r in recipients), [10, 40, 50])
+        by_chat = {r['chat_id']: r for r in recipients}
+        self.assertEqual((by_chat[10]['player'], by_chat[10]['source']), (1, 'bound'))
+        self.assertEqual((by_chat[40]['player'], by_chat[40]['source']), (3, 'identity'))
+        self.assertEqual((by_chat[50]['player'], by_chat[50]['source']), (None, 'contact'))
+        self.assertEqual(by_chat[50]['name'], 'مهمان')
+        self.assertEqual(unreachable, [])
+
+    def test_broadcast_prepares_for_an_identified_player(self):
+        with self.db.conn:
+            command = self.service.prepare('broadcast',
+                                           {'text': 'سانس فردا لغو شد', 'players': 'مهدی کریمی'})
+
+        self.assertEqual(command['args']['players'], [3])
+        self.assertEqual(command['args']['audience'], 'players')
+        self.assertFalse(command['args']['request_phone'])
+        recipients, _ = self.service.broadcast_recipients(command['args']['players'],
+                                                          command['args']['audience'])
+        self.assertEqual([r['chat_id'] for r in recipients], [40])
+
+    def test_preview_names_the_audience_and_the_receivers(self):
+        command = self.service.prepare('broadcast', {'text': 'سلام', 'players': None, 'audience': 'all'})
+        preview = self.service.preview(command)
+        self.assertIn('حالت: همهٔ مخاطبان ربات', preview)
+        self.assertIn('گیرندگان (3 نفر)', preview)
+        self.assertIn('غیربازیکن (1 نفر', preview)
+        self.assertIn('مهمان', preview)
+        self.assertIn('پیام فقط پس از تأیید شما ارسال می‌شود.', preview)
+
+    def test_preview_reports_an_unconfirmed_audience(self):
+        command = self.service.prepare('broadcast', {'text': 'سلام', 'players': None})
+        preview = self.service.preview(command)
+        self.assertIn('حالت: بازیکنان', preview)
+        self.assertIn('بدون بازیکن تأییدشده (1 نفر', preview)
+        self.assertIn('مهدی کریمی', preview)
+        self.assertIn('بدون آدرس قابل‌دسترس و بدون دریافت پیام (2 نفر)', preview)
+        self.assertIn('رضا محمدی', preview)
+        self.assertIn('حسین نوری', preview)
+
+    def test_all_audience_queues_one_message_per_starter(self):
+        ident, _ = self.broadcast(audience='all')
+        with self.db.conn:
+            self.bot.confirm(ident, True, 1)
+        self.assertEqual(sorted(p['chat_id'] for p in self.private_sends()), [10, 40, 50])
+        rows = self.db.all('SELECT player_id, user_id, chat_id FROM outreach ORDER BY chat_id')
+        self.assertEqual([(r['player_id'], r['user_id'], r['chat_id']) for r in rows],
+                         [(1, 10, 10), (3, 40, 40), (None, 50, 50)])
+        self.assertTrue(all(p['text'] == 'سانس فردا لغو شد' for p in self.private_sends()))
+
+    def test_request_phone_attaches_only_the_contact_button(self):
+        ident, _ = self.broadcast(players='علی رضایی', request_phone=True)
+        with self.db.conn:
+            self.bot.confirm(ident, True, 1)
+        payloads = self.private_sends()
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]['reply_markup'],
+                         {'keyboard': [[{'text': CONTACT_BUTTON, 'request_contact': True}]]})
+        self.assertNotIn('resize_keyboard', payloads[0]['reply_markup'])
+        self.assertNotIn('one_time_keyboard', payloads[0]['reply_markup'])
+        with self.db.conn:
+            self.db.execute('DELETE FROM outbox')
+        ident, _ = self.broadcast(players='علی رضایی')
+        with self.db.conn:
+            self.bot.confirm(ident, True, 1)
+        self.assertNotIn('reply_markup', self.private_sends()[0])
+
+    def test_changed_audience_expires_the_card(self):
+        ident, _ = self.broadcast()
+        with self.db.conn:
+            self.service.bind(2, 20, 1)     # رضا محمدی became reachable
+        self.click('yes:' + ident)
+        self.assertEqual(self.private_sends(), [])
+        self.assertEqual(self.db.all('SELECT * FROM outreach'), [])
+        self.assertEqual(self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status'],
+                         'expired')
+
+    def test_admin_reads_open_identities_and_contacts(self):
+        tools, _ = self.tools(admin=True)
+        identities = tools['query_database'].invoke({'target': 'identities'})
+        self.assertIn('+989121110000', identities)
+        self.assertIn('@mehdi', identities)
+        self.assertIn('شناسهٔ بله: 40', identities)
+        self.assertIn(self.identity, identities)
+        contacts = tools['query_database'].invoke({'target': 'contacts'})
+        self.assertIn('شناسهٔ بله: 50', contacts)
+        self.assertIn('مهمان', contacts)
+        self.assertIn('غیربازیکن', contacts)
+        player_tools, _ = self.tools(admin=False, user=50)
+        for target in ('identities', 'contacts'):
+            with self.subTest(target=target):
+                self.assertIn('فقط ادمین',
+                              player_tools['query_database'].invoke({'target': target}))
+
+    def test_stored_phone_is_announced_once_to_the_admins(self):
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '09121234567'})
+
+        announced = self.replies(-100)
+        self.assertIn('شمارهٔ تماس ثبت شد', announced)
+        self.assertIn('+989121234567', announced)
+        self.assertIn('علی رضایی', announced)
+
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+98 912 123 4567'})
+        self.assertEqual(announced, self.replies(-100))
+
+    def test_identity_approval_offers_the_contact_button(self):
+        self.send('/identify حسین نوری', user=60, chat=60)
+        ident = self.db.one("SELECT id FROM pending WHERE kind='identity' AND requester=60")['id']
+        with self.db.conn:
+            self.db.execute('DELETE FROM outbox')
+
+        self.click('yes:' + ident)
+
+        payloads = [json.loads(row['payload']) for row in
+                    self.db.all("SELECT payload FROM outbox WHERE method='sendMessage'")]
+        keyboards = [p['reply_markup'] for p in payloads
+                     if p['chat_id'] == 60 and 'reply_markup' in p]
+        self.assertEqual(keyboards, [{'keyboard': [[{'text': CONTACT_BUTTON,
+                                                     'request_contact': True}]]}])
+
+    def test_non_player_reply_is_relayed(self):
+        with self.db.conn:
+            self.db.execute("INSERT INTO outreach(player_id,user_id,chat_id,text,status,message_id) "
+                            "VALUES (NULL,50,50,'سانس فردا لغو شد','sent',901)")
+        calls = len(self.ai.calls)
+
+        self.send('باشه، ممنون', user=50, chat=50,
+                  reply_to_message={'message_id': 901, 'from': {'id': 999}})
+
+        self.assertIn('باشه، ممنون', self.replies(-100))
+        self.assertIn('شناسهٔ بله 50', self.replies(-100))
+        self.assertIn(RELAY_CONFIRMATION, self.replies(50))
+        self.assertEqual(len(self.ai.calls), calls)
+
+    def test_legacy_outreach_table_is_upgraded(self):
+        legacy = Path(self.temp.name) / 'legacy-outreach.sqlite3'
+        conn = sqlite3.connect(legacy)
+        try:
+            conn.execute("CREATE TABLE players (id INTEGER PRIMARY KEY, name TEXT NOT NULL, "
+                         "normalized_name TEXT NOT NULL UNIQUE, note TEXT NOT NULL DEFAULT '', "
+                         "phone TEXT NOT NULL DEFAULT '', bale_id INTEGER UNIQUE)")
+            conn.execute("INSERT INTO players(id,name,normalized_name) VALUES (1,'علی','علی')")
+            conn.execute('''CREATE TABLE outreach (id INTEGER PRIMARY KEY,
+                player_id INTEGER NOT NULL REFERENCES players(id), chat_id INTEGER NOT NULL,
+                text TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('queued','sent','failed')),
+                message_id INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                delivered_at TEXT)''')
+            conn.execute("INSERT INTO outreach(player_id,chat_id,text,status) VALUES (1,10,'قدیمی','sent')")
+            conn.commit()
+        finally:
+            conn.close()
+
+        upgraded = Database(legacy)
+        try:
+            columns = {row['name']: row for row in upgraded.all('PRAGMA table_info(outreach)')}
+            self.assertIn('user_id', columns)
+            self.assertEqual(columns['player_id']['notnull'], 0)
+            row = upgraded.one('SELECT * FROM outreach')
+            self.assertEqual((row['player_id'], row['user_id'], row['chat_id'], row['text']),
+                             (1, 10, 10, 'قدیمی'))
+            self.assertEqual(upgraded.all('PRAGMA foreign_key_check'), [])
+        finally:
+            upgraded.close()
+
+    def test_audience_above_the_limit_fails_closed(self):
+        with self.db.conn:
+            for user_id in range(1000, 1201):
+                self.db.execute('INSERT INTO contacts(user_id,chat_id,display_name) VALUES (?,?,?)',
+                                (user_id, user_id, f'مخاطب {user_id}'))
+
+        with self.assertRaises(UserError) as caught:
+            self.service.prepare('broadcast', {'text': 'سلام', 'audience': 'all'})
+
+        self.assertIn('حداکثر 200 مخاطب', str(caught.exception))
+        self.assertEqual(self.db.all("SELECT * FROM pending WHERE kind='commands'"), [])
+
+
+
+
+
+
 
 class PlayerPhoneTests(BaseCase):
     """SPEC-016: a player shares one canonical phone number with one button."""
@@ -2614,6 +2862,107 @@ class ChatMemoryTests(BaseCase):
 
         rows = self.db.all("SELECT text FROM chat_messages WHERE role='user'")
         self.assertEqual([row['text'] for row in rows], ['سانس فردا\nساعت ۹ شب'])
+
+class PrivateAdminTests(BaseCase):
+    """SPEC-020: an allowlisted admin keeps admin powers in a private chat."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        # The test config allowlists {1, 2}; user 99 is not on it.
+        self.bot.config = replace(self.config, admins=frozenset({1, 2}),
+                                  admin_access='allowlist')
+
+    def tools(self, admin=True, user=1, current_message=''):
+        from app.agent import SansAgent
+        effects = {}
+        agent = SansAgent(self.bot)
+        return {t.name: t for t in agent._make_tools(-100, user, admin, None, effects,
+                                                     current_message=current_message)}, effects
+
+    def set_phone(self, tools, player='علی رضایی', phone='09121234567'):
+        return tools['manage_records'].invoke({
+            'operation': 'set_phone',
+            'data_json': json.dumps({'player': player, 'phone': phone}, ensure_ascii=False)})
+
+    def test_allowlisted_admin_manages_in_private(self):
+        self.assertTrue(self.bot.is_admin(1, 1))
+
+        self.send('/report', user=1, chat=1)
+
+        self.assertIn('گزارش حساب‌ها', self.replies(1))
+        self.assertNotIn('فقط برای ادمین', self.replies(1))
+
+    def test_other_users_stay_players_in_private(self):
+        self.assertFalse(self.bot.is_admin(99, 99))
+
+        self.send('/report', user=99, chat=99)
+
+        self.assertIn('فقط برای ادمین', self.replies(99))
+        self.assertNotIn('گزارش حساب‌ها', self.replies(99))
+
+    def test_group_members_policy_grants_no_private_admin(self):
+        self.bot.config = replace(self.config, admin_access='group_members')
+
+        self.assertFalse(self.bot.is_admin(1, 1))
+        self.assertTrue(self.bot.is_admin(-100, 1))
+
+        self.send('/report', user=1, chat=1)
+        self.assertIn('فقط برای ادمین', self.replies(1))
+
+    def test_group_membership_is_still_the_group_boundary(self):
+        self.bot.config = replace(self.config, admins=frozenset(),
+                                  admin_access='group_members')
+
+        self.assertTrue(self.bot.is_admin(-100, 99))
+        self.assertFalse(self.bot.is_admin(-200, 99))
+        self.assertFalse(self.bot.is_admin(-100, None))
+        self.assertFalse(self.bot.is_admin(-100, True))
+
+    def test_set_phone_requires_the_number_in_the_current_message(self):
+        tools, _ = self.tools(current_message='شمارهٔ علی رضایی را ثبت کن')
+
+        reply = self.set_phone(tools)
+
+        self.assertIn('صریحاً در همین پیام', reply)
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'], '')
+
+    def test_set_phone_stores_and_is_idempotent(self):
+        tools, _ = self.tools(current_message='شمارهٔ علی رضایی ۰۹۱۲ ۱۲۳ ۴۵۶۷ است، ثبتش کن')
+
+        first = self.set_phone(tools)
+
+        self.assertIn('+989121234567', first)
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'],
+                         '+989121234567')
+
+        second = self.set_phone(tools)
+        self.assertIn('از قبل همین بود', second)
+        self.assertEqual(
+            self.db.one("SELECT COUNT(*) n FROM audit_logs WHERE action='set_player_phone'")['n'], 1)
+
+    def test_set_phone_is_admin_only(self):
+        tools, _ = self.tools(admin=False, user=99,
+                              current_message='شمارهٔ علی رضایی 09121234567')
+
+        reply = self.set_phone(tools)
+
+        self.assertIn('فقط برای ادمین', reply)
+        self.assertEqual(self.db.one('SELECT phone FROM players WHERE id=1')['phone'], '')
+
+    def test_admin_reply_to_outreach_is_not_relayed(self):
+        with self.db.conn:
+            self.db.execute("INSERT INTO outreach(player_id,user_id,chat_id,text,status,message_id) "
+                            "VALUES (1,1,1,'سانس فردا لغو شد','sent',777)")
+        self.ai.answer = {'action': 'clarify', 'args': {}, 'question': 'باشه، ثبت شد.'}
+
+        self.send('باشه', user=1, chat=1,
+                  reply_to_message={'message_id': 777, 'from': {'id': 999}})
+
+        self.assertNotIn(RELAY_CONFIRMATION, self.replies(1))
+        self.assertEqual(len(self.ai.calls), 1)
+
+
 
 
 if __name__ == '__main__':

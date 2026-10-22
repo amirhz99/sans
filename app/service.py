@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .content import CONTENT_PATH, DEFAULTS
+from .keyboards import contact_keyboard
 from . import jalali
 
 
@@ -239,6 +240,49 @@ ADMIN_ACTIONS = {'new_player', 'new_session', 'update_session', 'attendance',
 MAX_BATCH = 30
 MAX_RECIPIENTS = 200
 BROADCAST_LIMIT = 3500
+
+# SPEC-019: who a proactive message may reach.  ``players`` keeps the SPEC-014
+# audience (a player the bot can address); ``all`` adds every private starter,
+# including people who are not players at all.
+AUDIENCES = ('players', 'all')
+AUDIENCE_LABELS = {'players': 'بازیکنان', 'all': 'همهٔ مخاطبان ربات'}
+AUDIENCE_ALIASES = {
+    'players': 'players', 'player': 'players', 'بازیکنان': 'players',
+    'بازیکن‌ها': 'players', 'بازیکن ها': 'players', 'همه بازیکن‌ها': 'players',
+    'همه بازیکن ها': 'players', 'فقط بازیکنان': 'players',
+    'all': 'all', 'everyone': 'all', 'contacts': 'all', 'همه': 'all',
+    'همه مخاطبان': 'all', 'همهٔ مخاطبان': 'all', 'مخاطبان': 'all',
+    'همه افراد': 'all', 'همهٔ افراد': 'all',
+}
+# A name list that means "every player"; kept from SPEC-014 so «به همه بگو»
+# still works through the ``players`` argument.
+ALL_PLAYERS_WORDS = ('all', 'همه', 'همه بازیکن ها', 'همه بازیکن‌ها')
+
+
+def parse_audience(value):
+    """Return 'players' or 'all' for a model or command supplied audience."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 'players'
+    if not isinstance(value, str):
+        raise UserError('حالت ارسال باید «بازیکنان» یا «همه» باشد.')
+    audience = AUDIENCE_ALIASES.get(normalize(value))
+    if audience is None:
+        raise UserError('حالت ارسال باید «بازیکنان» یا «همه» باشد.')
+    return audience
+
+
+def parse_flag(value, label):
+    """Return a boolean for an optional flag that the model may send as text."""
+    if value is None or value == '':
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and normalize(value) in ('true', 'yes', '1', 'بله', 'اره', 'آره'):
+        return True
+    if isinstance(value, str) and normalize(value) in ('false', 'no', '0', 'خیر', 'نه'):
+        return False
+    raise UserError(f'{label} باید بله یا خیر باشد.')
+
 
 SETTING_LABELS = {'card': 'شماره کارت', 'payment_note': 'پیام راهنمای پرداخت',
                   'approval_required': 'بررسی رسید توسط ادمین',
@@ -688,21 +732,102 @@ class Service:
     def card(self):
         return self.db.setting('card') or 'شماره کارت هنوز ثبت نشده؛ از ادمین‌ها می‌پرسم.'
 
-    def broadcast_recipients(self, player_ids=None):
+    def open_identity_addresses(self):
+        """Map player id to the private addresses of open identity requests.
+
+        SPEC-019: a player who already started the bot and introduced himself
+        can be reached before an admin approves the match.  The address is the
+        requester of the pending row, never a value from the model.
+        """
+        found = {}
+        rows = self.db.all("SELECT chat_id, payload FROM pending "
+                           "WHERE kind IN ('identity','claim') AND status='pending' ORDER BY created_at")
+        for row in rows:
+            try:
+                payload = json.loads(row['payload'])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            player, user_id = payload.get('player'), payload.get('user_id')
+            if not self._positive_id(player) or not self._positive_id(user_id):
+                continue
+            # A private chat id is positive; a request filed from a group falls
+            # back to the user id so the notice still reaches that person.
+            chat_id = row['chat_id'] if self._positive_id(row['chat_id']) else user_id
+            found.setdefault(player, {}).setdefault(user_id, chat_id)
+        return found
+
+    @staticmethod
+    def _positive_id(value):
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    def known_address(self, player_id, identities=None):
+        """Return ``{'user_id', 'chat_id', 'source'}`` for a player, or ``None``.
+
+        The linked account wins.  Without one, a single open identity request is
+        used; two requests with two different user ids are ambiguous, so the
+        player is deliberately not addressed (SPEC-019).  ``identities`` lets a
+        caller resolve a whole audience from one read of the pending rows.
+        """
+        player = self.player(player_id)
+        if self._positive_id(player['bale_id']):
+            return {'user_id': player['bale_id'], 'chat_id': player['bale_id'], 'source': 'bound'}
+        if identities is None:
+            identities = self.open_identity_addresses()
+        addresses = identities.get(player['id'], {})
+        if len(addresses) == 1:
+            user_id, chat_id = next(iter(addresses.items()))
+            return {'user_id': user_id, 'chat_id': chat_id, 'source': 'identity'}
+        return None
+
+    def broadcast_recipients(self, player_ids=None, audience='players'):
         """Return (recipients, unreachable names) for a proactive message.
 
-        Only a player with a linked Bale account can be addressed directly; an
-        unlinked name is reported instead of being guessed (SPEC-014).
+        A recipient is a private chat the bot can address: a linked account
+        (``bound``), one open identity request (``identity``), or a person in the
+        address book (``contact``).  Recipients are de-duplicated by chat id so
+        nobody receives the same notice twice.  An unaddressable player is
+        reported instead of being guessed (SPEC-014/019).
         """
+        if audience not in AUDIENCES:
+            raise UserError('حالت ارسال باید «بازیکنان» یا «همه» باشد.')
         if player_ids is None:
             rows = self.db.all('SELECT id, name, bale_id FROM players ORDER BY id')
         else:
             rows = [self.player(ident) for ident in player_ids]
-        recipients, unreachable = [], []
+        recipients, unreachable, seen = [], [], set()
+        identities = self.open_identity_addresses()
+
+        def add(chat_id, name, player=None, source='contact'):
+            if chat_id in seen:
+                return
+            seen.add(chat_id)
+            recipients.append({'player': player, 'user_id': chat_id, 'chat_id': chat_id,
+                               'name': name, 'source': source})
+
+        if audience == 'all':
+            if player_ids is not None:
+                raise UserError('حالت «همهٔ مخاطبان» با فهرست نام‌ها جمع نمی‌شود؛ '
+                                'یا نام‌ها را بدهید یا بگویید «همه».')
+            bound = {row['bale_id']: row for row in
+                     self.db.all('SELECT id, name, bale_id FROM players WHERE bale_id IS NOT NULL')}
+            for row in self.db.all('SELECT user_id, chat_id, display_name FROM contacts '
+                                   'ORDER BY updated_at DESC, user_id'):
+                player = bound.get(row['user_id'])
+                name = player['name'] if player else (row['display_name'] or f"مخاطب {row['user_id']}")
+                add(row['chat_id'], name, player['id'] if player else None,
+                    'bound' if player else 'contact')
+            for row in rows:
+                address = self.known_address(row['id'], identities)
+                if address:
+                    add(address['chat_id'], row['name'], row['id'], address['source'])
+            return recipients, unreachable
+
         for row in rows:
-            chat_id = row['bale_id']
-            if isinstance(chat_id, int) and not isinstance(chat_id, bool) and chat_id > 0:
-                recipients.append({'player': row['id'], 'name': row['name'], 'chat_id': chat_id})
+            address = self.known_address(row['id'], identities)
+            if address:
+                add(address['chat_id'], row['name'], row['id'], address['source'])
             else:
                 unreachable.append(row['name'])
         return recipients, unreachable
@@ -893,13 +1018,16 @@ class Service:
             a['amount'] = balance
             a['note'] = 'تسویه کامل توسط ادمین'
         elif action == 'broadcast':
-            # SPEC-014: the audience is resolved from the database here, never
-            # taken from the model, and nothing is delivered before approval.
+            # SPEC-014/019: the audience is resolved from the database here,
+            # never taken from the model, and nothing is delivered before
+            # approval.
             a['text'] = text(args.get('text'), 'متن پیام', limit=BROADCAST_LIMIT)
+            a['audience'] = parse_audience(args.get('audience'))
+            a['request_phone'] = parse_flag(args.get('request_phone'), 'درخواست شماره')
             raw = args.get('players')
             if raw is None or (isinstance(raw, str) and not raw.strip()) or raw == []:
                 a['players'] = None
-            elif isinstance(raw, str) and normalize(raw) in ('all', 'همه', 'همه بازیکن ها', 'همه بازیکن‌ها'):
+            elif isinstance(raw, str) and normalize(raw) in ALL_PLAYERS_WORDS:
                 a['players'] = None
             else:
                 refs = (raw if isinstance(raw, list)
@@ -914,9 +1042,16 @@ class Service:
                 if not ids:
                     raise UserError('گیرنده‌ای مشخص نشد؛ نام بازیکن‌ها را بفرستید یا «همه» را بگویید.')
                 a['players'] = ids
-            recipients, _ = self.broadcast_recipients(a['players'])
+            recipients, _ = self.broadcast_recipients(a['players'], a['audience'])
+            if len(recipients) > MAX_RECIPIENTS:
+                raise UserError(f'در هر ارسال حداکثر {MAX_RECIPIENTS} مخاطب مجاز است؛ '
+                                f'این ارسال {len(recipients)} نفر می‌شد.')
             if not recipients:
-                raise UserError('هیچ بازیکن متصلی برای دریافت پیام وجود ندارد؛ ابتدا بازیکن‌ها با /identify یا /bind به بله متصل شوند.')
+                if a['audience'] == 'all':
+                    raise UserError('هیچ مخاطبی برای دریافت پیام شناخته نشده است؛ هنوز کسی ربات را '
+                                    'در پی‌وی استارت نکرده یا خودش را معرفی نکرده است.')
+                raise UserError('هیچ بازیکنی برای دریافت پیام آدرس قابل‌دسترس ندارد؛ بازیکن‌ها باید با '
+                                '/identify خودشان را معرفی کنند یا ادمین با /bind وصل کند.')
         elif action == 'settings':
             key = args.get('key')
             if key not in SETTING_LABELS:
@@ -975,8 +1110,9 @@ class Service:
         if action in ('adjustment', 'declare_debt', 'player_delete'):
             return {'player': a['player']}
         if action == 'broadcast':
-            recipients, _ = self.broadcast_recipients(a['players'])
-            return {'recipients': sorted(r['player'] for r in recipients), 'text': a['text']}
+            recipients, _ = self.broadcast_recipients(a['players'], a['audience'])
+            return {'chat_ids': sorted(r['chat_id'] for r in recipients), 'text': a['text'],
+                    'request_phone': a['request_phone']}
         return {}
 
     def setting_display(self, key, value):
@@ -1026,14 +1162,24 @@ class Service:
             return '\n'.join(['حذف بازیکن', f"#{p['id']} {p['name']}",
                               'این بازیکن هیچ حضور، تراکنش یا رسیدی ندارد.'])
         if action == 'broadcast':
-            recipients, unreachable = self.broadcast_recipients(a['players'])
+            recipients, unreachable = self.broadcast_recipients(a['players'], a['audience'])
             names = '، '.join(r['name'] for r in recipients[:10])
             if len(recipients) > 10:
                 names += f' و {len(recipients) - 10} نفر دیگر'
-            lines = ['ارسال پیام به بازیکنان', a['text'], '',
+            lines = ['ارسال پیام', f"حالت: {AUDIENCE_LABELS[a['audience']]}", a['text'], '',
                      f'گیرندگان ({len(recipients)} نفر): {names}']
+            unconfirmed = [r['name'] for r in recipients if r['source'] == 'identity']
+            if unconfirmed:
+                lines.append(f'بدون بازیکن تأییدشده ({len(unconfirmed)} نفر، بر اساس درخواست شناسایی باز): ' +
+                             '، '.join(unconfirmed[:10]))
+            outsiders = [r['name'] for r in recipients if r['source'] == 'contact']
+            if outsiders:
+                lines.append(f'غیربازیکن ({len(outsiders)} نفر، فقط ربات را استارت کرده‌اند): ' +
+                             '، '.join(outsiders[:10]))
+            if a['request_phone']:
+                lines.append('همراه پیام، دکمهٔ «ارسال شمارهٔ من» هم فرستاده می‌شود.')
             if unreachable:
-                lines.append(f'بدون حساب متصل و بدون دریافت پیام ({len(unreachable)} نفر): ' +
+                lines.append(f'بدون آدرس قابل‌دسترس و بدون دریافت پیام ({len(unreachable)} نفر): ' +
                              '، '.join(unreachable[:10]))
             lines.append('پیام فقط پس از تأیید شما ارسال می‌شود.')
             return '\n'.join(lines)
@@ -1121,16 +1267,23 @@ class Service:
             self.db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',
                             (a['player'], a['amount'], a['note'], source))
         elif action == 'broadcast':
-            # SPEC-014: one outreach row per recipient so delivery is traceable,
-            # and one private outbox row per message. Nothing is sent here.
-            recipients, _ = self.broadcast_recipients(a['players'])
+            # SPEC-014/019: one outreach row per private chat so delivery is
+            # traceable, and one private outbox row per message. Nothing is sent
+            # here.
+            recipients, _ = self.broadcast_recipients(a['players'], a['audience'])
+            keyboard = contact_keyboard() if a['request_phone'] else None
             for recipient in recipients:
                 outreach_id = self.db.execute(
-                    "INSERT INTO outreach(player_id,chat_id,text,status) VALUES (?,?,?,'queued')",
-                    (recipient['player'], recipient['chat_id'], a['text'])).lastrowid
-                self.db.queue('sendMessage', {'chat_id': recipient['chat_id'], 'text': a['text']},
-                              ref=f'outreach:{outreach_id}')
+                    "INSERT INTO outreach(player_id,user_id,chat_id,text,status) VALUES (?,?,?,?,'queued')",
+                    (recipient['player'], recipient['user_id'], recipient['chat_id'],
+                     a['text'])).lastrowid
+                payload = {'chat_id': recipient['chat_id'], 'text': a['text']}
+                if keyboard:
+                    payload['reply_markup'] = keyboard
+                self.db.queue('sendMessage', payload, ref=f'outreach:{outreach_id}')
             self.db.audit(actor, action, {'recipients': len(recipients), 'players': a['players'],
+                                          'audience': a['audience'],
+                                          'request_phone': a['request_phone'],
                                           'text_length': len(a['text'])})
             return
         elif action == 'settings':

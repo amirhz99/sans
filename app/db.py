@@ -43,9 +43,49 @@ class Database:
         player_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(players)')}
         if 'phone' not in player_columns:
             self.conn.execute("ALTER TABLE players ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
+        # SPEC-019: an outreach recipient is a private chat, not always a player
+        # (somebody who only started the bot), so ``player_id`` must be nullable
+        # and the Bale user id is stored next to it.  SQLite cannot relax a
+        # NOT NULL constraint in place, so the table is rebuilt once inside a
+        # transaction that keeps every existing row.
+        outreach = {row['name']: row for row in self.conn.execute('PRAGMA table_info(outreach)')}
+        if 'user_id' not in outreach or outreach['player_id']['notnull']:
+            self._rebuild_outreach()
         # Drop legacy trigger if present so incomplete/historical sessions work freely.
         self.conn.execute('DROP TRIGGER IF EXISTS sessions_require_session_at')
         self.conn.commit()
+
+    def _rebuild_outreach(self):
+        """Recreate ``outreach`` with a nullable player id (SPEC-019)."""
+        self.conn.execute('PRAGMA foreign_keys = OFF')
+        try:
+            self.conn.execute('BEGIN IMMEDIATE')
+            self.conn.execute('''CREATE TABLE outreach_migrated (
+                id INTEGER PRIMARY KEY,
+                player_id INTEGER REFERENCES players(id),
+                user_id INTEGER,
+                chat_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('queued', 'sent', 'failed')),
+                message_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                delivered_at TEXT)''')
+            self.conn.execute('''INSERT INTO outreach_migrated
+                (id, player_id, user_id, chat_id, text, status, message_id, created_at, delivered_at)
+                SELECT id, player_id, chat_id, chat_id, text, status, message_id, created_at, delivered_at
+                FROM outreach''')
+            self.conn.execute('DROP TABLE outreach')
+            self.conn.execute('ALTER TABLE outreach_migrated RENAME TO outreach')
+            self.conn.execute('CREATE INDEX IF NOT EXISTS idx_outreach_chat ON outreach(chat_id, message_id)')
+            problems = self.conn.execute('PRAGMA foreign_key_check').fetchall()
+            if problems:
+                raise RuntimeError('outreach migration would leave dangling references')
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            self.conn.execute('PRAGMA foreign_keys = ON')
 
     def close(self):
         self.conn.close()

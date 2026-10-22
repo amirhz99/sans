@@ -10,6 +10,9 @@ from .clients import APIError
 from .content import ADMIN_HELP, DEFAULTS, HELP, SYSTEM_PROMPT
 from .db import dumps
 from .domain import ConversationState, EntityRef, Intent, ResponseLevel
+from .keyboards import CONTACT_BUTTON as _CONTACT_BUTTON
+from .keyboards import contact_keyboard as _contact_keyboard
+from .keyboards import hide_keyboard as _hide_keyboard
 from .presentation import SessionView
 from .service import (ADMIN_ACTIONS, Service, UserError, integer, normalize,
                       normalize_phone, text)
@@ -20,7 +23,9 @@ from .service import (ADMIN_ACTIONS, Service, UserError, integer, normalize,
 GREETING_REPLY = 'سلام! در خدمتم؛ بفرمایید چه کاری برایتان انجام دهم؟ برای راهنما /help را بفرستید.'
 
 # SPEC-016: a contact card can only be obtained through a reply-keyboard button.
-CONTACT_BUTTON = '📱 ارسال شمارهٔ من'
+# SPEC-019: the markup itself lives in ``app/keyboards.py`` so the service layer
+# can attach it without importing ``Bot``.  This name stays importable here.
+CONTACT_BUTTON = _CONTACT_BUTTON
 
 # SPEC-017: readable names for the values a new session may inherit.
 DEFAULT_LABELS = {'location': 'محل', 'venue_cost': 'هزینهٔ زمین', 'person_fee': 'سهم هر نفر'}
@@ -53,9 +58,20 @@ class Bot:
         self.agent = SansAgent(self)
 
     def is_admin(self, chat_id, user_id):
-        return (isinstance(user_id, int) and not isinstance(user_id, bool) and user_id > 0
-                and isinstance(chat_id, int) and not isinstance(chat_id, bool)
-                and chat_id == self.config.admin_group)
+        """Return whether this sender may act as an admin in this chat.
+
+        The configured admin group is the permission boundary for its members.
+        SPEC-020: an allowlisted user id also keeps admin powers in a private
+        chat, so the owner of the bot is not treated as a stranger in his own
+        private conversation.
+        """
+        if (isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0
+                or isinstance(chat_id, bool) or not isinstance(chat_id, int)):
+            return False
+        if chat_id == self.config.admin_group:
+            return True
+        return (chat_id == user_id and self.config.admin_access == 'allowlist'
+                and user_id in self.config.admins)
 
     def allowed_chat(self, chat):
         """Return whether an update can be handled in this chat.
@@ -174,7 +190,7 @@ class Bot:
         only plain text: a photo or a contact is still handled by the receipt
         and identity flows (SPEC-014).
         """
-        if user_id in self.config.admins:
+        if self.is_admin(chat_id, user_id) or user_id in self.config.admins:
             return None
         if msg.get('contact') or msg.get('photo') or msg.get('document'):
             return None
@@ -240,12 +256,12 @@ class Bot:
         Only ``keyboard`` is sent: ``resize_keyboard`` and ``one_time_keyboard``
         are not documented for the Bale API (SPEC-016).
         """
-        return {'keyboard': [[{'text': CONTACT_BUTTON, 'request_contact': True}]]}
+        return _contact_keyboard()
 
     @staticmethod
     def hide_keyboard():
         """Return the markup that dismisses the share-contact reply keyboard."""
-        return {'remove_keyboard': True}
+        return _hide_keyboard()
 
     def player_without_phone(self, user_id):
         """Return the linked player when a phone number is still missing."""
@@ -384,7 +400,8 @@ class Bot:
             self.db.log_agent_event(
                 chat_id, user_id, sender_name, 'RELAYED_TO_ADMIN',
                 summary=body[:200],
-                details={'outreach': relayed['id'], 'player': relayed['player_id']},
+                details={'outreach': relayed['id'], 'player': relayed['player_id'],
+                         'user_id': user_id},
             )
             self.db.say(self.config.admin_group,
                         f'پاسخ {sender_name} (شناسهٔ بله {user_id}) به پیام شما:\n{body[:3000]}')
@@ -816,6 +833,12 @@ class Bot:
         linked = self.service.linked(user_id)
         if linked:
             result = self.service.set_player_phone(linked['id'], phone, user_id)
+            if result['changed']:
+                # SPEC-019: the admin group must learn about a number without
+                # anybody having to run /players.
+                self.db.say(self.config.admin_group,
+                            f"شمارهٔ تماس ثبت شد\nبازیکن: #{result['id']} {result['name']}\n"
+                            f"شماره: {result['phone']}\nشناسهٔ بله: {user_id}")
             return (f'شمارهٔ {result["phone"]} برای «{result["name"]}» ثبت شد ✅\n'
                     'اگر شماره عوض شد، دوباره /phone را بفرستید.', self.hide_keyboard())
         pending = self.db.one("SELECT * FROM pending WHERE requester=? AND chat_id=? "
@@ -1173,8 +1196,15 @@ class Bot:
         if row['kind'] == 'binding':
             self.db.say(row['chat_id'], 'اتصال حساب تأیید شد ✅')
         elif row['kind'] in ('identity', 'claim'):
-            self.db.say(row['chat_id'], 'هویت شما تأیید شد.\n' + self.service.debt(payload['player']) if approve
-                        else 'درخواست شناسایی تأیید نشد. لطفاً با /identify نام کامل دقیق را دوباره بفرستید.')
+            if approve:
+                reply = 'هویت شما تأیید شد.\n' + self.service.debt(payload['player'])
+                # SPEC-019: the freshly linked player can share a number right
+                # here instead of having to discover /phone.
+                keyboard = (self.contact_keyboard()
+                            if self.player_without_phone(payload.get('user_id')) else None)
+                self.db.say(row['chat_id'], reply, keyboard=keyboard)
+            else:
+                self.db.say(row['chat_id'], 'درخواست شناسایی تأیید نشد. لطفاً با /identify نام کامل دقیق را دوباره بفرستید.')
         if approve and row['kind'] == 'commands':
             for command in payload:
                 if command['action'] == 'finalize':

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from app.ai_context import AIContextBuilder
 from app.agent import AGENT_SYSTEM_PROMPT, SansAgent
 from app.clients import AIClient
+from app.config import Config
 from app.content import DEFAULTS, SYSTEM_PROMPT
 from app.db import Database
 from app.domain import ConversationState, EntityRef, EntityType, Intent, ResponseLevel
@@ -1255,6 +1256,70 @@ class ChatMemoryWindowTests(unittest.TestCase):
         # The tail, not the head, of the conversation is replayed.
         self.assertTrue(payload['history'][0]['content'].startswith('12 '))
         self.assertTrue(payload['history'][-1]['content'].startswith('19 '))
+
+
+class OutreachPromptTests(unittest.TestCase):
+    """SPEC-019: the prompt and the tool must not invent a reply-only bot."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp.name) / 'outreach.sqlite3')
+        self.service = Service(self.db)
+        self.config = Config('fake-token', -100, frozenset({1}), 'https://example.com/v1',
+                             'fake-key', 'fake-model', Path(self.temp.name) / 'unused.sqlite3')
+        self.bot = Bot(self.db, self.config, SimpleNamespace())
+        with self.db.conn:
+            self.service.apply(self.service.prepare('new_player', {'name': 'علی رضایی'}), 1, 'test:1')
+            self.service.apply(self.service.prepare('new_player', {'name': 'مهدی کریمی'}), 1, 'test:2')
+            self.service.bind(1, 10, 1)
+            self.bot.new_pending('identity', {'name': 'مهدی کریمی', 'user_id': 40, 'player': 2,
+                                              'username': 'mehdi'}, 40, 40)
+            self.service.touch_contact(50, 50, 'مهمان')
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def tools(self, admin=True, user=1):
+        effects = {}
+        agent = SansAgent(self.bot)
+        return {t.name: t for t in agent._make_tools(-100, user, admin, None, effects)}, effects
+
+    def test_prompt_allows_admins_and_proactive_sending(self):
+        # The bot does send proactively after an admin click, and the prompt says so.
+        self.assertIn('می‌تواند و می‌کند که خودش شروع‌کنندهٔ پیام باشد', AGENT_SYSTEM_PROMPT)
+        self.assertIn('فقط پاسخ‌دهنده» نیست', AGENT_SYSTEM_PROMPT)
+        # The admin exception is explicit, and the absolute rule is gone.
+        self.assertIn('اگر کاربر «ادمین» است', AGENT_SYSTEM_PROMPT)
+        self.assertIn('نمی‌توانم شماره را نشان بدهم', AGENT_SYSTEM_PROMPT)
+        self.assertNotIn('و شمارهٔ یک بازیکن را برای کاربر دیگری بازگو نکن', AGENT_SYSTEM_PROMPT)
+        # Both audiences and the discovery targets are documented.
+        self.assertIn("audience='all'", AGENT_SYSTEM_PROMPT)
+        self.assertIn("target='identities'", AGENT_SYSTEM_PROMPT)
+        self.assertIn("target='contacts'", AGENT_SYSTEM_PROMPT)
+        self.assertIn('request_phone=true', AGENT_SYSTEM_PROMPT)
+
+    def test_message_players_exposes_both_audiences(self):
+        tools, _ = self.tools(admin=True)
+        self.assertIn('audience', tools['message_players'].args)
+        self.assertIn('request_phone', tools['message_players'].args)
+
+        reply = tools['message_players'].invoke({'text': 'سانس فردا لغو شد', 'audience': 'all'})
+
+        self.assertIn('حالت: همهٔ مخاطبان ربات', reply)
+        self.assertIn('گیرندگان (3 نفر)', reply)
+        self.assertIn('مهمان', reply)
+        self.assertIn('تأیید', reply)
+        # A proposal only: nothing is delivered or recorded before the click.
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM outreach')['n'], 0)
+
+    def test_request_phone_is_reported_on_the_card(self):
+        tools, _ = self.tools(admin=True)
+
+        reply = tools['message_players'].invoke({'text': 'شماره‌تان را بفرستید',
+                                                 'audience': 'all', 'request_phone': True})
+
+        self.assertIn('دکمهٔ «ارسال شمارهٔ من» هم فرستاده می‌شود', reply)
 
 
 if __name__ == '__main__':
