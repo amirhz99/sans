@@ -292,7 +292,7 @@ git diff --check
   original 51 attendance rows are still there, and the bot was started again
   afterwards.
 
-## Live deployment plan
+## Live run notes
 
 - `data/sessions.csv` holds the 52 names (51 sheet rows plus the approved
   addition «علی صدری») and the ten Friday columns. It was rebuilt from the
