@@ -557,12 +557,14 @@ _PAID_SOURCE = 'backfill:paid:'
 def paid_total(db, player_id):
     """Return how much one person has paid, in تومان.
 
-    A session charge is what the period *asks*; every other row is a payment or
-    a correction of one.  Reading the credits this way keeps the import
-    idempotent even after a positive correction raised the debt.
+    A session charge is what the period *asks*, and an ``opening:`` row is a
+    snapshot of debt, so neither is a payment.  Every other row (a proposal, a
+    receipt, a correction) counts, which keeps the import idempotent even after
+    a positive correction raised the debt.
     """
     return -db.one("SELECT COALESCE(SUM(amount),0) n FROM ledger WHERE player_id=? "
-                   "AND source NOT LIKE 'session:%'", (player_id,))['n']
+                   "AND source NOT LIKE 'session:%' AND source NOT LIKE 'opening:%'",
+                   (player_id,))['n']
 
 
 def apply_payments(db, rows, fee, dry_run=False, aliases=None, allow_new=()):

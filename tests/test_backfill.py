@@ -4,7 +4,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from app.backfill import (apply_payments, apply_sessions, format_reconcile, marked_sessions,
-                          read_plan, read_workbook, reconcile)
+                          paid_total, read_plan, read_workbook, reconcile)
 from app.db import Database
 from app.service import Service, UserError
 
@@ -306,6 +306,18 @@ class PaymentTests(BackfillCase):
         second = apply_payments(self.db, read_workbook(path, 150000), 150000)
         self.assertEqual((second['adjusted'], second['unchanged']), ([], 2))
         self.assertEqual(self.counts(), fingerprint)
+
+    def test_an_opening_snapshot_row_is_not_read_as_a_payment(self):
+        ali = self.player('علی')
+        with self.db.conn:
+            # A legacy ``--import-players`` snapshot: a debt, never a payment.
+            self.db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',
+                            (ali['id'], 1200000, 'بدهی تا ۱۶ مرداد ۱۴۰۵', f'opening:{ali["id"]}'))
+        path = self.workbook([HEADER, ['علی', 2, 1, 150]])
+        report = apply_payments(self.db, read_workbook(path, 150000), 150000)
+        self.assertEqual([item['amount'] for item in report['adjusted']], [-150000])
+        self.assertEqual(self.service.balance(ali['id']), 1200000 - 150000)
+        self.assertEqual(paid_total(self.db, ali['id']), 150000)
 
     def test_a_missing_player_is_created_from_the_sheet(self):
         path = self.workbook([HEADER, ['ناشناس', 1, 0, '']])

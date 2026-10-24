@@ -108,11 +108,12 @@ correction visible as its own ledger row.
   taken). `SUM(amount)` over the prefix always equals the current charge.
 
 - **Payments**: a person's paid total is every ledger row that is **not** a
-  session charge (`source NOT LIKE 'session:%'`), so a correction stays stable
-  and a second run writes nothing. The target is `paid_sessions × fee`; the
-  difference to the current total is written as one `backfill:paid:<pid>` row
-  (positive when the database recorded too much payment). A name the roster did
-  not create is created from the sheet here.
+  session charge or an `opening:` snapshot (`source NOT LIKE 'session:%'` and
+  `NOT LIKE 'opening:%'`), so a snapshot debt is never read as a payment and a
+  correction stays stable. The target is `paid_sessions × fee`; the difference
+  to the current total is written as one `backfill:paid:<pid>` row (positive
+  when the database recorded too much payment). A name the roster did not create
+  is created from the sheet here.
 
 - **Attendance counts slots**: the workbook's «جلسات آمده» counts a player with
   two guests as three attended sessions, so reconcile sums `1 + guests` over the
@@ -206,8 +207,8 @@ git diff --check
 
 ## Validation Result
 
-- `python3 -m unittest discover -s tests -t . -v`: 304 tests, OK, no skips. The
-  23 new `tests/test_backfill.py` tests replace the one test that used to skip
+- `python3 -m unittest discover -s tests -t . -v`: 305 tests, OK, no skips. The
+  24 new `tests/test_backfill.py` tests replace the one test that used to skip
   because it pointed at a workbook outside the repository.
 - `python3 -m compileall -q app tests`: OK.
 - `git diff --check`: clean.
