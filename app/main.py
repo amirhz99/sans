@@ -322,9 +322,13 @@ def run(db, config):
             time.sleep(5)
 
 
-def main():
-    os.umask(0o077)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+def build_parser():
+    """Build the argument parser used by every command-line entry point.
+
+    The commands exclude each other, but the SPEC-022 modifiers do not:
+    ``--workbook-overrides`` has to travel with ``--import-payments`` and
+    ``--reconcile``, which both read the workbook it corrects.
+    """
     parser = argparse.ArgumentParser(description='Bale football-session manager')
     parser.add_argument('--database', type=Path, help='SQLite path (overrides DATABASE_PATH)')
     commands = parser.add_mutually_exclusive_group()
@@ -340,6 +344,8 @@ def main():
     commands.add_argument('--discover-ids', action='store_true', help='Show IDs from recent messages; only BALE_BOT_TOKEN needed')
     commands.add_argument('--logs', type=int, nargs='?', const=30, metavar='N', help='Show last N agent trace logs from database')
     # SPEC-022 modifiers belong to the command above them, not to the group.
+    parser.add_argument('--workbook-overrides', type=Path, metavar='CSV',
+                        help='SPEC-022: apply approved attendance/debt corrections')
     parser.add_argument('--dry-run', action='store_true',
                         help='SPEC-022: report what would change and roll it back')
     parser.add_argument('--alias', action='append', default=[], metavar='ROSTER=STORED',
@@ -352,12 +358,30 @@ def main():
                         help='SPEC-022: hall cost per session (default 2500000)')
     parser.add_argument('--hour', default=SESSION_HOUR, metavar='HH:MM',
                         help='SPEC-022: session start time in Tehran (default 16:30)')
+    return parser
+
+
+def check_modifiers(args):
+    """Refuse a SPEC-022 modifier that the chosen command cannot use.
+
+    ``--workbook-overrides`` only means something next to the workbook reader;
+    on its own it would silently fall through to starting the bot.
+    """
+    if args.workbook_overrides and not (args.import_payments or args.reconcile):
+        raise UserError('--workbook-overrides فقط همراه --import-payments یا --reconcile معنا دارد.')
+
+
+def main():
+    os.umask(0o077)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    parser = build_parser()
     args = parser.parse_args()
     load_env()
     path = args.database or Path(os.getenv('DATABASE_PATH', 'data/sans.sqlite3'))
     if not path.is_absolute():
         path = ROOT / path
     try:
+        check_modifiers(args)
         if args.discover_ids:
             token = os.getenv('BALE_BOT_TOKEN', '').strip()
             if not token:
@@ -403,12 +427,12 @@ def main():
                                             fee=args.session_fee, venue_cost=args.venue_cost)
                     print(format_sessions(report))
                 elif args.import_payments:
-                    rows = read_workbook(args.import_payments, args.session_fee)
+                    rows = read_workbook(args.import_payments, args.session_fee, args.workbook_overrides)
                     report = apply_payments(db, rows, args.session_fee, dry_run=args.dry_run,
                                             aliases=aliases(args.alias), allow_new=args.allow_new)
                     print(format_payments(report))
                 elif args.reconcile:
-                    rows = read_workbook(args.reconcile, args.session_fee)
+                    rows = read_workbook(args.reconcile, args.session_fee, args.workbook_overrides)
                     result = reconcile(db, rows, args.session_fee)
                     print(format_reconcile(result))
                     if not result['ok']:

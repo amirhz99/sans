@@ -113,12 +113,50 @@ def _sheet_int(value, label):
     return int(number)
 
 
-def read_workbook(path, fee):
+def read_overrides(path, fee):
+    """Read explicit operator corrections without changing the workbook.
+
+    The CSV has ``name,attended,paid`` columns; ``debt`` is optional and, when
+    present, is expressed in thousands of تومان.  An override may also add a
+    person absent from the workbook (for example an approved late addition).
+    """
+    with Path(path).open(encoding='utf-8-sig', newline='') as handle:
+        reader = csv.DictReader(handle)
+        fields = {normalize(value): value for value in (reader.fieldnames or [])}
+        if not fields.get('نام') and not fields.get('name'):
+            raise UserError('فایل اصلاحات باید ستون name یا نام داشته باشد.')
+        result, seen = {}, set()
+        name_field = fields.get('نام') or fields.get('name')
+        for raw in reader:
+            name = text(raw.get(name_field, ''), 'نام اصلاحات')
+            key = normalize(name)
+            if key in seen:
+                raise UserError('نام تکراری در فایل اصلاحات: ' + name)
+            seen.add(key)
+            item = {'name': name}
+            for key_name, aliases in (('attended', ('جلسات آمده', 'attended')),
+                                      ('paid', ('جلسات پرداخت شده', 'جلسات پرداخت', 'paid'))):
+                field = next((fields[a] for a in aliases if a in fields), None)
+                if field and str(raw.get(field, '')).strip():
+                    item[key_name] = _sheet_int(raw[field], f'{key_name} {name}')
+            debt_field = next((fields[a] for a in ('مجموع بدهکاری', 'مجموع', 'debt') if a in fields), None)
+            if debt_field and str(raw.get(debt_field, '')).strip():
+                item['debt'] = _sheet_int(raw[debt_field], f'بدهی {name}') * 1000
+            if 'attended' not in item or 'paid' not in item:
+                raise UserError(f'اصلاح {name} باید attended و paid داشته باشد.')
+            expected = (item['attended'] - item['paid']) * fee
+            if 'debt' in item and item['debt'] != expected:
+                raise UserError(f'بدهی اصلاحی {name} با attended و paid نمی‌خواند.')
+            item['debt'] = expected
+            result[key] = item
+    return result
+
+
+def read_workbook(path, fee, overrides=None):
     """Return ``[{'name', 'attended', 'paid', 'debt'}]`` from the account sheet.
 
-    ``debt`` is always ``(attended - paid) * fee``.  A debt cell that is filled
-    in but disagrees with that formula means the sheet contradicts itself, so
-    the import stops instead of choosing one of the two numbers.
+    ``overrides`` is an explicit correction CSV path; corrected rows are merged
+    after workbook validation and may add approved people.
     """
     rows = xlsx_rows(path)
     header = {_header(value): column for column, value in rows[0].items()
@@ -154,6 +192,14 @@ def read_workbook(path, fee):
         result.append({'name': name, 'attended': attended, 'paid': paid, 'debt': expected})
     if not result:
         raise UserError('اکسل هیچ بازیکنی ندارد.')
+    if overrides:
+        corrections = read_overrides(overrides, fee)
+        by_name = {normalize(row['name']): row for row in result}
+        for key, correction in corrections.items():
+            if key in by_name:
+                by_name[key].update(correction)
+            else:
+                result.append(correction)
     return result
 
 

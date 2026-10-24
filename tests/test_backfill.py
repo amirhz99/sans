@@ -6,6 +6,7 @@ from zipfile import ZipFile
 from app.backfill import (apply_payments, apply_sessions, format_reconcile, marked_sessions,
                           paid_total, read_plan, read_workbook, reconcile)
 from app.db import Database
+from app.main import build_parser, check_modifiers
 from app.service import Service, UserError
 
 # The ten Fridays the operator confirmed for 1405 (SPEC-022).
@@ -109,6 +110,21 @@ class BackfillCase(unittest.TestCase):
             self.db.one('SELECT COALESCE(SUM(amount),0) n FROM ledger')['n'],
         )
 class WorkbookTests(BackfillCase):
+    def test_explicit_overrides_replace_rows_and_can_add_approved_player(self):
+        workbook = self.workbook([HEADER, ['علی', 3, 1, 300], ['رضا', 2, 0, 300]])
+        overrides = self.file('overrides.csv',
+                             'name,attended,paid,debt\nعلی,4,1,450\nسارا,7,2,750\n')
+        rows = read_workbook(workbook, 150000, overrides)
+        self.assertEqual([(row['name'], row['attended'], row['paid'], row['debt']) for row in rows],
+                         [('علی', 4, 1, 450000), ('رضا', 2, 0, 300000),
+                          ('سارا', 7, 2, 750000)])
+
+    def test_an_override_with_inconsistent_debt_fails_closed(self):
+        workbook = self.workbook([HEADER, ['علی', 3, 1, 300]])
+        overrides = self.file('bad-overrides.csv', 'name,attended,paid,debt\nعلی,4,1,300\n')
+        with self.assertRaises(UserError):
+            read_workbook(workbook, 150000, overrides)
+
     def test_debt_is_the_formula_and_a_mismatch_names_the_row(self):
         path = self.workbook([HEADER, ['مهیار', 10, 2, 1200], ['ایلانلو', 1, 1, ''],
                               ['قامتی', 1, 0, '']])
@@ -398,3 +414,19 @@ class ReconcileTests(BackfillCase):
         self.assertFalse(unmarked['ok'])
         # No import has run in this database, so nothing is marked yet.
         self.assertEqual(marked_sessions(self.db), [])
+
+
+class CliTests(unittest.TestCase):
+    def test_the_override_file_is_a_modifier_not_a_command(self):
+        """``--workbook-overrides`` must travel with the command it corrects."""
+        parser = build_parser()
+        for command in ('--reconcile', '--import-payments'):
+            parsed = parser.parse_args([command, 'account.xlsx',
+                                        '--workbook-overrides', 'overrides.csv'])
+            self.assertEqual(parsed.workbook_overrides, Path('overrides.csv'))
+            check_modifiers(parsed)
+        parsed = parser.parse_args(['--import-sessions', 'roster.csv', '--dry-run'])
+        self.assertIsNone(parsed.workbook_overrides)
+        self.assertTrue(parsed.dry_run)
+        with self.assertRaises(UserError):
+            check_modifiers(parser.parse_args(['--workbook-overrides', 'overrides.csv']))
