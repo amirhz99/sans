@@ -7,10 +7,7 @@ import logging
 import os
 import sqlite3
 import time
-from decimal import Decimal, InvalidOperation
 from contextlib import contextmanager
-from zipfile import ZipFile
-from xml.etree import ElementTree as ET
 from pathlib import Path
 
 from .bot import Bot
@@ -19,6 +16,12 @@ from .config import Config, ROOT, load_env
 from .db import Database
 from .service import UserError, integer, normalize, text
 from .turns import TurnBuffer
+# SPEC-022: the workbook reader, the roster importer and the reconcile gate live
+# in their own module; the legacy snapshot path below only wrapper-calls them.
+from .backfill import (PERIOD, SESSION_HOUR, VENUE_COST, apply_payments,
+                       apply_sessions, format_payments, format_reconcile,
+                       format_sessions, read_plan, read_workbook, reconcile,
+                       workbook_amount, xlsx_rows)
 
 LOG = logging.getLogger('sans')
 ACKNOWLEDGEMENT = 'پیامتان دریافت شد؛ در حال بررسی هستم…'
@@ -40,6 +43,17 @@ def coalesce_seconds():
         return TURN_COALESCE_SECONDS
 
 
+def aliases(values):
+    """Parse ``--alias "roster name=stored name"`` into a mapping (SPEC-022)."""
+    result = {}
+    for value in values or []:
+        roster, separator, stored = str(value).partition('=')
+        if not separator or not roster.strip() or not stored.strip():
+            raise UserError('هر --alias باید به شکل "نام لیست=نام ذخیره‌شده" باشد.')
+        result[roster.strip()] = stored.strip()
+    return result
+
+
 @contextmanager
 def instance_lock(database):
     """Only one poller/importer may change this installation at a time (Linux)."""
@@ -57,77 +71,28 @@ def instance_lock(database):
 
 
 def _xlsx_rows(path):
-    """Read the small, plain XLSX workbook used for the football account snapshot."""
-    namespace = {'m': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-    with ZipFile(path) as workbook:
-        shared = []
-        if 'xl/sharedStrings.xml' in workbook.namelist():
-            root = ET.fromstring(workbook.read('xl/sharedStrings.xml'))
-            for item in root.findall('m:si', namespace):
-                shared.append(''.join(node.text or '' for node in item.iter(
-                    '{%s}t' % namespace['m'])))
-        sheet_names = [name for name in workbook.namelist()
-                       if name.startswith('xl/worksheets/') and name.endswith('.xml')]
-        if not sheet_names:
-            raise UserError('فایل Excel هیچ شیتی ندارد.')
-        root = ET.fromstring(workbook.read(sorted(sheet_names)[0]))
-        rows = []
-        for row in root.findall('.//m:sheetData/m:row', namespace):
-            values = {}
-            for cell in row.findall('m:c', namespace):
-                reference = cell.attrib.get('r', '')
-                column = ''.join(char for char in reference if char.isalpha())
-                value = cell.find('m:v', namespace)
-                value = None if value is None else value.text
-                if cell.attrib.get('t') == 's' and value is not None:
-                    try:
-                        value = shared[int(value)]
-                    except (IndexError, ValueError):
-                        raise UserError('رشتهٔ مشترک نامعتبر در فایل Excel.') from None
-                elif cell.attrib.get('t') == 'inlineStr':
-                    value = ''.join(node.text or '' for node in cell.iter(
-                        '{%s}t' % namespace['m']))
-                values[column] = value
-            if values:
-                rows.append(values)
-    if not rows:
-        raise UserError('فایل Excel خالی است.')
-    return rows
+    """SPEC-022: the workbook reader now lives in ``app/backfill.py``."""
+    return xlsx_rows(path)
 
 
 def _workbook_amount(value, sessions, name):
-    """Return تومان; Excel's non-empty debt column is expressed in هزار تومان."""
-    if value is None or not str(value).strip():
-        count = integer(sessions, 'جلسات آمده', 0, 10000)
-        return count * 150000
+    """Return تومان for one snapshot row; the debt column is in هزار تومان.
+
+    SPEC-022 fixed this helper: it used to ignore the paid column, so a fully
+    paid row («ایلانلو», 1 attended and 1 paid) became 150,000 T of debt.
+    """
     try:
-        units = Decimal(str(value).replace(',', '').replace('٬', '').strip())
-    except InvalidOperation:
-        raise UserError(f'مبلغ بدهی {name} در Excel معتبر نیست.') from None
-    if units != units.to_integral_value() or units < 0:
-        raise UserError(f'مبلغ بدهی {name} در Excel باید عدد صحیح مثبت یا صفر باشد.')
-    return integer(int(units) * 1000, 'بدهی اولیه', 0)
+        return workbook_amount(value, sessions, 0, 150000)
+    except UserError as exc:
+        raise UserError(f'{exc} (ردیف {name})') from None
 
 
 def _read_xlsx_players(path):
-    rows = _xlsx_rows(path)
-    header = rows[0]
-    columns = {str(value).replace('\u200c', ' ').strip(): column
-               for column, value in header.items() if value is not None}
-    required = {'نام   (تا 16 مرداد - 10 جلسه)', 'جلسات آمده', 'مجموع  بدهکاری'}
-    if not required <= set(columns):
-        raise UserError('Excel باید ستون‌های نام، جلسات آمده و مجموع بدهکاری را داشته باشد.')
+    """SPEC-022: read the snapshot columns into the legacy import shape."""
     result = []
-    for row in rows[1:]:
-        raw_name = row.get(columns['نام   (تا 16 مرداد - 10 جلسه)'])
-        if raw_name is None or not str(raw_name).strip():
-            continue
-        name = text(str(raw_name), 'نام')
-        sessions = row.get(columns['جلسات آمده'])
-        if sessions is None or not str(sessions).strip():
-            raise UserError(f'تعداد جلسات {name} در Excel خالی است.')
-        amount = _workbook_amount(row.get(columns['مجموع  بدهکاری']), sessions, name)
-        result.append({'name': name, 'opening_balance': amount, 'note': 'بدهی تا آخر شهریور'})
+    for row in read_workbook(path, 150000):
+        result.append({'name': row['name'], 'opening_balance': row['debt'],
+                       'note': f'بدهی تا {PERIOD}'})
     return result
 
 
@@ -365,9 +330,28 @@ def main():
     commands = parser.add_mutually_exclusive_group()
     commands.add_argument('--init', action='store_true', help='Initialize database, no credentials needed')
     commands.add_argument('--import-players', type=Path, metavar='CSV_OR_XLSX')
+    commands.add_argument('--import-sessions', type=Path, metavar='ROSTER_CSV',
+                          help='SPEC-022: create/repair the real sessions and apply the roster')
+    commands.add_argument('--import-payments', type=Path, metavar='WORKBOOK_XLSX',
+                          help='SPEC-022: bring every payment to the workbook column')
+    commands.add_argument('--reconcile', type=Path, metavar='WORKBOOK_XLSX',
+                          help='SPEC-022: read-only diff of the ledger against the workbook; writes nothing')
     commands.add_argument('--backup', type=Path, metavar='DESTINATION', help='Create consistent SQLite backup')
     commands.add_argument('--discover-ids', action='store_true', help='Show IDs from recent messages; only BALE_BOT_TOKEN needed')
     commands.add_argument('--logs', type=int, nargs='?', const=30, metavar='N', help='Show last N agent trace logs from database')
+    # SPEC-022 modifiers belong to the command above them, not to the group.
+    parser.add_argument('--dry-run', action='store_true',
+                        help='SPEC-022: report what would change and roll it back')
+    parser.add_argument('--alias', action='append', default=[], metavar='ROSTER=STORED',
+                        help='SPEC-022: a roster name that belongs to an existing player')
+    parser.add_argument('--allow-new', action='append', default=[], metavar='NAME',
+                        help='SPEC-022: create this name even though it resembles another player')
+    parser.add_argument('--session-fee', type=int, default=150000, metavar='TOMAN',
+                        help='SPEC-022: fee per person (default 150000)')
+    parser.add_argument('--venue-cost', type=int, default=VENUE_COST, metavar='TOMAN',
+                        help='SPEC-022: hall cost per session (default 2500000)')
+    parser.add_argument('--hour', default=SESSION_HOUR, metavar='HH:MM',
+                        help='SPEC-022: session start time in Tehran (default 16:30)')
     args = parser.parse_args()
     load_env()
     path = args.database or Path(os.getenv('DATABASE_PATH', 'data/sans.sqlite3'))
@@ -412,6 +396,23 @@ def main():
                     print('Database initialized:', path)
                 elif args.import_players:
                     print('Imported rows:', import_players(db, args.import_players))
+                elif args.import_sessions:
+                    plan = read_plan(args.import_sessions, args.hour)
+                    report = apply_sessions(db, plan, aliases=aliases(args.alias),
+                                            allow_new=args.allow_new, dry_run=args.dry_run,
+                                            fee=args.session_fee, venue_cost=args.venue_cost)
+                    print(format_sessions(report))
+                elif args.import_payments:
+                    rows = read_workbook(args.import_payments, args.session_fee)
+                    report = apply_payments(db, rows, args.session_fee, dry_run=args.dry_run,
+                                            aliases=aliases(args.alias), allow_new=args.allow_new)
+                    print(format_payments(report))
+                elif args.reconcile:
+                    rows = read_workbook(args.reconcile, args.session_fee)
+                    result = reconcile(db, rows, args.session_fee)
+                    print(format_reconcile(result))
+                    if not result['ok']:
+                        raise UserError('حساب‌ها با اکسل نمی‌خوانند؛ جدول بالا را ببینید.')
                 elif args.backup:
                     destination = args.backup.resolve()
                     if destination.exists():

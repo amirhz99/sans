@@ -7,3 +7,5 @@ data/
 *.sqlite3*
 *.log
 /players.csv
+*.xlsx
+*.xls
