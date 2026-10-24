@@ -263,11 +263,15 @@ python3 /root/sans/run.py --import-players '/root/sans/football-account(1).xlsx'
 Snapshot برای دورهٔ «تا ۱۶ مرداد ۱۴۰۵» کافی نیست، چون نمی‌گوید کدام بدهی برای کدام سانس است. جای آن، ده سانس واقعی ساخته می‌شود و حضور و پرداخت از روی همان لیست و همان اکسل می‌آید:
 
 ```bash
+systemctl --user stop sans-bot.service
 python3 /root/sans/run.py --import-sessions /root/sans/data/sessions.csv --dry-run
 python3 /root/sans/run.py --import-sessions /root/sans/data/sessions.csv
 python3 /root/sans/run.py --import-payments '/root/sans/football-account.xlsx'
 python3 /root/sans/run.py --reconcile '/root/sans/football-account.xlsx'
+systemctl --user start sans-bot.service
 ```
+
+این چهار فرمان هم مثل بکاپ قفل نصب را می‌گیرند، پس ربات باید متوقف باشد؛ وگرنه با «ربات یا ابزار ورود اطلاعات دیگری در حال اجراست» رد می‌شوند.
 
 قالب آمادهٔ لیست حضور در `examples/sessions-template.csv` است: ردیف اول نام‌ها (همان ۵۱ نام اکسل) و ستون‌های بعدی تاریخ سانس‌ها. هر خانهٔ پر یعنی آن نفر در آن سانس بوده و عدد داخلش تعداد مهمان اوست؛ خانهٔ خالی یعنی نبوده. `x`، `✓`، `حاضر` و `بله` هم یعنی «بدون مهمان»، و `-` یا `غایب` یعنی نبوده. قالب بلند `date,name,guests` هم پذیرفته می‌شود.
 
