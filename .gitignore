@@ -2,7 +2,8 @@
 __pycache__/
 *.py[cod]
 .venv/
-data/
+data/*
+!data/guest-links.csv
 /logs/
 *.sqlite3*
 *.log

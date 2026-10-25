@@ -30,7 +30,30 @@ CREATE TABLE IF NOT EXISTS attendance (
     session_id INTEGER NOT NULL REFERENCES sessions(id),
     player_id INTEGER NOT NULL REFERENCES players(id),
     guests INTEGER NOT NULL DEFAULT 0 CHECK(guests >= 0),
+    -- SPEC-024: 1 when the player attended himself, 0 when the row only carries
+    -- his guests.  The default keeps every pre-existing row on today's rule.
+    own INTEGER NOT NULL DEFAULT 1 CHECK(own IN (0, 1)),
     PRIMARY KEY(session_id, player_id)
+);
+-- SPEC-024: who the guests were, when the operator knows it.  Descriptive only:
+-- ``attendance.guests`` stays authoritative for the money.
+CREATE TABLE IF NOT EXISTS attendance_guests (
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    host_id INTEGER NOT NULL REFERENCES players(id),
+    name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(session_id, host_id, normalized_name)
+);
+-- SPEC-024: idempotency registry of the explicit guest migration.  A migrated
+-- guest keeps its name, so the key is the name and the original session.
+CREATE TABLE IF NOT EXISTS guest_migrations (
+    guest_name TEXT NOT NULL,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    host_id INTEGER NOT NULL REFERENCES players(id),
+    destination_session_id INTEGER NOT NULL REFERENCES sessions(id),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(guest_name, session_id)
 );
 CREATE TABLE IF NOT EXISTS ledger (
     id INTEGER PRIMARY KEY,

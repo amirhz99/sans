@@ -19,8 +19,9 @@ from .turns import TurnBuffer
 # SPEC-022: the workbook reader, the roster importer and the reconcile gate live
 # in their own module; the legacy snapshot path below only wrapper-calls them.
 from .backfill import (PERIOD, SESSION_HOUR, VENUE_COST, apply_payments,
-                       apply_sessions, format_payments, format_reconcile,
-                       format_sessions, read_plan, read_workbook, reconcile,
+                       apply_sessions, format_guest_migration, format_payments,
+                       format_reconcile, format_sessions, migrate_guests, read_guest_links,
+                       read_plan, read_workbook, reconcile,
                        workbook_amount, xlsx_rows)
 
 LOG = logging.getLogger('sans')
@@ -336,6 +337,8 @@ def build_parser():
     commands.add_argument('--import-players', type=Path, metavar='CSV_OR_XLSX')
     commands.add_argument('--import-sessions', type=Path, metavar='ROSTER_CSV',
                           help='SPEC-022: create/repair the real sessions and apply the roster')
+    commands.add_argument('--migrate-guests', type=Path, metavar='LINKS_CSV',
+                          help='SPEC-024: move explicit guests onto their host account')
     commands.add_argument('--import-payments', type=Path, metavar='WORKBOOK_XLSX',
                           help='SPEC-022: bring every payment to the workbook column')
     commands.add_argument('--reconcile', type=Path, metavar='WORKBOOK_XLSX',
@@ -426,6 +429,10 @@ def main():
                                             allow_new=args.allow_new, dry_run=args.dry_run,
                                             fee=args.session_fee, venue_cost=args.venue_cost)
                     print(format_sessions(report))
+                elif args.migrate_guests:
+                    report = migrate_guests(db, read_guest_links(args.migrate_guests),
+                                            dry_run=args.dry_run)
+                    print(format_guest_migration(report))
                 elif args.import_payments:
                     rows = read_workbook(args.import_payments, args.session_fee, args.workbook_overrides)
                     report = apply_payments(db, rows, args.session_fee, dry_run=args.dry_run,

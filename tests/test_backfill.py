@@ -4,7 +4,8 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from app.backfill import (apply_payments, apply_sessions, format_reconcile, marked_sessions,
-                          paid_total, read_plan, read_workbook, reconcile)
+                          migrate_guests, paid_total, read_guest_links, read_plan,
+                          read_workbook, reconcile)
 from app.db import Database
 from app.main import build_parser, check_modifiers
 from app.service import Service, UserError
@@ -89,7 +90,9 @@ class BackfillCase(unittest.TestCase):
                 self.db.execute('UPDATE sessions SET session_at=? WHERE id=?', (session_at, row['id']))
             for name, count in players or []:
                 player = self.service.ensure_player(name)
-                self.db.execute('INSERT INTO attendance VALUES (?,?,?)',
+                # SPEC-024: the roster path always means «the player came».
+                self.db.execute('INSERT INTO attendance(session_id,player_id,guests,own) '
+                                'VALUES (?,?,?,1)',
                                 (row['id'], player['id'], count))
                 self.db.execute(
                     'INSERT INTO ledger(player_id,session_id,amount,note,source) VALUES (?,?,?,?,?)',
@@ -430,3 +433,132 @@ class CliTests(unittest.TestCase):
         self.assertTrue(parsed.dry_run)
         with self.assertRaises(UserError):
             check_modifiers(parser.parse_args(['--workbook-overrides', 'overrides.csv']))
+
+class GuestLinkTests(BackfillCase):
+    def test_links_are_explicit_and_mostly_natural(self):
+        path = self.file('links.csv', 'guest,host,rule\nایمان,محمد,nearest\n')
+        self.assertEqual(read_guest_links(path)[0]['host'], 'محمد')
+        bad = self.file('bad-links.csv', 'guest,host\nمهمان نواز,نواز\n')
+        with self.assertRaises(UserError):
+            read_guest_links(bad)
+
+
+class GuestMigrationTests(BackfillCase):
+    """SPEC-024: a guest lives on the host's account, never on its own."""
+
+    def dates(self, **titles):
+        with self.db.conn:
+            for title, stamp in titles.items():
+                self.db.execute('UPDATE sessions SET session_at=? WHERE title=?', (stamp, title))
+
+    def test_guest_lands_on_host_and_player_row_disappears(self):
+        session = self.session('سانس مشترک', 'مشترک', players=[('میزبان', 0), ('مهمان', 0)])
+        guest_id = self.service.player('مهمان')['id']
+        before = self.counts()
+        report = migrate_guests(self.db, [{'guest': 'مهمان', 'host': 'میزبان'}])
+        host = self.service.player('میزبان')
+        self.assertEqual([(item['guest'], item['to']) for item in report['moved']],
+                         [('مهمان', session['id'])])
+        self.assertEqual(report['removed_players'], 1)
+        # The guest has no account, no attendance and no ledger row of its own.
+        self.assertIsNone(self.db.one('SELECT 1 FROM players WHERE id=?', (guest_id,)))
+        self.assertIsNone(self.db.one('SELECT 1 FROM ledger WHERE player_id=?', (guest_id,)))
+        row = self.db.one('SELECT * FROM attendance WHERE session_id=? AND player_id=?',
+                          (session['id'], host['id']))
+        self.assertEqual((row['own'], row['guests']), (1, 1))
+        self.assertEqual(self.service.guest_names(session['id'], host['id']), ['مهمان'])
+        self.assertEqual(self.service.balance(host['id']), 300000)
+        self.assertEqual(self.counts()[3], before[3])
+        self.assertEqual(self.counts()[4], before[4])
+
+    def test_moves_to_nearest_host_and_earlier_tie_preserving_ledger(self):
+        self.session('سانس اول', 'اول', players=[('میزبان', 0)])
+        self.session('سانس مهمان', 'مهمان', players=[('مهمان', 0)])
+        self.session('سانس سوم', 'سوم', players=[('میزبان', 0)])
+        self.dates(**{'سانس اول': '2026-01-02T16:30+03:30',
+                      'سانس مهمان': '2026-01-03T16:30+03:30',
+                      'سانس سوم': '2026-01-04T16:30+03:30'})
+        before = self.counts()
+        report = migrate_guests(self.db, [{'guest': 'مهمان', 'host': 'میزبان'}])
+        first = self.db.one("SELECT id FROM sessions WHERE title='سانس اول'")['id']
+        third = self.db.one("SELECT id FROM sessions WHERE title='سانس سوم'")['id']
+        host = self.service.player('میزبان')
+        # Both neighbours are one day away, so the earlier session wins.
+        self.assertEqual(report['moved'][0]['to'], first)
+        self.assertEqual(self.db.one('SELECT guests FROM attendance WHERE session_id=? AND player_id=?',
+                                     (first, host['id']))['guests'], 1)
+        self.assertEqual(self.db.one('SELECT guests FROM attendance WHERE session_id=? AND player_id=?',
+                                     (third, host['id']))['guests'], 0)
+        # Money followed the person instead of a new charge being posted: not a
+        # single ledger row was added or removed.
+        self.assertEqual(self.counts()[4], before[4])
+        self.assertEqual(self.counts()[3], before[3])
+
+    def test_missing_host_is_created_in_guest_session(self):
+        session = self.session('سانس مهمان', 'مهمان', players=[('مهمان', 0)])
+        before = self.counts()
+        report = migrate_guests(self.db, [{'guest': 'مهمان', 'host': 'خلیل'}])
+        host = self.service.player('خلیل')
+        self.assertIn('خلیل', report['created_hosts'])
+        row = self.db.one('SELECT * FROM attendance WHERE session_id=? AND player_id=?',
+                          (session['id'], host['id']))
+        # The host never played, so only the guest share is charged.
+        self.assertEqual((row['own'], row['guests']), (0, 1))
+        self.assertEqual(self.service.balance(host['id']), 150000)
+        self.assertEqual(self.counts()[3:5], before[3:5])
+
+    def test_two_guests_of_an_absent_host_share_one_guest_only_row(self):
+        self.session('سانس مهمان‌ها', 'مهمان‌ها', players=[('مهمان یک', 0), ('مهمان دو', 0)])
+        report = migrate_guests(self.db, [{'guest': 'مهمان یک', 'host': 'خلیل'},
+                                          {'guest': 'مهمان دو', 'host': 'خلیل'}])
+        host = self.service.player('خلیل')
+        row = self.db.one('SELECT * FROM attendance WHERE player_id=?', (host['id'],))
+        self.assertEqual((row['own'], row['guests']), (0, 2))
+        self.assertEqual(self.service.balance(host['id']), 300000)
+        self.assertEqual(len(report['guest_only_rows']), 2)
+        self.assertEqual(len(self.service.guest_names(row['session_id'], host['id'])), 2)
+
+    def test_repeating_the_migration_changes_nothing(self):
+        self.session('سانس مشترک', 'مشترک', players=[('میزبان', 0), ('مهمان', 0)])
+        migrate_guests(self.db, [{'guest': 'مهمان', 'host': 'میزبان'}])
+        after = self.counts()
+        again = migrate_guests(self.db, [{'guest': 'مهمان', 'host': 'میزبان'}])
+        self.assertEqual((again['moved'], again['posted'], again['removed_players']), ([], 0, 0))
+        self.assertEqual(again['already_done'], 1)
+        self.assertEqual(self.counts(), after)
+
+    def test_a_dry_run_writes_nothing(self):
+        self.session('سانس مشترک', 'مشترک', players=[('میزبان', 0), ('مهمان', 0)])
+        before = self.counts()
+        report = migrate_guests(self.db, [{'guest': 'مهمان', 'host': 'میزبان'}], dry_run=True)
+        self.assertTrue(report['dry_run'])
+        self.assertEqual(self.counts(), before)
+        self.assertFalse(self.db.all('SELECT * FROM guest_migrations'))
+        self.assertFalse(self.db.all('SELECT * FROM attendance_guests'))
+
+    def test_an_unknown_guest_fails_closed(self):
+        self.session('سانس مشترک', 'مشترک', players=[('میزبان', 0)])
+        before = self.counts()
+        with self.assertRaises(UserError):
+            migrate_guests(self.db, [{'guest': 'ناشناس', 'host': 'میزبان'}])
+        self.assertEqual(self.counts(), before)
+
+
+class GuestReconcileTests(BackfillCase):
+    """SPEC-024: the workbook still lists the guest, so the row folds on the host."""
+
+    def test_reconcile_folds_a_migrated_guest_into_its_host(self):
+        session = self.session('سانس مشترک', 'مشترک', players=[('میزبان', 0), ('مهمان', 0)])
+        path = self.workbook([HEADER, ['میزبان', 1, 0, 150], ['مهمان', 1, 0, 150]])
+        rows = read_workbook(path, 150000)
+        before = reconcile(self.db, rows, 150000, session_ids=[session['id']])
+        self.assertTrue(before['ok'])
+        migrate_guests(self.db, [{'guest': 'مهمان', 'host': 'میزبان'}])
+        after = reconcile(self.db, rows, 150000, session_ids=[session['id']])
+        self.assertEqual(after['missing'], [])
+        self.assertEqual(after['extra'], [])
+        self.assertEqual(after['rows'][0]['name'], 'میزبان')
+        self.assertEqual((after['rows'][0]['attended'], after['rows'][0]['sheet_attended']), (2, 2))
+        self.assertEqual(after['sheet_total'], 300000)
+        self.assertEqual(after['ledger_total'], 300000)
+        self.assertTrue(after['ok'])

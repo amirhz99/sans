@@ -43,6 +43,18 @@ class Database:
         player_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(players)')}
         if 'phone' not in player_columns:
             self.conn.execute("ALTER TABLE players ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
+        # SPEC-024: ``own`` distinguishes «the player came» from «only his guests
+        # came».  Default 1 keeps every existing row on the old billing rule.
+        attendance_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(attendance)')}
+        if 'own' not in attendance_columns:
+            self.conn.execute('ALTER TABLE attendance ADD COLUMN own INTEGER NOT NULL DEFAULT 1')
+        # SPEC-024 replaced the SPEC-023 migration registry (keyed by a player id
+        # that no longer exists after the move) with a name-keyed one.
+        migration_columns = {row['name'] for row in
+                             self.conn.execute('PRAGMA table_info(guest_migrations)')}
+        if 'guest_id' in migration_columns:
+            self.conn.execute('DROP TABLE guest_migrations')
+            self.conn.executescript(Path(__file__).with_name('schema.sql').read_text())
         # SPEC-019: an outreach recipient is a private chat, not always a player
         # (somebody who only started the bot), so ``player_id`` must be nullable
         # and the Bale user id is stored next to it.  SQLite cannot relax a

@@ -3177,3 +3177,113 @@ class FirstContactTests(BaseCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class GuestNameTests(BaseCase):
+    """SPEC-024: a guest name is optional, and it never moves money."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.session = self.service.session('current', draft=True)
+        self.player = self.service.player('#1')
+
+    def row(self):
+        return self.db.one('SELECT * FROM attendance WHERE session_id=? AND player_id=?',
+                           (self.session['id'], self.player['id']))
+
+    def test_names_are_stored_next_to_the_count_and_change_no_money(self):
+        self.apply('attendance', session='current', player='#1', guests=2,
+                   guest_names=['رضا', 'سارا'])
+
+        row = self.row()
+        # The roster rule is untouched: the player came, two guests with him.
+        self.assertEqual((row['own'], row['guests']), (1, 2))
+        self.assertEqual(self.service.guest_names(self.session['id'], self.player['id']),
+                         ['رضا', 'سارا'])
+        # Attendance alone still creates no debt.
+        self.assertEqual(self.service.balance(self.player['id']), 0)
+
+    def test_a_list_of_names_is_a_valid_way_to_state_the_count(self):
+        self.apply('attendance', session='current', player='#1',
+                   guest_names=['رضا', 'سارا', 'مینا'])
+
+        self.assertEqual(self.row()['guests'], 3)
+
+    def test_more_names_than_guests_fails_closed(self):
+        with self.assertRaises(UserError):
+            self.service.prepare('attendance', {'session': self.session['id'], 'player': '#1',
+                                                'guests': 1, 'guest_names': ['رضا', 'سارا']})
+
+        self.assertFalse(self.db.all('SELECT * FROM attendance'))
+        self.assertFalse(self.db.all('SELECT * FROM attendance_guests'))
+
+    def test_a_duplicate_or_empty_name_fails_closed(self):
+        for names in (['رضا', ' رضا '], ['رضا', '']):
+            with self.assertRaises(UserError):
+                self.service.prepare('attendance', {'session': self.session['id'], 'player': '#1',
+                                                    'guests': 2, 'guest_names': names})
+        self.assertFalse(self.db.all('SELECT * FROM attendance_guests'))
+
+    def test_removing_attendance_removes_guest_names(self):
+        self.apply('attendance', session='current', player='#1', guests=1, guest_names=['رضا'])
+        self.assertEqual(len(self.service.guest_names(self.session['id'], self.player['id'])), 1)
+
+        self.apply('attendance', session='current', player='#1', present=False)
+
+        self.assertFalse(self.db.all('SELECT * FROM attendance'))
+        self.assertFalse(self.db.all('SELECT * FROM attendance_guests'))
+
+    def test_the_admin_view_shows_the_guest_names(self):
+        self.apply('attendance', session='current', player='#1', guests=2,
+                   guest_names=['رضا', 'سارا'])
+
+        text = SessionView(self.service).render(self.service.session('current'),
+                                                ResponseLevel.FULL, True)
+
+        self.assertIn('رضا', text)
+        self.assertIn('سارا', text)
+
+    def test_the_finalize_preview_names_the_guests_and_keeps_the_formula(self):
+        self.apply('attendance', session='current', player='#1', guests=1, guest_names=['رضا'])
+        prepared = self.service.prepare('finalize', {'session': self.session['id']})
+
+        preview = self.service.preview(prepared)
+
+        self.assertIn('رضا', preview)
+        self.assertIn('300,000', preview)   # 1 + 1 guest
+
+
+class GuestOwnShareTests(BaseCase):
+    """SPEC-024: a host who was absent pays for his guest only."""
+
+    def test_an_absent_host_charges_the_guest_share_alone(self):
+        self.seed()
+        session = self.service.session('current', draft=True)
+        player = self.service.player('#1')
+        with self.db.conn:
+            self.db.execute('INSERT INTO attendance(session_id,player_id,guests,own) VALUES (?,?,1,0)',
+                            (session['id'], player['id']))
+            self.db.execute('INSERT INTO attendance_guests(session_id,host_id,name,normalized_name) '
+                            'VALUES (?,?,?,?)',
+                            (session['id'], player['id'], 'رضا', normalize('رضا')))
+
+        self.apply('finalize', session=session['id'])
+
+        self.assertEqual(self.service.balance(player['id']), 150000)
+        note = self.db.one('SELECT note FROM ledger WHERE player_id=?', (player['id'],))['note']
+        self.assertIn('میزبان حاضر نبود', note)
+        self.assertIn('رضا', note)
+
+    def test_saving_attendance_again_means_the_player_came(self):
+        self.seed()
+        session = self.service.session('current', draft=True)
+        player = self.service.player('#1')
+        with self.db.conn:
+            self.db.execute('INSERT INTO attendance(session_id,player_id,guests,own) VALUES (?,?,1,0)',
+                            (session['id'], player['id']))
+
+        self.apply('attendance', session='current', player='#1', guests=1)
+
+        row = self.db.one('SELECT * FROM attendance WHERE session_id=? AND player_id=?',
+                          (session['id'], player['id']))
+        self.assertEqual(row['own'], 1)

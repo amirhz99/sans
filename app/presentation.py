@@ -32,9 +32,18 @@ class SessionView:
             lines += [f"هزینهٔ زمین: {session['venue_cost'] if session['venue_cost'] is not None else 'نامشخص'} تومان",
                       'وضعیت: ' + ('نهایی' if session['finalized'] else 'در انتظار تکمیل / نهایی‌سازی')]
             for attendance in self.service.db.all(
-                    '''SELECT p.name,a.guests FROM attendance a JOIN players p ON p.id=a.player_id
+                    '''SELECT a.player_id,a.guests,a.own,p.name FROM attendance a
+                       JOIN players p ON p.id=a.player_id
                        WHERE a.session_id=? ORDER BY p.id''', (session['id'],)):
-                lines.append(f"• {attendance['name']} + {attendance['guests']} مهمان")
+                if attendance['own']:
+                    line = f"• {attendance['name']} + {attendance['guests']} مهمان"
+                else:
+                    # SPEC-024: the host was absent; only his guests attended.
+                    line = f"• {attendance['name']} (خودش حاضر نبود) + {attendance['guests']} مهمان"
+                names = self.service.guest_names(session['id'], attendance['player_id'])
+                if names:
+                    line += ' (' + '، '.join(names) + ')'
+                lines.append(line)
         return '\n'.join(filter(None, lines))
 
     def for_ref(self, ref=None, level=ResponseLevel.SUMMARY, admin=False) -> str:

@@ -1,0 +1,11 @@
+guest,host,rule,status
+ایمان دوست موحد,محمد مهدی موحد,nearest_host_session,confirmed
+بچه‌های خلیل,خلیل,same_guest_session_if_host_absent,confirmed
+رفیق علی بختیاری,علی بختیاری,nearest_host_session,confirmed
+علیرضا دوست مباشر,امیر مهدی مباشر,nearest_host_session,confirmed
+پارسا پاکزاد شاگرد نژاد,علیرضا نژاد مقدم,nearest_host_session_earlier_tie,confirmed
+ایلیا چالویی شاگرد روستایی,مهدی روستایی,nearest_host_session,confirmed
+ازادی شاگرد نژاد,علیرضا نژاد مقدم,nearest_host_session,confirmed
+میرزااقا دوست هاشمی مدنی,سید علی هاشمی مدنی,nearest_host_session,confirmed
+باجناق میلاد,میلاد قدسی,nearest_host_session_earlier_tie,confirmed
+دوست رضوانیان 5 تیر,علی رضوانیان,nearest_host_session_earlier_tie,confirmed

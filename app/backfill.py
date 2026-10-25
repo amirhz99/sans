@@ -152,6 +152,39 @@ def read_overrides(path, fee):
     return result
 
 
+def read_guest_links(path):
+    """Read the explicit guest/host links for the SPEC-024 migration.
+
+    The file is deliberately declarative: no relationship is inferred from a
+    name.  ``guest`` and ``host`` are required; ``status`` is optional and is
+    retained for operator review.
+    """
+    with Path(path).open(encoding='utf-8-sig', newline='') as handle:
+        reader = csv.DictReader(handle)
+        fields = {normalize(value): value for value in (reader.fieldnames or [])}
+        guest_field = fields.get('guest') or fields.get('مهمان')
+        host_field = fields.get('host') or fields.get('میزبان')
+        if not guest_field or not host_field:
+            raise UserError('فایل مهمان‌ها باید ستون guest و host داشته باشد.')
+        status_field = fields.get('status') or fields.get('وضعیت')
+        result = []
+        seen = set()
+        for raw in reader:
+            guest = text(raw.get(guest_field, ''), 'نام مهمان')
+            host = text(raw.get(host_field, ''), 'نام میزبان')
+            key = normalize(guest)
+            if key in seen:
+                raise UserError('مهمان تکراری در فایل پیوندها: ' + guest)
+            if key == normalize('مهمان نواز'):
+                raise UserError('«مهمان نواز» نباید به‌عنوان مهمان ثبت شود.')
+            if key == normalize(host):
+                raise UserError('مهمان و میزبان نمی‌توانند یک نفر باشند: ' + guest)
+            seen.add(key)
+            result.append({'guest': guest, 'host': host,
+                           'status': (raw.get(status_field, '').strip() if status_field else '')})
+    return result
+
+
 def read_workbook(path, fee, overrides=None):
     """Return ``[{'name', 'attended', 'paid', 'debt'}]`` from the account sheet.
 
@@ -580,7 +613,9 @@ def _apply_attendance(db, wanted, report, fee):
                    db.all('SELECT * FROM attendance WHERE session_id=?', (session_id,))}
         for player_id, guests in target.items():
             if player_id not in current:
-                db.execute('INSERT INTO attendance VALUES (?,?,?)', (session_id, player_id, guests))
+                # SPEC-024: a roster row means the person attended himself.
+                db.execute('INSERT INTO attendance(session_id,player_id,guests,own) VALUES (?,?,?,1)',
+                           (session_id, player_id, guests))
                 report['added'] += 1
             elif current[player_id] != guests:
                 db.execute('UPDATE attendance SET guests=? WHERE session_id=? AND player_id=?',
@@ -671,41 +706,200 @@ def marked_sessions(db):
     return [int(ident) for ident in ids if isinstance(ident, int) or str(ident).isdigit()]
 
 
+def _migrated(db, guest_name, session_id):
+    """Return ``True`` when this guest already left this session (SPEC-024)."""
+    return db.one('SELECT 1 FROM guest_migrations WHERE guest_name=? AND session_id=?',
+                  (guest_name, session_id)) is not None
+
+
+def _guest_host_session(db, host_id, session_at):
+    """Return the host's own attendance row closest to ``session_at``.
+
+    ``own=1`` rows only: a session the host himself played.  An equal distance is
+    resolved by the earlier timestamp, so the previous session always wins.
+    """
+    rows = db.all('''SELECT a.session_id, a.guests, a.own, s.session_at
+                     FROM attendance a JOIN sessions s ON s.id=a.session_id
+                     WHERE a.player_id=? AND a.own=1''', (host_id,))
+    if not rows:
+        return None
+    return min(rows, key=lambda item: (_session_distance(session_at, item['session_at']),
+                                       item['session_at'] or '', item['session_id']))
+
+
+def _retire_guest(db, guest):
+    """Delete an emptied guest account, keeping its name and history (SPEC-024).
+
+    The name stays in ``attendance_guests`` and in the ledger notes, so the
+    operator loses nothing.  An account with a bound chat, a receipt or a pending
+    request is never deleted.
+    """
+    if guest['bale_id'] is not None:
+        return 0
+    for table in ('attendance', 'ledger', 'receipts'):
+        if db.one(f'SELECT 1 FROM {table} WHERE player_id=?', (guest['id'],)):
+            return 0
+    if Service(db).pending_reference(guest['id']):
+        return 0
+    db.execute('DELETE FROM players WHERE id=?', (guest['id'],))
+    db.audit('backfill', 'guest_account_retired', {'player': guest['id'], 'name': guest['name']})
+    return 1
+
+
+def migrate_guests(db, links, dry_run=False):
+    """Move explicitly linked guests under their host's account (SPEC-024).
+
+    A guest never keeps an account of its own.  Its attendance row becomes one
+    guest slot on the host's row in the closest session the host himself
+    attended, and its ledger rows move to the host unchanged, so the ledger total
+    cannot grow.  A host who never attended at all keeps the guest in the guest's
+    own session with ``own=0``, which charges the guest share only.
+    """
+    report = {'dry_run': bool(dry_run), 'moved': [], 'created_hosts': [],
+              'guest_only_rows': [], 'already_done': 0, 'posted': 0, 'removed_players': 0}
+    try:
+        with db.conn:
+            for link in links:
+                guest_name = link['guest']
+                guest = db.one('SELECT * FROM players WHERE normalized_name=?',
+                               (normalize(guest_name),))
+                if not guest:
+                    # A previous run already moved this guest and retired it.
+                    if db.one('SELECT 1 FROM guest_migrations WHERE guest_name=?', (guest_name,)):
+                        report['already_done'] += 1
+                        continue
+                    raise UserError('مهمان در دیتابیس نیست: ' + guest_name)
+                host = db.one('SELECT * FROM players WHERE normalized_name=?',
+                              (normalize(link['host']),))
+                if not host:
+                    host_id = db.execute(
+                        'INSERT INTO players(name,normalized_name) VALUES (?,?)',
+                        (link['host'], normalize(link['host']))).lastrowid
+                    db.audit('backfill', 'guest_host_created',
+                             {'host': host_id, 'name': link['host'], 'guest': guest['id']})
+                    host = db.one('SELECT * FROM players WHERE id=?', (host_id,))
+                    report['created_hosts'].append(link['host'])
+                attendance = db.all(
+                    '''SELECT a.session_id, s.title, s.session_at FROM attendance a
+                       JOIN sessions s ON s.id=a.session_id
+                       WHERE a.player_id=? ORDER BY s.session_at, a.session_id''',
+                    (guest['id'],))
+                for row in attendance:
+                    if _migrated(db, guest_name, row['session_id']):
+                        report['already_done'] += 1
+                        continue
+                    target = _guest_host_session(db, host['id'], row['session_at'])
+                    if target:
+                        destination_id = target['session_id']
+                        db.execute('UPDATE attendance SET guests=guests+1 '
+                                   'WHERE session_id=? AND player_id=?',
+                                   (destination_id, host['id']))
+                    else:
+                        destination_id = row['session_id']
+                        # A guest-only row for this host may already exist here.
+                        existing = db.one('SELECT 1 FROM attendance '
+                                          'WHERE session_id=? AND player_id=?',
+                                          (destination_id, host['id']))
+                        if existing:
+                            db.execute('UPDATE attendance SET guests=guests+1 '
+                                       'WHERE session_id=? AND player_id=?',
+                                       (destination_id, host['id']))
+                        else:
+                            db.execute('INSERT INTO attendance(session_id,player_id,guests,own) '
+                                       'VALUES (?,?,1,0)', (destination_id, host['id']))
+                        report['guest_only_rows'].append(f"{link['host']} در {row['title']}")
+                    db.execute('''INSERT OR IGNORE INTO attendance_guests
+                                  (session_id,host_id,name,normalized_name) VALUES (?,?,?,?)''',
+                               (destination_id, host['id'], guest['name'],
+                                normalize(guest['name'])))
+                    # The money travels with the person: the rows keep their
+                    # amount and their unique audit key, so the total is fixed.
+                    moved = db.execute(
+                        '''UPDATE ledger SET player_id=?, session_id=?
+                           WHERE player_id=? AND (session_id=? OR session_id IS NULL)''',
+                        (host['id'], destination_id, guest['id'], row['session_id'])).rowcount
+                    report['posted'] += moved
+                    db.execute('DELETE FROM attendance WHERE session_id=? AND player_id=?',
+                               (row['session_id'], guest['id']))
+                    db.execute('''INSERT INTO guest_migrations
+                                  (guest_name,session_id,host_id,destination_session_id)
+                                  VALUES (?,?,?,?)''',
+                               (guest_name, row['session_id'], host['id'], destination_id))
+                    report['moved'].append({'guest': guest_name, 'host': host['name'],
+                                            'from': row['session_id'], 'to': destination_id})
+                report['removed_players'] += _retire_guest(db, guest)
+            if dry_run:
+                raise _DryRun()
+    except _DryRun:
+        pass
+    return report
+
+
+def _session_distance(left, right):
+    """Distance between ISO session timestamps, with deterministic fallback."""
+    if not left or not right:
+        return 10**18
+    try:
+        return abs((datetime.fromisoformat(left) - datetime.fromisoformat(right)).total_seconds())
+    except ValueError:
+        return 10**18
+
+
 def reconcile(db, rows, fee, session_ids=None):
-    """Compare the ledger with the workbook.  Read-only: it never writes."""
+    """Compare the ledger with the workbook.  Read-only: it never writes.
+
+    SPEC-024: a workbook row whose name is a registered guest is counted on its
+    host, because the guest no longer owns an account or an attendance row.
+    """
     if session_ids is None:
         session_ids = marked_sessions(db)
     covered = set(session_ids) if session_ids else None
+    hosts = {}
+    for row in db.all('SELECT normalized_name, host_id FROM attendance_guests'):
+        hosts.setdefault(row['normalized_name'], row['host_id'])
     # The workbook counts slots, not rows: a player with two guests counts as
-    # three attended sessions, which is how the operator keeps the sheet.
+    # three attended sessions, and a guest-only row adds its guests alone.
     attended = {}
-    for row in db.all('SELECT session_id, player_id, guests FROM attendance'):
+    for row in db.all('SELECT session_id, player_id, guests, own FROM attendance'):
         if covered is not None and row['session_id'] not in covered:
             continue
-        attended[row['player_id']] = attended.get(row['player_id'], 0) + 1 + row['guests']
-    result = {'rows': [], 'missing': [], 'extra': [], 'ok': True,
-              'session_ids': list(session_ids or []), 'sheet_total': 0}
-    seen = set()
+        attended[row['player_id']] = (attended.get(row['player_id'], 0)
+                                      + row['own'] + row['guests'])
+    # Fold the sheet onto the players that really own the money.
+    wanted, missing = {}, []
     for row in rows:
-        player = db.one('SELECT * FROM players WHERE normalized_name=?', (normalize(row['name']),))
+        key = normalize(row['name'])
+        player = db.one('SELECT id FROM players WHERE normalized_name=?', (key,))
+        host_id = hosts.get(key)
+        if player is None and host_id is None:
+            missing.append(row['name'])
+            continue
+        target = host_id or player['id']
+        item = wanted.setdefault(target, {'name': None, 'attended': 0, 'paid': 0, 'debt': 0})
+        item['attended'] += row['attended']
+        item['paid'] += row['paid']
+        item['debt'] += row['debt']
+    result = {'rows': [], 'missing': missing, 'extra': [], 'ok': not missing,
+              'session_ids': list(session_ids or []), 'sheet_total': 0}
+    for player_id, expected in wanted.items():
+        player = db.one('SELECT * FROM players WHERE id=?', (player_id,))
         if not player:
-            result['missing'].append(row['name'])
+            result['missing'].append(expected['name'] or str(player_id))
             result['ok'] = False
             continue
-        seen.add(player['id'])
         balance = db.one('SELECT COALESCE(SUM(amount),0) n FROM ledger WHERE player_id=?',
-                         (player['id'],))['n']
-        paid = paid_total(db, player['id'])
-        count = attended.get(player['id'], 0)
-        item = {'name': player['name'], 'attended': count, 'sheet_attended': row['attended'],
-                'paid': paid, 'sheet_paid': row['paid'] * fee, 'balance': balance,
-                'sheet_debt': row['debt'], 'diff': balance - row['debt']}
+                         (player_id,))['n']
+        paid = paid_total(db, player_id)
+        count = attended.get(player_id, 0)
+        item = {'name': player['name'], 'attended': count, 'sheet_attended': expected['attended'],
+                'paid': paid, 'sheet_paid': expected['paid'] * fee, 'balance': balance,
+                'sheet_debt': expected['debt'], 'diff': balance - expected['debt']}
         result['rows'].append(item)
-        result['sheet_total'] += row['debt']
-        if item['diff'] or count != row['attended'] or paid != row['paid'] * fee:
+        result['sheet_total'] += expected['debt']
+        if item['diff'] or count != item['sheet_attended'] or paid != item['sheet_paid']:
             result['ok'] = False
     for player in db.all('SELECT * FROM players ORDER BY id'):
-        if player['id'] in seen:
+        if player['id'] in wanted:
             continue
         balance = db.one('SELECT COALESCE(SUM(amount),0) n FROM ledger WHERE player_id=?',
                          (player['id'],))['n']
@@ -761,6 +955,19 @@ def format_sessions(report):
                      + '، '.join(item['name'] for item in report['players_created']))
     if report['blocked']:
         lines.append(_blocked_message(report['blocked']))
+    return '\n'.join(lines)
+
+
+def format_guest_migration(report):
+    lines = []
+    if report['dry_run']:
+        lines.append('حالت آزمایشی: هیچ تغییری در دیتابیس ثبت نشد.')
+    lines.append(f"انتقال‌یافته: {len(report['moved'])}؛ ردیف دفتر منتقل‌شده: {report['posted']}؛ "
+                 f"میزبان ساخته‌شده: {len(report['created_hosts'])}؛ "
+                 f"ردیف «فقط مهمان»: {len(report['guest_only_rows'])}؛ "
+                 f"حساب مهمان حذف‌شده: {report['removed_players']}")
+    for item in report['moved']:
+        lines.append(f"{item['guest']} ← {item['host']}؛ سانس #{item['from']} به #{item['to']}")
     return '\n'.join(lines)
 
 

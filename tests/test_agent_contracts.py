@@ -783,6 +783,34 @@ class AgentContractTests(unittest.TestCase):
         self.assertEqual(self.db.one('SELECT when_text FROM sessions WHERE title=?',
                                      ('سانس قدیمی',))['when_text'], 'پنجشنبه ساعت ۲۱')
 
+    def test_set_attendance_takes_optional_guest_names(self):
+        """SPEC-024: names are descriptive; an impossible list fails closed."""
+        from app.config import Config
+
+        config = Config('t', -100, frozenset({1}), 'https://example.invalid/v1', 'k', 'm',
+                        Path(self.temp.name) / 'contracts.sqlite3')
+        bot = Bot(self.db, config, SimpleNamespace(use_langgraph=True))
+        tools = {t.name: t for t in bot.agent._make_tools(-100, 1, True, {'first_name': 'ادمین'}, {})}
+        manage = tools['manage_records']
+        self.apply('new_session', title='سانس', when_text='فردا ساعت ۲۱')
+        manage.invoke({'operation': 'upsert_players', 'data_json': json.dumps(
+            {'name': 'علی رضایی'}, ensure_ascii=False)})
+        player = self.service.player('علی رضایی')['id']
+
+        # More names than guests is a contradiction, not a silent truncation.
+        result = manage.invoke({'operation': 'set_attendance', 'data_json': json.dumps(
+            {'session': 1, 'attendees': [{'name': 'علی رضایی', 'guests': 1,
+                                          'guest_names': ['رضا', 'سارا']}]}, ensure_ascii=False)})
+        self.assertIn('بیشتر است', result)
+        self.assertFalse(self.db.all('SELECT * FROM attendance'))
+
+        result = manage.invoke({'operation': 'set_attendance', 'data_json': json.dumps(
+            {'session': 1, 'attendees': [{'name': 'علی رضایی', 'guests': 2,
+                                          'guest_names': ['رضا', 'سارا']}]}, ensure_ascii=False)})
+        self.assertIn('ثبت شدند', result)
+        self.assertEqual(self.service.guest_names(1, player), ['رضا', 'سارا'])
+        self.assertEqual(self.db.one('SELECT guests FROM attendance')['guests'], 2)
+
     def test_merge_tool_only_proposes_and_duplicates_are_admin_only(self):
         from app.config import Config
 

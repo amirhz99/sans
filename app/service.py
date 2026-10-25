@@ -410,9 +410,56 @@ class Service:
         usage = {table: self.db.one(f'SELECT COUNT(*) n FROM {table} WHERE player_id=?',
                                     (player_id,))['n']
                  for table in ('attendance', 'ledger', 'receipts')}
+        # SPEC-024: a guest name is a reference too, so a merge must carry it and
+        # a delete must not leave it behind.
+        usage['guest_names'] = self.db.one(
+            'SELECT COUNT(*) n FROM attendance_guests WHERE host_id=?', (player_id,))['n']
         usage['balance'] = self.balance(player_id)
         usage['pending'] = self._pending_reference(player_id, ignore=ignore_pending)
         return usage
+
+    # SPEC-024: a guest name is optional and descriptive; it never moves money.
+    GUEST_NAME_LIMIT = 50
+
+    def guest_names(self, session_id, host_id):
+        """Return the recorded guest names of one host in one session."""
+        return [row['name'] for row in self.db.all(
+            'SELECT name FROM attendance_guests WHERE session_id=? AND host_id=? ORDER BY rowid',
+            (session_id, host_id))]
+
+    def _clean_guest_names(self, raw):
+        """Validate the optional guest-name list, or return ``None``.
+
+        ``None`` means «the caller said nothing about names», which differs from
+        an empty list: only an explicit list replaces what is already stored.
+        """
+        if raw is None:
+            return None
+        if not isinstance(raw, (list, tuple)):
+            raise UserError('نام مهمان‌ها باید فهرست باشد.')
+        names, seen = [], set()
+        for value in raw:
+            name = text(value, 'نام مهمان', limit=self.GUEST_NAME_LIMIT)
+            key = normalize(name)
+            if key in seen:
+                raise UserError('نام مهمان تکراری است: ' + name)
+            seen.add(key)
+            names.append(name)
+        return names
+
+    def _store_guest_names(self, session_id, host_id, names):
+        """Replace the stored names of one attendance row (explicit call only)."""
+        self.db.execute('DELETE FROM attendance_guests WHERE session_id=? AND host_id=?',
+                        (session_id, host_id))
+        for name in names:
+            self.db.execute(
+                'INSERT INTO attendance_guests(session_id,host_id,name,normalized_name) '
+                'VALUES (?,?,?,?)', (session_id, host_id, name, normalize(name)))
+
+
+    def pending_reference(self, *player_ids):
+        """Public form of ``_pending_reference`` for non-interactive callers."""
+        return self._pending_reference(*player_ids)
 
     def _pending_reference(self, *player_ids, ignore=None):
         """Return a pending proposal id that points at one of the players."""
@@ -493,6 +540,24 @@ class Service:
                 self.db.execute('UPDATE attendance SET player_id=? WHERE session_id=? AND player_id=?',
                                 (target['id'], row['session_id'], source['id']))
             moved['attendance'] += 1
+        # SPEC-024: a guest name follows its host, and a duplicate is dropped
+        # instead of breaking the primary key.
+        moved['guest_names'] = 0
+        for row in self.db.all('SELECT session_id, normalized_name FROM attendance_guests '
+                               'WHERE host_id=?', (source['id'],)):
+            clash = self.db.one('SELECT 1 FROM attendance_guests WHERE session_id=? AND host_id=? '
+                                'AND normalized_name=?',
+                                (row['session_id'], target['id'], row['normalized_name']))
+            if clash:
+                self.db.execute('DELETE FROM attendance_guests WHERE session_id=? AND host_id=? '
+                                'AND normalized_name=?',
+                                (row['session_id'], source['id'], row['normalized_name']))
+            else:
+                self.db.execute('UPDATE attendance_guests SET host_id=? WHERE session_id=? '
+                                'AND host_id=? AND normalized_name=?',
+                                (target['id'], row['session_id'], source['id'],
+                                 row['normalized_name']))
+            moved['guest_names'] += 1
         for table in ('ledger', 'receipts'):
             # ``ledger.source`` stays untouched on purpose: it is a unique
             # audit key for the original transaction, not an ownership field.
@@ -515,7 +580,8 @@ class Service:
 
     def _assert_deletable(self, player, ignore_pending=None):
         usage = self.player_usage(player['id'], ignore_pending=ignore_pending)
-        if player['bale_id'] is not None or usage['attendance'] or usage['ledger'] or usage['receipts']:
+        if (player['bale_id'] is not None or usage['attendance'] or usage['ledger']
+                or usage['receipts'] or usage['guest_names']):
             raise UserError(f"«{player['name']}» حضور، تراکنش یا رسید ثبت‌شده دارد و حذف نمی‌شود؛ "
                             'برای حفظ سابقه آن را با بازیکن درست ادغام کنید.')
         if usage['pending']:
@@ -974,7 +1040,20 @@ class Service:
             a['session'] = s['id']
             if action == 'attendance':
                 a['player'] = self.player(args.get('player', ''))['id']
-                a['guests'] = integer(args.get('guests', 0), 'تعداد مهمان', maximum=100)
+                # SPEC-024: names are optional, and a list of names is a valid
+                # way to state the count when the admin did not repeat it.
+                names = self._clean_guest_names(args.get('guest_names'))
+                raw_guests = args.get('guests')
+                if raw_guests is None or (isinstance(raw_guests, str) and not raw_guests.strip()):
+                    guests = len(names or [])
+                else:
+                    guests = integer(raw_guests, 'تعداد مهمان', maximum=100)
+                if names is not None and len(names) > guests:
+                    raise UserError('تعداد نام مهمان‌ها از تعداد مهمان بیشتر است؛ '
+                                    'یا تعداد را اصلاح کنید یا نام‌ها را کم کنید.')
+                a['guests'] = guests
+                if names is not None:
+                    a['guest_names'] = names
                 a['present'] = args.get('present', True)
                 if not isinstance(a['present'], bool):
                     raise UserError('وضعیت حضور معتبر نیست.')
@@ -1191,7 +1270,7 @@ class Service:
         fields = {'name': 'نام', 'title': 'عنوان', 'note': 'توضیح', 'when_text': 'عبارت زمان',
                   'location': 'محل', 'venue_cost': 'هزینهٔ زمین (تومان)', 'person_fee': 'سهم هر نفر (تومان)',
                   'guests': 'تعداد مهمان', 'present': 'حاضر', 'amount': 'مبلغ (مثبت: بدهکار؛ منفی: بستانکار)',
-                  'key': 'تنظیم', 'value': 'مقدار'}
+                  'guest_names': 'نام مهمان‌ها', 'key': 'تنظیم', 'value': 'مقدار'}
         lines = [labels[action]]
         for key, value in a.items():
             if key == 'defaults_used':
@@ -1202,6 +1281,9 @@ class Service:
                 lines.append('سانس: ' + self.session(value)['title'])
             elif key == 'session_at':
                 lines.append('زمان تهران: ' + self.session_at_display(value))
+            elif key == 'guest_names':
+                if value:
+                    lines.append('نام مهمان‌ها: ' + '، '.join(value))
             else:
                 lines.append(f'{fields.get(key, key)}: {value}')
         used = a.get('defaults_used') or []
@@ -1213,9 +1295,15 @@ class Service:
             total = 0
             for row in self.db.all('''SELECT a.*,p.name FROM attendance a JOIN players p ON p.id=a.player_id
                                       WHERE session_id=? ORDER BY p.id''', (s['id'],)):
-                amount = (1 + row['guests']) * s['person_fee']
+                amount = (row['own'] + row['guests']) * s['person_fee']
                 total += amount
-                lines.append(f"{row['name']}: {row['guests']} مهمان، {amount:,} تومان")
+                if row['own']:
+                    lines.append(f"{row['name']}: {row['guests']} مهمان، {amount:,} تومان")
+                else:
+                    lines.append(f"{row['name']}: خودش حاضر نبود، {row['guests']} مهمان، {amount:,} تومان")
+                names = self.guest_names(s['id'], row['player_id'])
+                if names:
+                    lines.append('  مهمان‌ها: ' + '، '.join(names))
             lines.append(f'جمع بدهی جدید: {total:,} تومان؛ هزینهٔ زمین در محاسبه دخالت ندارد.')
         return '\n'.join(lines)
 
@@ -1252,17 +1340,36 @@ class Service:
                     self.db.execute(f'UPDATE sessions SET {key}=? WHERE id=?', (value, a['session']))
         elif action == 'attendance':
             if a['present']:
-                self.db.execute('''INSERT INTO attendance VALUES (?,?,?) ON CONFLICT(session_id,player_id)
-                                   DO UPDATE SET guests=excluded.guests''', (a['session'], a['player'], a['guests']))
+                # SPEC-024: an explicit attendance row means the player came
+                # himself, so a guest-only row is upgraded back to own=1.
+                self.db.execute('''INSERT INTO attendance(session_id,player_id,guests,own)
+                                   VALUES (?,?,?,1) ON CONFLICT(session_id,player_id)
+                                   DO UPDATE SET guests=excluded.guests, own=excluded.own''',
+                                (a['session'], a['player'], a['guests']))
+                if 'guest_names' in a:
+                    self._store_guest_names(a['session'], a['player'], a['guest_names'])
             else:
-                self.db.execute('DELETE FROM attendance WHERE session_id=? AND player_id=?', (a['session'], a['player']))
+                self.db.execute('DELETE FROM attendance WHERE session_id=? AND player_id=?',
+                                (a['session'], a['player']))
+                # No attendance row, no guest names: they must not be orphaned.
+                self.db.execute('DELETE FROM attendance_guests WHERE session_id=? AND host_id=?',
+                                (a['session'], a['player']))
         elif action == 'finalize':
             s = self.session(a['session'], draft=True)
             for row in self.db.all('SELECT * FROM attendance WHERE session_id=?', (s['id'],)):
+                share = row['own'] + row['guests']
+                if not share:
+                    continue
+                note = f"{s['title']}؛ خود فرد + {row['guests']} مهمان. {s['note']}".strip()
+                if not row['own']:
+                    # SPEC-024: the host did not play that evening; his guest did.
+                    note = f"{s['title']}؛ فقط {row['guests']} مهمان (میزبان حاضر نبود). {s['note']}".strip()
+                names = self.guest_names(s['id'], row['player_id'])
+                if names:
+                    note += ' مهمان‌ها: ' + '، '.join(names) + '.'
                 self.db.execute('INSERT INTO ledger(player_id,session_id,amount,note,source) VALUES (?,?,?,?,?)',
-                                (row['player_id'], s['id'], (1 + row['guests']) * s['person_fee'],
-                                 f"{s['title']}؛ خود فرد + {row['guests']} مهمان. {s['note']}",
-                                 f"session:{s['id']}:player:{row['player_id']}"))
+                                (row['player_id'], s['id'], share * s['person_fee'],
+                                 note, f"session:{s['id']}:player:{row['player_id']}"))
             self.db.execute('UPDATE sessions SET finalized=1 WHERE id=?', (s['id'],))
         elif action == 'adjustment':
             self.db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',

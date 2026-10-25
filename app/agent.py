@@ -323,10 +323,11 @@ class SansAgent:
             - 'identify': data_json='{"name": "نام کامل"}' — شمارهٔ کاربر، اگر قبلاً با دکمهٔ
               «ارسال شمارهٔ من» فرستاده شده باشد، خودکار روی کارت ادمین می‌آید؛ آن را از
               کاربر دوباره نپرس و در data_json نگذار.
-            - 'attendance_self': data_json='{"present": true, "guests": 0, "session": ""}'
+            - 'attendance_self': data_json='{"present": true, "guests": 0, "guest_names": ["علی"], "session": ""}'
+              guest_names is optional: only the names the caller actually stated.
             - 'upsert_players': (admin) data_json='{"players": [{"name": "علی رضایی", "note": ""}]}'; a name similar to an existing player is refused unless force=true.
             - 'save_session': (admin) create/update new or historical session; date is accepted as an alias for when_text. Jalali («۹ خرداد ساعت ۲۱», «1405/03/09 21:00») and Gregorian (YYYY-MM-DD) dates are both accepted; a Jalali date without a year uses the current Jalali year.
-            - 'set_attendance': (admin) set present/absent players for a session; unknown names are refused, no player is ever created here.
+            - 'set_attendance': (admin) set present/absent players for a session; unknown names are refused, no player is ever created here. Each attendee may carry guest_names: [{"name":"علی","guests":2,"guest_names":["رضا"]}].
             - 'rename_player': (admin) data_json='{"player": "#15", "name": "نام کامل"}' — keeps the id and the whole history.
             - 'merge_player': (admin) data_json='{"source": "#4", "target": "#15"}' — moves history and builds an approval card.
             - 'delete_player': (admin) data_json='{"player": "#4"}' — only for a player with no history; builds an approval card.
@@ -354,17 +355,30 @@ class SansAgent:
                     s = service.session(data.get('session') or None, draft=True)
                     present = bool(data.get('present', True))
                     guests = integer(data.get('guests', 0), 'تعداد مهمان', 0, 20)
+                    names = service._clean_guest_names(data.get('guest_names'))
+                    if names is not None and len(names) > guests:
+                        return 'تعداد نام مهمان‌ها از تعداد مهمان بیشتر است.'
                     if present:
                         db.execute(
-                            '''INSERT INTO attendance VALUES (?,?,?) ON CONFLICT(session_id,player_id)
-                               DO UPDATE SET guests=excluded.guests''',
+                            '''INSERT INTO attendance(session_id,player_id,guests,own)
+                               VALUES (?,?,?,1) ON CONFLICT(session_id,player_id)
+                               DO UPDATE SET guests=excluded.guests, own=excluded.own''',
                             (s['id'], linked['id'], guests),
                         )
+                        if names is not None:
+                            service._store_guest_names(s['id'], linked['id'], names)
                     else:
-                        db.execute('DELETE FROM attendance WHERE session_id=? AND player_id=?', (s['id'], linked['id']))
-                    db.audit(user_id, 'attendance_self', {'session': s['id'], 'player': linked['id'], 'present': present, 'guests': guests})
+                        db.execute('DELETE FROM attendance WHERE session_id=? AND player_id=?',
+                                   (s['id'], linked['id']))
+                        db.execute('DELETE FROM attendance_guests WHERE session_id=? AND host_id=?',
+                                   (s['id'], linked['id']))
+                    db.audit(user_id, 'attendance_self', {'session': s['id'], 'player': linked['id'],
+                                                          'present': present, 'guests': guests,
+                                                          'guest_names': names or []})
                     effects['last_session_id'] = s['id']
-                    return f"حضور {linked['name']} در «{s['title']}» با وضعیت present={present} و مهمان={guests} ثبت شد."
+                    extra = (' مهمان‌ها: ' + '، '.join(names)) if names else ''
+                    return (f"حضور {linked['name']} در «{s['title']}» با وضعیت present={present} "
+                            f"و مهمان={guests} ثبت شد.{extra}")
 
                 if not admin:
                     return 'خطا: این عملیات مدیریتی فقط برای ادمین مجاز است.'
@@ -455,31 +469,44 @@ class SansAgent:
                     # worse than a clear error, and no player is created here.
                     planned, missing = [], []
                     for item in present:
+                        names = None
                         if isinstance(item, str):
                             p_name, guests = item, 0
                         elif isinstance(item, dict):
-                            extra = set(item) - {'name', 'player', 'guests'}
+                            extra = set(item) - {'name', 'player', 'guests', 'guest_names'}
                             if extra:
                                 return 'کلید ناشناخته در حاضران: ' + '، '.join(sorted(extra))
                             p_name = item.get('name') or item.get('player') or ''
                             guests = integer(item.get('guests', 0), 'مهمان', 0, 50)
+                            try:
+                                names = service._clean_guest_names(item.get('guest_names'))
+                            except UserError as exc:
+                                return str(exc)
+                            if names is not None and len(names) > guests:
+                                return 'تعداد نام مهمان‌ها از تعداد مهمان بیشتر است.'
                         else:
                             continue
                         try:
-                            planned.append((service.player(p_name), guests))
+                            planned.append((service.player(p_name), guests, names))
                         except UserError:
                             missing.append(str(p_name).strip() or '—')
                     if missing:
                         return ('حضور ثبت نشد؛ این نام‌ها در فهرست بازیکنان نیست:\n' + '، '.join(missing) +
                                 '\nاول با upsert_players بازیکن را با نام کامل ثبت کنید یا نام درست را از فهرست انتخاب کنید.')
                     added = []
-                    for p, guests in planned:
+                    for p, guests, names in planned:
                         db.execute(
-                            '''INSERT INTO attendance VALUES (?,?,?) ON CONFLICT(session_id,player_id)
-                               DO UPDATE SET guests=excluded.guests''',
+                            '''INSERT INTO attendance(session_id,player_id,guests,own)
+                               VALUES (?,?,?,1) ON CONFLICT(session_id,player_id)
+                               DO UPDATE SET guests=excluded.guests, own=excluded.own''',
                             (s['id'], p['id'], guests),
                         )
-                        added.append(f"{p['name']}" + (f" (+{guests} مهمان)" if guests else ''))
+                        if names is not None:
+                            service._store_guest_names(s['id'], p['id'], names)
+                        label = f"{p['name']}" + (f" (+{guests} مهمان)" if guests else '')
+                        if names:
+                            label += ' [' + '، '.join(names) + ']'
+                        added.append(label)
                     removed = []
                     for item in data.get('absent', []):
                         p_name = item.get('name') if isinstance(item, dict) else str(item)
