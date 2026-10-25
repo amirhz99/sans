@@ -611,9 +611,13 @@ class Bot:
                         # domain Action enum, so the legacy JSON route can never
                         # create one; only the agent tool and an explicit admin
                         # click can.
+                        # SPEC-025: `request_link` and `settle_partner` are the
+                        # only link actions a player may ask for, and both still
+                        # end in an admin card.
                         allowed = ADMIN_ACTIONS | {'batch', 'card', 'config', 'debt', 'help', 'session_info', 'clarify',
                                                    'identify', 'payment_amount', 'declare_debt', 'admin_receipt',
-                                                   'list_players', 'list_sessions', 'report'}
+                                                   'list_players', 'list_sessions', 'report',
+                                                   'request_link', 'settle_partner'}
                         if command['action'] not in allowed:
                             raise UserError('تأیید یا اتصال مستقیم از طریق هوش مصنوعی مجاز نیست؛ از دکمه‌ها یا فرمان‌های راهنما استفاده کنید.')
                 action, args = command['action'], command.get('args', {})
@@ -656,6 +660,9 @@ class Bot:
                     if not p:
                         raise UserError('ابتدا با /identify نام کامل خود را معرفی کنید و منتظر تأیید اتصال حساب بمانید.')
                     reply = self.service.debt(p['id'])
+                    # SPEC-025: a linked player sees his partners' balances and
+                    # may propose to settle them; nothing moves without a click.
+                    reply += self.service.shared_links(p['id'])
                     if private and not p['phone']:
                         # SPEC-016: offer the one button that can share a number.
                         reply += ('\n\nبرای اینکه ادمین‌ها در صورت نیاز تماس بگیرند، '
@@ -688,10 +695,31 @@ class Bot:
                     reply = self.submit_amount(args.get('amount'), state, user_id)
                 elif action == 'declare_debt' and private:
                     reply, markup = self.request_self_debt(args, user_id, chat_id)
+                elif action == 'request_link' and private:
+                    reply, markup = self.request_link(args.get('partner'), user_id, chat_id,
+                                                      msg.get('from'))
+                elif action == 'settle_partner' and private:
+                    reply, markup = self.settle_partner(args.get('partner'), user_id, chat_id)
                 elif not admin:
                     raise UserError('این عملیات فقط برای ادمین‌های مجاز در گروه مدیریتی است.')
                 elif action == 'duplicates':
                     reply = self.service.duplicates_report()
+                elif action == 'list_links':
+                    rows = self.db.all('SELECT * FROM player_links ORDER BY low_id, high_id')
+                    reply = '\n'.join(
+                        f"#{r['low_id']} {self.service.player(r['low_id'])['name']}"
+                        f" ↔ #{r['high_id']} {self.service.player(r['high_id'])['name']}"
+                        for r in rows) or 'هیچ پیوندی ثبت نشده.'
+                elif action == 'suggest_links':
+                    # SPEC-025: advisory only; nothing is linked here.
+                    pairs = self.service.link_candidates()
+                    reply = self.service.format_link_candidates(pairs)
+                    if pairs:
+                        commands = [self.service.prepare('player_link',
+                                                         {'player': item['left']['id'],
+                                                          'partner': item['right']['id']})
+                                    for item in pairs[:10]]
+                        return self.propose_commands(commands, user_id, chat_id)
                 elif action == 'player_rename':
                     reply = self.rename_player(args.get('player'), args.get('name'), user_id)
                 elif action in ADMIN_ACTIONS or action == 'batch':
@@ -851,6 +879,24 @@ class Bot:
                 return obj
             except ValueError:
                 raise UserError('پس از /do یک JSON معتبر شامل action و args بفرستید.') from None
+        if name in ('link2', 'unlink2', 'suggestlinks') and admin:
+            # SPEC-025: still only builds an approval card, like every mutation.
+            if name == 'suggestlinks':
+                return {'action': 'suggest_links', 'args': {}}
+            pieces = rest.replace('،', ' ').split()
+            if len(pieces) != 2:
+                raise UserError(f'/{name} شناسه_یا_نام۱ شناسه_یا_نام۲ — مثلاً /{name} 12 18 '
+                                '(برای نام‌های چندکلمه‌ای از شناسه استفاده کنید)')
+            action = 'player_link' if name == 'link2' else 'player_unlink'
+            return {'action': action, 'args': {'player': pieces[0], 'partner': pieces[1]}}
+        if name == 'links' and admin:
+            return {'action': 'list_links', 'args': {}}
+        if name == 'requestlink' or (name == 'settlepartner' and rest):
+            # SPEC-025: a player asks in a private chat; the admin decides.
+            if not rest.strip():
+                raise UserError('نام یا شناسهٔ طرف مقابل را بنویسید؛ مثلاً /requestlink 15')
+            action = 'request_link' if name == 'requestlink' else 'settle_partner'
+            return {'action': action, 'args': {'partner': rest.strip()}}
         return {'action': 'help', 'args': {}}
 
     def rename_player(self, player_ref, new_name, actor):
@@ -1353,6 +1399,66 @@ class Bot:
         if not player or player['phone']:
             return None
         return self.service.set_player_phone(player['id'], phone, actor)
+
+    def request_link(self, partner_ref, user_id, chat_id, sender=None):
+        """File a link request for an admin decision (SPEC-025).
+
+        The card is the only way a link comes into existence: it carries the two
+        player ids, so the approving click can never be redirected to somebody
+        else.
+        """
+        player = self.service.linked(user_id)
+        if not player:
+            raise UserError('برای درخواست پیوند ابتدا با /identify خودتان را معرفی کنید و منتظر تأیید ادمین بمانید.')
+        partner = self.service.player(partner_ref)
+        if partner['id'] == player['id']:
+            raise UserError('یک حساب را نمی‌توان به خودش وصل کرد.')
+        if self.service.are_linked(player['id'], partner['id']):
+            raise UserError(f"حساب شما از قبل به «{partner['name']}» وصل است.")
+        for row in self.db.all("SELECT payload FROM pending WHERE requester=? AND kind='commands' "
+                               "AND status='pending'", (user_id,)):
+            try:
+                commands = json.loads(row['payload'])
+            except (TypeError, ValueError):
+                continue
+            for command in commands if isinstance(commands, list) else []:
+                if (command.get('action') == 'player_link'
+                        and sorted([(command.get('args') or {}).get('player'),
+                                    (command.get('args') or {}).get('partner')])
+                        == sorted([player['id'], partner['id']])):
+                    raise UserError('درخواست پیوند شما با این حساب هنوز منتظر بررسی ادمین است.')
+        command = self.service.prepare('player_link', {'player': player['id'],
+                                                       'partner': partner['id']})
+        ident = self.new_pending('commands', [command], user_id, chat_id)
+        note = (f'درخواست پیوند حساب‌ها {ident}\n'
+                f"درخواست‌دهنده: #{player['id']} {player['name']}\n"
+                f"طرف مقابل: #{partner['id']} {partner['name']}\n"
+                'با تأیید، هر دو نفر گزارش ماندهٔ همدیگر را می‌بینند و می‌توانند برای هم تسویه پیشنهاد دهند؛ '
+                'هیچ پولی خودکار جابه‌جا نمی‌شود.')
+        self.db.say(self.config.admin_group, note, buttons('yes:' + ident, 'no:' + ident))
+        return ('درخواست پیوند برای تأیید ادمین ارسال شد؛ تا آن زمان هیچ حسابی به هم وصل نیست.',
+                None)
+
+    def settle_partner(self, partner_ref, user_id, chat_id):
+        """Propose a full settle for a linked partner (SPEC-025).
+
+        Only a direct partner qualifies, and the money moves only after the
+        admin approves this card.
+        """
+        player = self.service.linked(user_id)
+        if not player:
+            raise UserError('برای تسویهٔ حساب طرف مقابل ابتدا باید حساب شما تأیید شده باشد.')
+        partner = self.service.player(partner_ref)
+        if not self.service.are_linked(player['id'], partner['id']):
+            raise UserError(f"«{partner['name']}» در حساب‌های پیوندی شما نیست؛ "
+                            'اول از ادمین بخواهید حساب‌ها را به هم وصل کند.')
+        command = self.service.prepare('settle', {'player': partner['id']})
+        ident = self.new_pending('commands', [command], user_id, chat_id)
+        note = (f'درخواست تسویه از طرف {player["name"]} برای حساب پیوندی {partner["name"]}\n'
+                f'کد تأیید: {ident}')
+        self.db.say(self.config.admin_group, note, buttons('yes:' + ident, 'no:' + ident))
+        return (f'درخواست تسویهٔ «{partner["name"]}» برای تأیید ادمین ارسال شد؛ '
+                'تا تأیید نشود هیچ تغییری در حساب ثبت نمی‌شود.', None)
 
     def request_self_debt(self, args, user_id, chat_id):
         player = self.service.linked(user_id)

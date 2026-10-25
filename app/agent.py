@@ -338,6 +338,11 @@ class SansAgent:
             - 'expire_proposals': (admin) close open approval cards; data_json='{"older_than_hours": 0}'
               where 0 closes every open card and an omitted value means the 24 hour TTL.
               This only removes the cards; nothing financial is applied.
+            - 'links': (admin) list the existing player links.
+            - 'suggest_links': (admin) propose pairs that share a family name; every
+              pair becomes an approval card, and nothing links without a click.
+            - 'link_players' / 'unlink_players': (admin) data_json='{"player":"#12","partner":"#18"}'
+              builds ONE approval card; it never links or unlinks directly.
             - 'update_settings': (admin) propose setting changes with approval buttons; data_json='{"card": "...", "payment_note": "...", "approval_required": true}'
             """
             try:
@@ -580,6 +585,44 @@ class SansAgent:
 
                 if operation == 'duplicates':
                     return service.duplicates_report()
+
+                if operation in ('suggest_links', 'links', 'link_players', 'unlink_players'):
+                    # SPEC-025: a player may ask; only the admin card links.
+                    if not admin:
+                        return 'خطا: پیوند حساب‌ها فقط توسط ادمین قابل پیشنهاد است.'
+                    if operation == 'suggest_links':
+                        pairs = service.link_candidates()
+                        preview = service.format_link_candidates(pairs)
+                        if not pairs:
+                            return preview
+                        for item in pairs[:10]:
+                            bot.propose({'action': 'player_link',
+                                         'args': {'player': item['left']['id'],
+                                                  'partner': item['right']['id']}},
+                                        user_id, chat_id)
+                        return preview + '\nیک کارت تأیید برای این زوج‌ها ساخته شد؛ بدون تأیید شما پیوندی ساخته نمی‌شود.'
+                    if operation == 'links':
+                        rows = db.all('SELECT * FROM player_links ORDER BY low_id, high_id')
+                        if not rows:
+                            return 'هیچ پیوندی ثبت نشده.'
+                        return '\n'.join(
+                            f"#{r['low_id']} {service.player(r['low_id'])['name']}"
+                            f" ↔ #{r['high_id']} {service.player(r['high_id'])['name']}"
+                            for r in rows)
+                    unknown = set(data) - {'player', 'partner'}
+                    if unknown:
+                        return 'کلید ناشناخته در پیوند: ' + '، '.join(sorted(unknown))
+                    left = service.player(data.get('player', ''))
+                    right = service.player(data.get('partner', ''))
+                    action = 'player_link' if operation == 'link_players' else 'player_unlink'
+                    if action == 'player_link' and service.are_linked(left['id'], right['id']):
+                        return 'این دو حساب از قبل به هم وصل هستند.'
+                    if action == 'player_unlink' and not service.are_linked(left['id'], right['id']):
+                        return 'این دو حساب به هم وصل نیستند.'
+                    reply, _ = bot.propose({'action': action,
+                                            'args': {'player': left['id'], 'partner': right['id']}},
+                                           user_id, chat_id)
+                    return reply
 
                 if operation == 'expire_proposals':
                     # SPEC-015: closing cards is bookkeeping, not a financial

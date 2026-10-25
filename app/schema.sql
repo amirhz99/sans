@@ -65,6 +65,16 @@ CREATE TABLE IF NOT EXISTS ledger (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS ledger_player ON ledger(player_id, id);
+-- SPEC-025: a symmetric link between two players who pay for each other.  One
+-- row per pair (``low_id < high_id``), so a link can never be stored twice.
+CREATE TABLE IF NOT EXISTS player_links (
+    low_id INTEGER NOT NULL REFERENCES players(id),
+    high_id INTEGER NOT NULL REFERENCES players(id),
+    created_by INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK(low_id < high_id),
+    PRIMARY KEY(low_id, high_id)
+);
 CREATE TABLE IF NOT EXISTS receipts (
     id INTEGER PRIMARY KEY,
     player_id INTEGER NOT NULL REFERENCES players(id),

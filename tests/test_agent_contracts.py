@@ -19,6 +19,58 @@ from app.prompt_loader import PromptLoader
 from app.service import Service
 
 
+class LinkContextTests(unittest.TestCase):
+    """SPEC-025: the model sees only the direct partners' id, name and balance."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp.name) / 'links.sqlite3')
+        self.service = Service(self.db)
+        self.source = 0
+        self.ali = self.player('علی رضایی')
+        self.hassan = self.player('حسن رضایی')
+        self.stranger = self.player('رضا محمدی')
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def player(self, name):
+        self.source += 1
+        with self.db.conn:
+            command = self.service.prepare('new_player', {'name': name})
+            self.service.apply(command, 1, f'test:{self.source}')
+        return self.service.player(name)
+
+    def context(self):
+        """Build the context for the linked account, like the bot does."""
+        with self.db.conn:
+            self.service.bind(self.ali['id'], 10, 1)
+        return AIContextBuilder(self.db, self.service).build(10, 10, False)
+
+    def test_context_carries_only_direct_partners(self):
+        # ``set_player_phone`` audits, which bumps the revision; do it first so
+        # the link below stays the last write.
+        with self.db.conn:
+            self.service.set_player_phone(self.hassan['id'], '09121234567', 1)
+            self.db.execute("INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)",
+                            (self.hassan['id'], 150000, 'بدهی شخصی حسن', 'test:debt'))
+        with self.db.conn:
+            self.service.link_players(self.ali['id'], self.hassan['id'], 1)
+
+        context = self.context()
+
+        self.assertEqual([item['id'] for item in context['linked_players']], [self.hassan['id']])
+        self.assertEqual(set(context['linked_players'][0]), {'id', 'name', 'balance'})
+        self.assertEqual(context['linked_players'][0]['balance'], 150000)
+        self.assertNotIn(self.stranger['id'], [item['id'] for item in context['linked_players']])
+        self.assertNotIn('09121234567', json.dumps(context, ensure_ascii=False))
+        self.assertNotIn('بدهی شخصی حسن', json.dumps(context, ensure_ascii=False))
+
+    def test_an_unlinked_player_has_no_link_block(self):
+        self.assertNotIn('linked_players', self.context())
+
+
 class AgentContractTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

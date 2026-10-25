@@ -233,7 +233,18 @@ def parse_session_datetime(value, now=None):
 
 ADMIN_ACTIONS = {'new_player', 'new_session', 'update_session', 'attendance',
                  'finalize', 'adjustment', 'settings', 'player_note', 'settle',
-                 'player_rename', 'player_merge', 'player_delete', 'broadcast'}
+                 'player_rename', 'player_merge', 'player_delete', 'broadcast',
+                 # SPEC-025: never reachable through the model's own routing; the
+                 # allow-list in ``bot.message`` keeps them out and only the
+                 # agent tool or an explicit admin command proposes them.
+                 'player_link', 'player_unlink'}
+
+# SPEC-025: a relation word in a name («دوست», «بچه‌های», «شاگرد») or a bare
+# number is not a family name, so it can neither group nor suggest a pair.
+RELATION_WORDS = {'دوست', 'رفیق', 'بچه', 'بچه‌های', 'بچهها', 'پسر', 'دختر', 'برادر',
+                  'خواهر', 'پدر', 'مادر', 'همسر', 'باجناق', 'داماد', 'عمو', 'دایی',
+                  'خاله', 'عمه', 'نوه', 'پسرخاله', 'پسرعمو', 'دخترخاله', 'دخترعمو',
+                  'شاگرد', 'مهمان', 'همکار', 'همسایه', 'فامیل'}
 
 # SPEC-012/014: one card never carries more than this many commands or
 # recipients; a longer request is a sign of a parsing mistake.
@@ -416,6 +427,10 @@ class Service:
             'SELECT COUNT(*) n FROM attendance_guests WHERE host_id=?', (player_id,))['n']
         usage['balance'] = self.balance(player_id)
         usage['pending'] = self._pending_reference(player_id, ignore=ignore_pending)
+        # SPEC-025: a link references the player from both sides.
+        usage['links'] = self.db.one('SELECT COUNT(*) n FROM player_links '
+                                     'WHERE low_id=? OR high_id=?',
+                                     (player_id, player_id))['n']
         return usage
 
     # SPEC-024: a guest name is optional and descriptive; it never moves money.
@@ -456,6 +471,156 @@ class Service:
                 'INSERT INTO attendance_guests(session_id,host_id,name,normalized_name) '
                 'VALUES (?,?,?,?)', (session_id, host_id, name, normalize(name)))
 
+    def pending_reference(self, *player_ids):
+        """Public form of ``_pending_reference`` for non-interactive callers."""
+        return self._pending_reference(*player_ids)
+
+    # ---- SPEC-025: two players who pay for each other --------------------
+
+    @staticmethod
+    def link_pair(left_id, right_id):
+        """Return the canonical ``(low, high)`` key of one link."""
+        if isinstance(left_id, bool) or isinstance(right_id, bool):
+            raise UserError('شناسهٔ بازیکن معتبر نیست.')
+        left, right = int(left_id), int(right_id)
+        if left == right:
+            raise UserError('یک حساب را نمی‌توان به خودش وصل کرد.')
+        return (left, right) if left < right else (right, left)
+
+    def link_players(self, left_id, right_id, actor='agent'):
+        """Link two players, keeping exactly one symmetric row (SPEC-025)."""
+        low, high = self.link_pair(left_id, right_id)
+        left, right = self.player(low), self.player(high)
+        if self.db.one('SELECT 1 FROM player_links WHERE low_id=? AND high_id=?', (low, high)):
+            raise UserError('این دو حساب از قبل به هم وصل هستند.')
+        self.db.execute('INSERT INTO player_links(low_id,high_id,created_by) VALUES (?,?,?)',
+                        (low, high, actor if isinstance(actor, int) else None))
+        self.db.audit(actor, 'player_link', {'left': low, 'left_name': left['name'],
+                                             'right': high, 'right_name': right['name']})
+        return {'left': low, 'right': high, 'left_name': left['name'],
+                'right_name': right['name']}
+
+    def unlink_players(self, left_id, right_id, actor='agent'):
+        """Remove one link; nothing financial is touched (SPEC-025)."""
+        low, high = self.link_pair(left_id, right_id)
+        if not self.db.one('SELECT 1 FROM player_links WHERE low_id=? AND high_id=?', (low, high)):
+            raise UserError('این دو حساب به هم وصل نیستند.')
+        self.db.execute('DELETE FROM player_links WHERE low_id=? AND high_id=?', (low, high))
+        self.db.audit(actor, 'player_unlink', {'left': low, 'right': high})
+        return {'left': low, 'right': high}
+
+    def partner_ids(self, player_id):
+        """Return the ids linked directly to ``player_id`` (SPEC-025)."""
+        rows = self.db.all('SELECT low_id, high_id FROM player_links '
+                           'WHERE low_id=? OR high_id=?', (player_id, player_id))
+        return [row['high_id'] if row['low_id'] == player_id else row['low_id'] for row in rows]
+
+    def links(self, player_id):
+        """Return the direct partners with a minimal, safe summary."""
+        found = []
+        for ident in self.partner_ids(player_id):
+            partner = self.db.one('SELECT * FROM players WHERE id=?', (ident,))
+            if partner:
+                found.append({'id': partner['id'], 'name': partner['name'],
+                              'balance': self.balance(partner['id'])})
+        found.sort(key=lambda item: item['id'])
+        return found
+
+    def are_linked(self, left_id, right_id):
+        try:
+            low, high = self.link_pair(left_id, right_id)
+        except UserError:
+            return False
+        return self.db.one('SELECT 1 FROM player_links WHERE low_id=? AND high_id=?',
+                           (low, high)) is not None
+
+    def shared_links(self, player_id):
+        """Return the report block a player may see about his partners.
+
+        Only the name and the balance travel; phones, receipts and the full
+        ledger history of the partner stay private.
+        """
+        found = self.links(player_id)
+        if not found:
+            return ''
+        lines = ['', 'حساب‌های پیوندی (تسویه برایشان با تأیید ادمین):']
+        for item in found:
+            state = 'بدهکار' if item['balance'] > 0 else 'بستانکار' if item['balance'] < 0 else 'تسویه'
+            lines.append(f"• {item['name']}: {abs(item['balance']):,} تومان ({state})")
+        return '\n'.join(lines)
+
+    @staticmethod
+    def family_name(name):
+        """Return the family token of a full name, or ``None`` (SPEC-025).
+
+        A relation word («دوست», «شاگرد») or a bare number is not a family
+        name, and a single-token name has no family part to compare.
+        """
+        tokens = [token for token in normalize(name).split() if token]
+        if len(tokens) < 2:
+            return None
+        family = tokens[-1]
+        if family in RELATION_WORDS or family.isdigit() or len(family) < 2:
+            return None
+        return family
+
+    def _link_asked(self, left_id, right_id):
+        """Return whether an open card already proposes this exact pair."""
+        low, high = self.link_pair(left_id, right_id)
+        for row in self.db.all("SELECT payload FROM pending WHERE status='pending' "
+                               "AND kind='commands'"):
+            try:
+                commands = json.loads(row['payload'])
+            except (TypeError, ValueError):
+                continue
+            for command in commands if isinstance(commands, list) else []:
+                if not isinstance(command, dict) or command.get('action') != 'player_link':
+                    continue
+                args = command.get('args') or {}
+                if sorted([args.get('player'), args.get('partner')]) == [low, high]:
+                    return True
+        return False
+
+    def link_candidates(self):
+        """Return pairs sharing a family name that are not linked yet.
+
+        Advisory only: the admin decides.  A suggestion never creates a link.
+        """
+        groups = {}
+        for row in self.db.all('SELECT * FROM players ORDER BY id'):
+            family = self.family_name(row['name'])
+            if family:
+                groups.setdefault(family, []).append({'id': row['id'], 'name': row['name']})
+        pairs = []
+        for family, members in groups.items():
+            for index, left in enumerate(members):
+                for right in members[index + 1:]:
+                    if self.are_linked(left['id'], right['id']):
+                        continue
+                    if self._link_asked(left['id'], right['id']):
+                        continue
+                    pairs.append({'family': family, 'left': left, 'right': right})
+        pairs.sort(key=lambda item: (item['family'], item['left']['id'], item['right']['id']))
+        return pairs
+
+    def format_link_candidates(self, pairs):
+        """Render the suggestion card text (no link is created here)."""
+        if not pairs:
+            return 'پیشنهادی برای پیوند بر اساس فامیل یکسان پیدا نشد.'
+        lines = ['پیشنهاد پیوند بر اساس فامیل یکسان؛ هیچ پیوندی بدون تأیید شما ساخته نمی‌شود:']
+        for item in pairs:
+            lines.append(f"• فامیل «{item['family']}»: #{item['left']['id']} {item['left']['name']}"
+                         f" ↔ #{item['right']['id']} {item['right']['name']}")
+        lines.append('برای ساخت، همان کارت تأیید را بزنید یا /link2 شناسه۱ شناسه۲ را بفرستید.')
+        return '\n'.join(lines)
+
+        self.db.execute('DELETE FROM attendance_guests WHERE session_id=? AND host_id=?',
+                        (session_id, host_id))
+        for name in names:
+            self.db.execute(
+                'INSERT INTO attendance_guests(session_id,host_id,name,normalized_name) '
+                'VALUES (?,?,?,?)', (session_id, host_id, name, normalize(name)))
+
 
     def pending_reference(self, *player_ids):
         """Public form of ``_pending_reference`` for non-interactive callers."""
@@ -478,7 +643,7 @@ class Service:
                 item = stack.pop()
                 if isinstance(item, dict):
                     for key, value in item.items():
-                        if (key in ('player', 'source', 'target') and isinstance(value, int)
+                        if (key in ('player', 'source', 'target', 'partner') and isinstance(value, int)
                                 and not isinstance(value, bool) and value in wanted):
                             return row['id']
                         stack.append(value)
@@ -529,7 +694,7 @@ class Service:
         conflict = self._merge_conflict(source, target, ignore_pending=ignore_pending)
         if conflict:
             raise UserError(conflict)
-        moved = {'attendance': 0, 'ledger': 0, 'receipts': 0}
+        moved = {'attendance': 0, 'ledger': 0, 'receipts': 0, 'guest_names': 0, 'links': 0}
         for row in self.db.all('SELECT session_id FROM attendance WHERE player_id=?', (source['id'],)):
             existing = self.db.one('SELECT 1 FROM attendance WHERE session_id=? AND player_id=?',
                                    (row['session_id'], target['id']))
@@ -558,6 +723,18 @@ class Service:
                                 (target['id'], row['session_id'], source['id'],
                                  row['normalized_name']))
             moved['guest_names'] += 1
+        # SPEC-025: links point at the survivor.  A pair that already exists is
+        # dropped instead of breaking the primary key.
+        moved['links'] = 0
+        for partner in self.partner_ids(source['id']):
+            low, high = self.link_pair(target['id'], partner)
+            if self.db.one('SELECT 1 FROM player_links WHERE low_id=? AND high_id=?', (low, high)):
+                continue
+            self.db.execute('INSERT INTO player_links(low_id,high_id,created_by) VALUES (?,?,?)',
+                            (low, high, None))
+            moved['links'] += 1
+        self.db.execute('DELETE FROM player_links WHERE low_id=? OR high_id=?',
+                        (source['id'], source['id']))
         for table in ('ledger', 'receipts'):
             # ``ledger.source`` stays untouched on purpose: it is a unique
             # audit key for the original transaction, not an ownership field.
@@ -581,7 +758,7 @@ class Service:
     def _assert_deletable(self, player, ignore_pending=None):
         usage = self.player_usage(player['id'], ignore_pending=ignore_pending)
         if (player['bale_id'] is not None or usage['attendance'] or usage['ledger']
-                or usage['receipts'] or usage['guest_names']):
+                or usage['receipts'] or usage['guest_names'] or usage['links']):
             raise UserError(f"«{player['name']}» حضور، تراکنش یا رسید ثبت‌شده دارد و حذف نمی‌شود؛ "
                             'برای حفظ سابقه آن را با بازیکن درست ادغام کنید.')
         if usage['pending']:
@@ -1079,6 +1256,17 @@ class Service:
             if conflict:
                 raise UserError(conflict)
             a = {'source': source['id'], 'target': target['id']}
+        elif action in ('player_link', 'player_unlink'):
+            # SPEC-025: a link is symmetric and never touches the ledger.
+            left = self.player(args.get('player', ''))
+            right = self.player(args.get('partner', ''))
+            self.link_pair(left['id'], right['id'])   # validates self/boolean ids
+            linked = self.are_linked(left['id'], right['id'])
+            if action == 'player_link' and linked:
+                raise UserError(f"«{left['name']}» و «{right['name']}» از قبل به هم وصل هستند.")
+            if action == 'player_unlink' and not linked:
+                raise UserError(f"«{left['name']}» و «{right['name']}» به هم وصل نیستند.")
+            a = {'player': left['id'], 'partner': right['id']}
         elif action == 'player_delete':
             p = self.player(args.get('player', ''))
             self._assert_deletable(p, ignore_pending=ignore_pending)
@@ -1187,6 +1375,10 @@ class Service:
             return {key: self.player(a['player'])[key]}
         if action == 'player_merge':
             return {'source': a['source'], 'target': a['target']}
+        if action in ('player_link', 'player_unlink'):
+            # SPEC-025: the card expires if the pair changed underneath it.
+            return {'linked': int(self.are_linked(a['player'], a['partner'])),
+                    'pair': list(self.link_pair(a['player'], a['partner']))}
         if action in ('adjustment', 'declare_debt', 'player_delete'):
             return {'player': a['player']}
         if action == 'broadcast':
@@ -1266,7 +1458,8 @@ class Service:
         labels = {'new_player': 'ثبت بازیکن', 'new_session': 'ثبت سانس', 'update_session': 'تکمیل سانس',
                   'attendance': 'ثبت/اصلاح حضور', 'finalize': 'نهایی‌سازی بدهی سانس',
                   'adjustment': 'اصلاح حساب', 'declare_debt': 'ثبت بدهی اعلام‌شده',
-                  'settle': 'تسویه کامل حساب', 'settings': 'تنظیمات', 'player_note': 'یادداشت بازیکن'}
+                  'settle': 'تسویه کامل حساب', 'settings': 'تنظیمات', 'player_note': 'یادداشت بازیکن',
+                  'player_link': 'پیوند دو حساب', 'player_unlink': 'برداشتن پیوند دو حساب'}
         fields = {'name': 'نام', 'title': 'عنوان', 'note': 'توضیح', 'when_text': 'عبارت زمان',
                   'location': 'محل', 'venue_cost': 'هزینهٔ زمین (تومان)', 'person_fee': 'سهم هر نفر (تومان)',
                   'guests': 'تعداد مهمان', 'present': 'حاضر', 'amount': 'مبلغ (مثبت: بدهکار؛ منفی: بستانکار)',
@@ -1277,6 +1470,8 @@ class Service:
                 continue
             if key == 'player':
                 lines.append('بازیکن: ' + self.player(value)['name'])
+            elif key == 'partner':
+                lines.append('حساب پیوندی: ' + self.player(value)['name'])
             elif key == 'session':
                 lines.append('سانس: ' + self.session(value)['title'])
             elif key == 'session_at':
@@ -1404,6 +1599,11 @@ class Service:
             self.merge_players(a['source'], a['target'], actor, ignore_pending=ignored)
         elif action == 'player_delete':
             self.delete_player(a['player'], actor, ignore_pending=ignored)
+        elif action == 'player_link':
+            # SPEC-025: linking is a read permission, not a financial movement.
+            self.link_players(a['player'], a['partner'], actor)
+        elif action == 'player_unlink':
+            self.unlink_players(a['player'], a['partner'], actor)
         else:
             # Unknown actions must never be acknowledged as applied.
             raise UserError('درخواست مدیریتی معتبر نیست.')

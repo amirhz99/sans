@@ -62,6 +62,12 @@ class AIContextBuilder:
             # never send the complete player directory to the model.
             'sessions': self._session_context(conversation.last_entity),
         }
+        if self.service and linked:
+            # SPEC-025: id, name and balance of the direct partners only; never a
+            # phone number, a receipt, or another player's ledger notes.
+            partners = self.service.links(linked['id'])
+            if partners:
+                context['linked_players'] = partners
         if self.service:
             # SPEC-017: the effective new-session defaults, so the model never
             # relies on numbers hardcoded in the prompt.

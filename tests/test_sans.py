@@ -698,7 +698,9 @@ class PermissionAndConversationTests(BaseCase):
         self.assertIn('دستورات کاربران', reply)
         self.assertIn('دستورات ادمین', reply)
         self.assertIn('/players', reply)
-        self.assertLessEqual(len(reply.splitlines()), 18)
+        self.assertIn('/link2', reply)
+        # SPEC-025 adds one line; the help stays compact enough to read.
+        self.assertLessEqual(len(reply.splitlines()), 19)
 
     def test_linked_user_can_declare_debt_only_after_confirmation(self):
         self.seed()
@@ -3287,3 +3289,186 @@ class GuestOwnShareTests(BaseCase):
         row = self.db.one('SELECT * FROM attendance WHERE session_id=? AND player_id=?',
                           (session['id'], player['id']))
         self.assertEqual(row['own'], 1)
+
+
+class PlayerLinkTests(BaseCase):
+    """SPEC-025: a link is symmetric, needs a click, and moves no money."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.apply('new_player', name='حسن رضایی')
+
+    def linked(self):
+        with self.db.conn:
+            self.service.link_players(1, 3, 1)
+
+    def test_a_link_is_symmetric_unique_and_refuses_self(self):
+        self.linked()
+
+        self.assertEqual(self.service.partner_ids(1), [3])
+        self.assertEqual(self.service.partner_ids(3), [1])
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM player_links')['n'], 1)
+        with self.assertRaises(UserError):
+            self.service.link_players(3, 1, 1)
+        with self.assertRaises(UserError):
+            self.service.link_players(1, 1, 1)
+        self.assertFalse(self.service.are_linked(1, 2))
+
+    def test_linking_happens_only_through_the_approved_card(self):
+        self.send('/link2 1 3', user=1, chat=-100)
+
+        # Only a card exists; nothing is linked yet.
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM player_links')['n'], 0)
+        ident = self.proposal()
+        payload = json.loads(self.db.one('SELECT payload FROM pending WHERE id=?', (ident,))['payload'])
+        self.assertEqual(payload[0]['action'], 'player_link')
+
+        self.click('yes:' + ident)
+
+        self.assertEqual(self.service.partner_ids(1), [3])
+        self.assertEqual(self.db.one(
+            "SELECT actor FROM audit_logs WHERE action='player_link'")['actor'], '1')
+
+    def test_delete_and_merge_keep_links_consistent(self):
+        temporary = self.service.ensure_player('موقت')
+        self.linked()
+        with self.assertRaises(UserError):
+            self.service.delete_player(3)
+
+        # A merge carries the link to the survivor instead of dropping it.
+        self.service.merge_players(3, temporary['id'], 1)
+
+        self.assertEqual(self.service.partner_ids(1), [temporary['id']])
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM player_links')['n'], 1)
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM player_links '
+                                     'WHERE low_id=? OR high_id=?', (3, 3))['n'], 0)
+
+
+class LinkRequestTests(BaseCase):
+    """SPEC-025: a player may ask; only the admin click links."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.apply('new_player', name='حسن رضایی')
+
+    def test_a_player_request_becomes_one_admin_card(self):
+        self.send('/requestlink حسن رضایی', user=10, chat=10)
+
+        self.assertIn('برای تأیید ادمین ارسال شد', self.replies(10))
+        self.assertIn('درخواست پیوند حساب‌ها', self.replies(-100))
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM player_links')['n'], 0)
+
+        self.click('yes:' + self.proposal())
+
+        self.assertEqual(self.service.partner_ids(1), [3])
+        self.assertTrue(self.service.are_linked(1, 3))
+
+    def test_rejecting_the_request_creates_no_link(self):
+        self.send('/requestlink حسن رضایی', user=10, chat=10)
+
+        self.click('no:' + self.proposal())
+
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM player_links')['n'], 0)
+        self.assertFalse(self.service.are_linked(1, 3))
+
+    def test_an_unlinked_player_cannot_ask_for_a_link(self):
+        self.send('/requestlink حسن رضایی', user=50, chat=50)
+
+        self.assertIn('identify', self.replies(50))
+        self.assertFalse(self.db.all("SELECT 1 FROM pending WHERE kind='commands'"))
+
+
+class SharedReportTests(BaseCase):
+    """SPEC-025: a linked player sees a short block; nobody else sees it."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.apply('new_player', name='حسن رضایی')
+        self.apply('adjustment', player='#3', amount=200000, note='بدهی قبلی')
+
+    def test_a_linked_player_sees_the_partner_balance(self):
+        with self.db.conn:
+            self.service.link_players(1, 3, 1)
+
+        self.send('/debt', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertIn('حساب‌های پیوندی', reply)
+        self.assertIn('حسن رضایی', reply)
+        self.assertIn('200,000', reply)
+
+    def test_an_unlinked_player_sees_no_other_balance(self):
+        self.send('/debt', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertNotIn('حساب‌های پیوندی', reply)
+        self.assertNotIn('حسن رضایی', reply)
+
+
+class LinkedSettleTests(BaseCase):
+    """SPEC-025: settling a partner still needs the admin's click."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.apply('new_player', name='حسن رضایی')
+        self.apply('adjustment', player='#3', amount=200000, note='بدهی قبلی')
+        with self.db.conn:
+            self.service.link_players(1, 3, 1)
+
+    def test_settling_a_partner_waits_for_the_admin(self):
+        self.send('/settlepartner حسن رضایی', user=10, chat=10)
+
+        self.assertIn('برای تأیید ادمین ارسال شد', self.replies(10))
+        self.assertEqual(self.service.balance(3), 200000)
+
+        self.click('yes:' + self.proposal())
+
+        self.assertEqual(self.service.balance(3), 0)
+        self.assertEqual(self.db.one(
+            "SELECT COUNT(*) n FROM ledger WHERE player_id=3 AND source LIKE 'proposal:%'")['n'], 1)
+
+    def test_settling_a_stranger_fails_closed(self):
+        stranger = self.service.ensure_player('سارا کریمی')
+
+        self.send('/settlepartner سارا کریمی', user=10, chat=10)
+
+        self.assertIn('در حساب‌های پیوندی شما نیست', self.replies(10))
+        self.assertEqual(self.db.one(
+            "SELECT COUNT(*) n FROM pending WHERE kind='commands'")['n'], 0)
+        self.assertEqual(self.service.balance(stranger['id']), 0)
+
+
+class LinkCandidateTests(BaseCase):
+    """SPEC-025: only family names are suggested, and nothing links by itself."""
+
+    def test_suggestions_use_family_names_only(self):
+        self.seed()
+        self.apply('new_player', name='حسن رضایی')
+        self.apply('new_player', name='مهمان نواز')
+        self.apply('new_player', name='مشهدی')
+
+        pairs = self.service.link_candidates()
+
+        self.assertEqual([(item['family'], item['left']['name'], item['right']['name'])
+                          for item in pairs],
+                         [('رضایی', 'علی رضایی', 'حسن رضایی')])
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM player_links')['n'], 0)
+
+        # The admin card is the only way a suggestion becomes a link.
+        self.send('/suggestlinks', user=1, chat=-100)
+        self.assertEqual(self.db.one(
+            "SELECT COUNT(*) n FROM pending WHERE status='pending'")['n'], 1)
+        self.click('yes:' + self.proposal())
+        self.assertTrue(self.service.are_linked(1, 3))
+
+    def test_the_suggestion_skips_existing_links(self):
+        self.seed()
+        self.apply('new_player', name='حسن رضایی')
+        with self.db.conn:
+            self.service.link_players(1, 3, 1)
+
+        self.assertEqual(self.service.link_candidates(), [])
