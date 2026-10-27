@@ -461,6 +461,46 @@ class Bot:
         return (preview + f'\n\nاین تغییر با تأیید شما اعمال می‌شود. کد: {ident}',
                 buttons('yes:' + ident, 'no:' + ident))
 
+    # SPEC-030: a multi-player card used to be eight raw ``Service.preview``
+    # blocks stacked on top of each other.  The card is the only thing the admin
+    # clicks on, so it has to be readable on its own: one table for the batch.
+    MONEY_ACTIONS = frozenset({'adjustment', 'settle'})
+    TABLE_NOTE_LIMIT = 60
+
+    def batch_table(self, commands):
+        """Return one compact table for a batch of money commands, else ``None``.
+
+        Only a homogeneous batch of ``adjustment``/``settle`` commands is
+        tabulated.  Anything else (mixed actions, broadcasts, a single command)
+        returns ``None`` so the caller keeps the classic preview and long-standing
+        card text stays byte-for-byte identical for one-player cards.
+        """
+        if not isinstance(commands, list) or len(commands) < 2:
+            return None
+        if any(c['action'] not in self.MONEY_ACTIONS for c in commands):
+            return None
+        rows, total = [], 0
+        for command in commands:
+            player = self.service.player(command['args']['player'])
+            if command['action'] == 'settle':
+                # The approval writes ``-balance`` (SPEC-011 locks that balance
+                # in the proposal guard), so the row shows the applied amount.
+                amount = -(self.service.guard(command).get('balance') or 0)
+                note = 'تسویه کامل'
+            else:
+                amount = command['args']['amount']
+                note = command['args'].get('note') or ''
+            note = ' '.join(str(note).split())
+            if len(note) > self.TABLE_NOTE_LIMIT:
+                note = note[:self.TABLE_NOTE_LIMIT - 1].rstrip() + '…'
+            rows.append((player, amount, note))
+            total += amount
+        lines = [f'ثبت پرداخت برای {len(rows)} نفر', '| بازیکن | مبلغ | توضیح |', '|---|---|---|']
+        for player, amount, note in rows:
+            lines.append(f"| {player['name']} | {amount:+,} | {note or '—'} |")
+        lines.append(f'| **جمع** | **{total:+,}** | |')
+        return '\n'.join(lines)
+
     def propose_commands(self, commands, user_id, chat_id):
         """Create one approval card for one or more already prepared commands.
 
@@ -476,7 +516,9 @@ class Bot:
         if len(set(targets)) != len(targets):
             raise UserError('درخواست مورد تکراری دارد؛ لطفاً اصلاح کنید.')
         ident = self.new_pending('commands', commands, user_id, chat_id)
-        preview = '\n\n'.join(self.service.preview(c) for c in commands)
+        preview = self.batch_table(commands)
+        if preview is None:
+            preview = '\n\n'.join(self.service.preview(c) for c in commands)
         tail = f'\n\nثبت شود؟ کد: {ident}'
         if any(c['action'] != 'broadcast' for c in commands):
             tail += '\nتمام مبلغ‌ها تومان هستند.'
@@ -1166,7 +1208,9 @@ class Bot:
         if row['kind'] == 'commands':
             try:
                 commands = json.loads(row['payload'])
-                preview = '\n\n'.join(self.service.preview(c) for c in commands)
+                preview = self.batch_table(commands)
+                if preview is None:
+                    preview = '\n\n'.join(self.service.preview(c) for c in commands)
             except (TypeError, ValueError, UserError, KeyError):
                 return f"{row['id']} | {row['kind']} | {row['payload']}"
             return f"درخواست {row['id']} — منتظر تأیید ادمین\n{preview}"

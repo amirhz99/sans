@@ -3903,3 +3903,89 @@ class ProgressUpdateTests(BaseCase):
                     {'chat_id': 10, 'message_id': 0}, {'chat_id': True, 'message_id': 555}):
             self.assertIsNone(self.bot.progress(client, bad))
         self.assertEqual(client.calls, [])
+
+
+class BatchCardLayoutTests(BaseCase):
+    """SPEC-030: a multi-player card is one table, not one block per player."""
+
+    def setUp(self):
+        super().setUp()
+        # No ``seed()``: these cards are about layout, not about links.
+        names = ['علی رضایی', 'رضا محمدی', 'سعید مرادی']
+        for name in names:
+            self.apply('new_player', name=name)
+        self.ids = [row['id'] for row in self.db.all('SELECT id FROM players ORDER BY id')]
+        self.assertEqual([row['name'] for row in self.db.all('SELECT name FROM players ORDER BY id')],
+                         names)
+
+    def card(self, *commands):
+        prepared = [self.service.prepare(c['action'], c.get('args', {})) for c in commands]
+        with self.db.conn:
+            return self.bot.propose_commands(prepared, 1, -100)
+
+    def adjustments(self, *pairs):
+        return [{'action': 'adjustment', 'args': {'player': player, 'amount': amount,
+                                                  'note': f'ثبت پرداخت برای بازیکن {player}'}}
+                for player, amount in pairs]
+
+    def test_batch_card_is_one_table_not_one_block_per_player(self):
+        text, _ = self.card(*self.adjustments(*zip(self.ids, (-900000, -300000, -1350000))))
+
+        self.assertEqual(text.count('| بازیکن |'), 1)
+        self.assertEqual(text.count('| بازیکن | مبلغ | توضیح |'), 1)
+        # The old layout repeated this heading once per player.
+        self.assertEqual(text.count('اصلاح حساب'), 0)
+        for name in ('علی رضایی', 'رضا محمدی', 'سعید مرادی'):
+            self.assertEqual(text.count(name), 1)
+        self.assertIn('ثبت پرداخت برای 3 نفر', text)
+
+    def test_batch_card_totals_the_amounts(self):
+        text, _ = self.card(*self.adjustments((self.ids[0], -900000), (self.ids[1], -300000)))
+        self.assertIn('| **جمع** | **-1,200,000** | |', text)
+
+    def test_single_card_is_unchanged(self):
+        self.apply('adjustment', player=self.ids[0], amount=400000, note='بدهی قبلی')
+        prepared = self.service.prepare('settle', {'player': self.ids[0]})
+        with self.db.conn:
+            text, _ = self.bot.propose_commands([prepared], 1, -100)
+        self.assertTrue(text.startswith(self.service.preview(prepared)))
+        self.assertIn('تسویه کامل حساب', text)
+        self.assertNotIn('| بازیکن |', text)
+
+    def test_batch_card_keeps_the_code_and_the_currency_note(self):
+        text, markup = self.card(*self.adjustments((self.ids[0], -1000), (self.ids[1], -2000)))
+        ident = markup[0][0]['callback_data'].split(':', 1)[1]
+        self.assertIn(f'کد: {ident}', text)
+        self.assertIn('تمام مبلغ‌ها تومان هستند', text)
+
+    def test_settle_row_shows_the_balance_the_approval_will_apply(self):
+        self.apply('adjustment', player=self.ids[0], amount=400000, note='بدهی قبلی')
+        self.apply('adjustment', player=self.ids[1], amount=250000, note='بدهی قبلی')
+        first, second = self.ids[0], self.ids[1]
+        text, markup = self.card({'action': 'settle', 'args': {'player': first}},
+                                 {'action': 'settle', 'args': {'player': second}})
+        self.assertIn('| علی رضایی | -400,000 | تسویه کامل |', text)
+        self.assertIn('| رضا محمدی | -250,000 | تسویه کامل |', text)
+        self.assertIn('| **جمع** | **-650,000** | |', text)
+
+        ident = markup[0][0]['callback_data'].split(':', 1)[1]
+        with self.db.conn:
+            self.bot.confirm(ident, True, 1)
+        self.assertEqual([self.service.balance(first), self.service.balance(second)], [0, 0])
+
+    def test_mixed_batch_keeps_the_classic_previews(self):
+        text, _ = self.card({'action': 'adjustment',
+                             'args': {'player': self.ids[0], 'amount': -1000}},
+                            {'action': 'player_note',
+                             'args': {'player': self.ids[1], 'note': 'یادداشت'}})
+        self.assertNotIn('| بازیکن |', text)
+        self.assertIn('اصلاح حساب', text)
+        self.assertIn('یادداشت بازیکن', text)
+
+    def test_pending_list_shows_the_same_table(self):
+        _, markup = self.card(*self.adjustments((self.ids[0], -1000), (self.ids[1], -2000)))
+        ident = markup[0][0]['callback_data'].split(':', 1)[1]
+        row = self.db.one('SELECT * FROM pending WHERE id=?', (ident,))
+        summary = self.bot.pending_summary(row)
+        self.assertIn('| بازیکن |', summary)
+        self.assertEqual(summary.count('| بازیکن |'), 1)

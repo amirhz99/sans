@@ -1005,6 +1005,77 @@ class AgentContractTests(unittest.TestCase):
         self.assertEqual(self.service.balance(2), 0)
 
 
+class AgentReplyPreviewTests(unittest.TestCase):
+    """SPEC-030: the card preview is never pasted a second time on top of a reply."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / 'preview.sqlite3'
+        self.db = Database(self.path)
+        self.service = Service(self.db)
+        self.config = Config('fake-token', -100, frozenset({1}), 'https://example.invalid',
+                             'fake-key', 'fake-model', self.path)
+        self.source = 0
+        for name in ('علی رضایی', 'رضا محمدی'):
+            self.person(name)
+        self.agent = SansAgent(Bot(self.db, self.config, SimpleNamespace(use_langgraph=False)))
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def person(self, name):
+        self.source += 1
+        with self.db.conn:
+            self.service.apply(self.service.prepare('new_player', {'name': name}),
+                               1, f'preview-test:{self.source}')
+
+    def effects(self):
+        return {'proposal_preview': None, 'tool_calls': []}
+
+    def review(self, reply, preview):
+        """Run only the reply-finalising rule of ``SansAgent.run``."""
+        effects = self.effects()
+        effects['proposal_preview'] = preview
+        return self.agent._finalize_reply(reply, effects)
+
+    def test_model_reply_that_echoes_the_card_is_not_doubled(self):
+        effects = self.effects()
+        tools = {t.name: t for t in self.agent._make_tools(-100, 1, True, None, effects)}
+        tools['propose_financial_change'].invoke({
+            'action': 'adjustment',
+            'entries': json.dumps([{'player': 'علی رضایی', 'amount': -900000},
+                                   {'player': 'رضا محمدی', 'amount': -300000}],
+                                  ensure_ascii=False),
+        })
+        preview = effects['proposal_preview']
+        self.assertIn('| بازیکن |', preview)
+
+        # The model answers by repeating the card it just received.
+        reply = f'کارت آماده شد:\n\n{preview}'
+        final = self.review(reply, preview)
+
+        self.assertEqual(final, reply)
+        self.assertEqual(final.count('| بازیکن |'), 1)
+        # The doubling came from a second copy of the whole card body.
+        self.assertEqual(final.count('ثبت شود؟ کد:'), 1)
+        self.assertEqual(final.count('| **جمع** |'), 1)
+
+    def test_reply_with_the_code_word_but_no_card_still_gets_the_card(self):
+        preview = 'اصلاح حساب\nبازیکن: علی رضایی\nمبلغ: -900,000\n\nثبت شود؟ کد: abc123'
+        # The old guard tested for «کد:» in the reply, so this reply lost the card.
+        final = self.review('کارت با کد abc123 آماده است، تأیید کنید.', preview)
+        self.assertIn('ثبت شود؟ کد: abc123', final)
+        self.assertTrue(final.startswith('کارت با کد abc123'))
+
+    def test_empty_reply_is_the_card_itself(self):
+        preview = 'اصلاح حساب\nبازیکن: علی رضایی\n\nثبت شود؟ کد: abc123'
+        self.assertEqual(self.review('', preview), preview)
+
+    def test_reply_without_a_card_is_left_alone(self):
+        self.assertEqual(self.review('سلام، در خدمتم.', None), 'سلام، در خدمتم.')
+
+
 class BatchFinancialToolTests(unittest.TestCase):
     """SPEC-012: one card for a multi-player balance correction."""
 

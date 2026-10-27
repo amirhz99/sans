@@ -859,6 +859,26 @@ class SansAgent:
 
         return [query_database, manage_records, propose_financial_change, message_players, ask_admins]
 
+    @staticmethod
+    def _finalize_reply(reply: str, effects: dict) -> str:
+        """Attach the approval card to the model reply at most once (SPEC-030).
+
+        The model usually repeats the tool result, and the whole card body lives
+        in ``effects['proposal_preview']``.  The old guard asked whether the word
+        «کد:» appeared in the reply, but the card itself always contains that
+        word, so a model that echoed the card still got it pasted on top: the
+        same block appeared two or three times in one message.  Compare the block
+        itself instead.
+        """
+        preview = effects.get('proposal_preview')
+        if not preview:
+            return reply
+        if not reply:
+            return preview
+        if preview.strip() in reply:
+            return reply
+        return f"{reply}\n\n{preview}"
+
     def run(
         self,
         body: str,
@@ -1087,11 +1107,7 @@ class SansAgent:
                     break
 
         reply = _unwrap_accidental_json(reply)
-
-        if not reply and effects.get('proposal_preview'):
-            reply = effects['proposal_preview']
-        elif effects.get('proposal_preview') and 'کد:' not in reply:
-            reply = f"{reply}\n\n{effects['proposal_preview']}"
+        reply = self._finalize_reply(reply, effects)
 
         total_ms = int((time.monotonic() - turn_start) * 1000)
         final_reply = reply or 'انجام شد.'
