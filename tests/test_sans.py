@@ -3793,9 +3793,50 @@ class ProgressUpdateTests(BaseCase):
         feed = self.bot.progress(client, self.ACK)
         feed(PROGRESS_START)
         feed.close()
-        # AC-010: nothing is sent once the answer takes over.
+        # AC-010: no further *edit* once the answer takes over; the close itself
+        # removes the message instead (AC-011).
         self.assertFalse(feed(PROGRESS_ANSWERING))
         self.assertEqual(client.methods().count('editMessageText'), 1)
+        self.assertEqual(client.methods().count('deleteMessage'), 1)
+
+    def test_progress_message_is_removed_after_the_answer(self):
+        client = RecordingClient()
+        self.ask(client, acknowledgement=self.ACK)
+        # AC-011: the answer is queued first, then the feed message is deleted.
+        self.assertEqual(len(self.queued('sendMessage')), 1)
+        self.assertEqual(client.methods()[-1], 'deleteMessage')
+        self.assertEqual(client.calls[-1][1], {'chat_id': 10, 'message_id': 555})
+
+    def test_progress_removal_failure_is_harmless(self):
+        class Client(RecordingClient):
+            def call(self, method, payload):
+                # The provider refuses the removal, as it does past 48 hours.
+                if method == 'deleteMessage':
+                    self.calls.append((method, dict(payload)))
+                    raise APIError('message can not be deleted', code=400)
+                return super().call(method, payload)
+
+        client = Client()
+        self.ask(client, acknowledgement=self.ACK)
+        # AC-011: the person still gets the answer.
+        self.assertEqual(len(self.queued('sendMessage')), 1)
+        self.assertEqual(client.methods()[-1], 'deleteMessage')
+
+    def test_close_without_a_step_sends_no_request(self):
+        client = RecordingClient()
+        feed = self.bot.progress(client, self.ACK)
+        # AC-012: nothing was shown, so there is nothing to remove.
+        self.assertFalse(feed.close())
+        self.assertEqual(client.calls, [])
+
+    def test_close_is_idempotent(self):
+        client = RecordingClient()
+        feed = self.bot.progress(client, self.ACK)
+        feed(PROGRESS_START)
+        # AC-011: a second close must not send a second removal.
+        self.assertTrue(feed.close())
+        self.assertFalse(feed.close())
+        self.assertEqual(client.methods().count('deleteMessage'), 1)
 
     def test_missing_acknowledgement_emits_no_progress(self):
         client = RecordingClient()

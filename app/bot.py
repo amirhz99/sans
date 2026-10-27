@@ -88,8 +88,27 @@ class TurnProgress:
         return False
 
     def close(self):
-        """SPEC-028: stop the feed; the answer takes over from here."""
+        """SPEC-028: stop the feed and remove its message.
+
+        The answer is already on its way as a new message, so a leftover
+        «در حال …» line would contradict it.  A feed that never displayed a step
+        has nothing to remove and sends no request.
+        """
+        if self.closed:
+            return False
         self.closed = True
+        if self.shown is None:
+            return False
+        try:
+            self.client.call('deleteMessage', {'chat_id': self.chat_id,
+                                               'message_id': self.message_id})
+            return True
+        except APIError as exc:
+            # A message older than 48 hours cannot be deleted; that is fine.
+            LOG.debug('Progress removal skipped for chat %s (%s)', self.chat_id, exc)
+        except Exception as exc:  # a progress line must never break a turn.
+            LOG.debug('Progress removal failed for chat %s (%s)', self.chat_id, exc)
+        return False
 
     def __call__(self, text):
         return self.step(text)
@@ -876,11 +895,11 @@ class Bot:
         self.db.save_conversation(chat_id, user_id, state, history)
         self.db.log_message(chat_id, 0, self.config.bot_name, reply, 'assistant')
         # SPEC-028: the acknowledgement message is a progress feed; the answer is
-        # always a fresh message, so a long reply can never leave a stale
-        # progress line on screen and the feed is never overwritten.
+        # always a fresh message.  The feed is closed only *after* the answer is
+        # queued, so a failed removal can never cost the person their reply.
+        self.db.say(chat_id, reply, markup, self.card_ref(markup), keyboard=keyboard)
         if progress is not None:
             progress.close()
-        self.db.say(chat_id, reply, markup, self.card_ref(markup), keyboard=keyboard)
 
     @staticmethod
     def parse_amount(body):

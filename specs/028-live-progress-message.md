@@ -84,8 +84,16 @@ left alone for good; the answer never replaces it and never edits it.
 - A step that repeats the currently displayed text sends nothing.  Two steps are
   never sent closer than `PROGRESS_MIN_INTERVAL` seconds apart, so a fast turn
   cannot burst the provider.
-- `TurnProgress.close()` marks the feed finished; later `step()` calls are
+- `TurnProgress.close()` marks the feed finished and **removes** the progress
+  message, because the answer is already on its way as a new message and a
+  leftover «در حال …» line would contradict it.  Later `step()` calls are
   no-ops.  The final answer path calls it before replying.
+- The removal is fail-open like every other feed call: an `APIError` or any
+  unexpected exception is swallowed at debug level, so a message the bot can no
+  longer delete (older than 48 hours, already deleted by the person) never fails
+  the turn.
+- A feed that never showed a step has nothing to remove, so `close()` sends
+  nothing for it.  This keeps the "no progress" routes at zero extra requests.
 - The progress payload mirrors the acknowledgement: same `chat_id`, same
   `message_id`, plain text, no `reply_markup` (SPEC-016 keeps keyboards off
   edits).  Each edit is a direct `client.call`, never an outbox row.
@@ -119,6 +127,8 @@ number of API calls, so a test can fail for a UX reason.
 - [x] AC-008: an `APIError` or unexpected exception from a progress edit does not stop the turn; the answer is still produced.
 - [x] AC-009: every progress text comes from the fixed catalogue and contains no amount, phone number, player name, or receipt content; an unknown text is not sent.
 - [x] AC-010: `close()` stops the feed: no edit is sent after the answer is produced.
+- [x] AC-011: after an answered turn the progress message is gone — the person is left with the answer only, and a failure to remove it never breaks the turn or suppresses the answer.
+- [x] AC-012: a feed that never displayed a step sends no removal request, so deterministic routes add no extra traffic.
 
 ## Test Mapping
 
@@ -132,6 +142,8 @@ number of API calls, so a test can fail for a UX reason.
 - AC-008 -> `tests/test_sans.py::ProgressUpdateTests::test_progress_failure_never_breaks_the_turn`
 - AC-009 -> `tests/test_sans.py::ProgressUpdateTests::test_progress_text_carries_no_data`
 - AC-010 -> `tests/test_sans.py::ProgressUpdateTests::test_progress_stops_after_close`
+- AC-011 -> `tests/test_sans.py::ProgressUpdateTests::test_progress_message_is_removed_after_the_answer`
+- AC-012 -> `tests/test_sans.py::ProgressUpdateTests::test_close_without_a_step_sends_no_request`
 
 ## Safety Constraints
 
