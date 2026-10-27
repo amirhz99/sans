@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -13,10 +13,18 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import tools_condition
 
+from . import jalali
 from .service import (MAX_BATCH, TEHRAN, UserError, integer, normalize,
                       setting_value_is_explicit)
 
 LOG = logging.getLogger('sans.agent')
+
+
+def _jalali_short(value):
+    """Render a date as «۱۴۰۵/۰۸/۰۶» for the model's snapshot (SPEC-026)."""
+    jy, jm, jd = jalali.from_gregorian(value)
+    return f'{jy:04d}/{jm:02d}/{jd:02d}'
+
 
 # SPEC-018: how much conversation the agent may look at.  The database keeps
 # HISTORY_LIMIT entries; the agent reads this window and sends a shorter tail to
@@ -32,6 +40,9 @@ AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمن�
 قوانین و اختیارات تو:
 ۱. درک کامل بافت و تاریخچه:
    - پیام‌های اخیر چت و وضعیت فعلی را می‌بینی. اگر کسی تاریخ شمسی، روز هفته یا عبارت محاوره‌ای (مثل «پنجشنبه»، «جلسه قبلی»، «سانس اول»، «هفته پیش») گفت، خودت آن را درک کن.
+   - در بافت `now_tehran` تاریخ امروز به تقویم شمسی و با نام روز هفته آمده است؛ همین را مبنا بگیر و خودت تقویم میلادی را به شمسی تبدیل نکن.
+   - تاریخ‌های نسبی («فردا»، «پس‌فردا»، «هفته بعد»، «آخر هفته»، «جمعه هفته بعد») را **دقیقاً همان‌طور که کاربر نوشت** در `when_text` بده؛ خودت تاریخ را حساب نکن و میلادی ننویس. ابزار خودش با ساعت تهران آن را حل می‌کند.
+   - اگر ربات گفت روز هفته با تاریخ نمی‌خواند، همان پیشنهاد را به کاربر بگو و منتظر تأیید بمان؛ هرگز خودت تاریخ را عوض نکن و دوباره با روز دیگری نفرست. هر روزی برای سانس مجاز است.
    - برای ثبت جلسات قدیمی یا ناقص، هیچ اجباری به داشتن ساعت یا تاریخ دقیق میلادی نیست؛ هر اطلاعاتی که کاربر داد (حتی فقط عنوان سانس و اسم حاضران) را با ابزار `manage_records` ثبت کن.
 
 ۲. مرز کارهای مستقیم و کارهای نیازمند تأیید ادمین:
@@ -119,7 +130,13 @@ class SansAgent:
     def _build_live_snapshot(self, chat_id: int, user_id: int, admin: bool, sender: dict | None) -> str:
         db = self.bot.db
         service = self.bot.service
-        now = datetime.now(TEHRAN).strftime('%Y-%m-%d %H:%M (%A)')
+        moment = datetime.now(TEHRAN)
+        today = moment.date()
+        # SPEC-026: the model reads a Jalali «now» with a Persian weekday, so it
+        # never has to convert «Tuesday» or a Gregorian date into what the
+        # operator writes.
+        today_text = (f'{jalali.format_date(today)}، {jalali.weekday_name(today)}، '
+                      f'ساعت {jalali.persian_digits(f"{moment:%H:%M}")}')
         linked = service.linked(user_id)
         open_sessions = db.all('SELECT * FROM sessions WHERE finalized=0 ORDER BY id DESC LIMIT 5')
         recent_sessions = db.all('SELECT * FROM sessions ORDER BY id DESC LIMIT 8')
@@ -135,7 +152,11 @@ class SansAgent:
             "AND status='pending'", (user_id,)))
 
         snapshot = {
-            'now_tehran': now,
+            'now_tehran': today_text,
+            # SPEC-026: precomputed Jalali relatives so the model never converts
+            # a calendar or a English weekday name itself.
+            'tomorrow': _jalali_short(today + timedelta(days=1)),
+            'day_after': _jalali_short(today + timedelta(days=2)),
             'caller': {
                 'user_id': user_id,
                 'chat_id': chat_id,

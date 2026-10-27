@@ -158,7 +158,7 @@ class PlanTests(BackfillCase):
         path = self.roster({'علی': {'۹ خرداد': 0}}, labels=['۹ خرداد'])
         with self.assertRaises(UserError) as caught:
             read_plan(path)
-        self.assertIn('جمعه نیست', str(caught.exception))
+        self.assertIn('نه جمعه', str(caught.exception))
         self.assertFalse(self.db.all('SELECT * FROM sessions'))
 
     def test_a_duplicate_date_and_a_bad_guest_count_are_rejected(self):

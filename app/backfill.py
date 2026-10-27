@@ -286,8 +286,11 @@ def planned_sessions(labels, hour=SESSION_HOUR):
             raise UserError(f'تاریخ «{clean}» در لیست حضور معتبر نیست؛ مثلاً «۸ خرداد».') from None
         moment = datetime.fromisoformat(stamp).astimezone(TEHRAN)
         if moment.weekday() != FRIDAY:
+            # SPEC-026: the shared helper names the real weekday, so the message
+            # cannot claim «جمعه نیست» without saying what it actually is.
             raise UserError(
-                f'{jalali.format_date(moment.date())} جمعه نیست؛ همهٔ سانس‌های این دوره جمعه بوده‌اند.')
+                f'{jalali.format_date(moment.date())} {jalali.weekday_name(moment.date())} است، '
+                'نه جمعه؛ همهٔ سانس‌های این دوره جمعه بوده‌اند.')
         if moment.date() in seen:
             raise UserError(f'تاریخ {jalali.format_date(moment.date())} دو بار در لیست آمده است.')
         seen.add(moment.date())

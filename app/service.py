@@ -103,11 +103,113 @@ def setting_value_is_explicit(message, key, value):
 
 
 TEHRAN = ZoneInfo('Asia/Tehran')
+# SPEC-026: the lookup is done on ``normalize()`` output, so every name is stored
+# in its space form.  A ZWNJ («سه‌شنبه») and a space («سه شنبه») are the same key.
 WEEKDAYS = {
-    'دوشنبه': 0, 'سه شنبه': 1, 'سه‌شنبه': 1, 'چهارشنبه': 2,
-    'پنجشنبه': 3, 'جمعه': 4, 'شنبه': 5, 'یکشنبه': 6, 'یک‌شنبه': 6,
+    'دوشنبه': 0, 'سه شنبه': 1, 'چهارشنبه': 2, 'پنجشنبه': 3,
+    'جمعه': 4, 'شنبه': 5, 'یکشنبه': 6,
 }
+# SPEC-026: «شنبه» is a suffix of «پنجشنبه»/«یکشنبه», so a longest-key-first scan
+# is required; a plain ``in`` test over the mapping would match the wrong day.
+_WEEKDAY_KEYS = tuple(sorted(WEEKDAYS, key=len, reverse=True))
+FRIDAY = WEEKDAYS['جمعه']
 JALALI_MONTHS = jalali.MONTHS
+
+
+def weekday_phrase(value):
+    """Return ``(weekday, phrase)`` for the weekday the operator wrote, or None.
+
+    The phrase is the matched key in its space form, so «پنج‌شنبه» and «پنج شنبه»
+    report the same day.  A day word inside a longer word («شنبه‌ها») still counts:
+    it is a weekday, and the consistency check below decides whether the date
+    agrees with it.
+    """
+    position = -1
+    found = None
+    for key in _WEEKDAY_KEYS:
+        index = value.find(key)
+        if index == -1:
+            continue
+        if found is None or index < position or (index == position and len(key) > len(found)):
+            position, found = index, key
+    return (WEEKDAYS[found], found) if found else None
+
+
+def _next_weekday(now, weekday, hour, minute):
+    """Return the next occurrence of ``weekday`` at the stated Tehran clock."""
+    delta = (weekday - now.weekday()) % 7
+    candidate = now.date() + timedelta(days=delta)
+    if delta == 0 and time(hour, minute) <= now.timetz().replace(tzinfo=None):
+        candidate += timedelta(days=7)
+    return candidate
+
+
+SATURDAY = WEEKDAYS['شنبه']
+
+
+def _week_start(day):
+    """Return the Saturday that starts the Iranian week containing ``day``."""
+    return day - timedelta(days=(day.weekday() - SATURDAY) % 7)
+
+
+def resolve_relative_date(date_text, now, hour, minute):
+    """Return the Tehran ``date`` a phrase means relative to ``now`` (SPEC-026).
+
+    ``date_text`` is the operator phrase with the clock span already removed.
+    Explicit dates are handled by the caller, so this is the relative layer.
+    """
+    found = weekday_phrase(date_text)
+    next_week = any(word in date_text
+                    for word in ('هفته بعد', 'هفته اینده', 'هفته آینده', 'هفته دیگر', 'هفته دیگه'))
+    this_week = 'این هفته' in date_text or 'همین هفته' in date_text
+    if 'پس فردا' in date_text or 'پسفردا' in date_text:
+        return now.date() + timedelta(days=2)
+    if 'فردا' in date_text:
+        return now.date() + timedelta(days=1)
+    if found:
+        weekday = found[0]
+        if this_week:
+            # «جمعه این هفته»: the same week as today; the day may already be
+            # behind us, which is exactly what the operator said.
+            return _week_start(now.date()) + timedelta(days=(weekday - SATURDAY) % 7)
+        if next_week or 'بعد' in date_text:
+            # «جمعه هفته بعد»: the first such weekday inside a later week, so it
+            # is always at least seven days away, even when today is that day.
+            week = _week_start(now.date()) + timedelta(days=7)
+            if week + timedelta(days=(weekday - SATURDAY) % 7) <= now.date():
+                week += timedelta(days=7)
+            return week + timedelta(days=(weekday - SATURDAY) % 7)
+        return _next_weekday(now, weekday, hour, minute)
+    if 'اخر هفته' in date_text or 'آخر هفته' in date_text:
+        return _next_weekday(now, FRIDAY, hour, minute)
+    if next_week:
+        # «هفته بعد ساعت ۲۱»: the same clock, seven days later.
+        return now.date() + timedelta(days=7)
+    # A clock without a date means today in the Tehran context; «امروز» and
+    # «امشب» are explicit spellings of the same thing.
+    return now.date()
+
+
+def _require_matching_weekday(target, date_text):
+    """Refuse a date that contradicts a weekday the operator wrote (SPEC-026).
+
+    Any weekday is a valid session day; the rule is only that the date and the
+    word must agree.  The message names both and proposes the nearest matching
+    Jalali date so the operator can confirm instead of recomputing.
+    """
+    found = weekday_phrase(date_text)
+    if not found:
+        return
+    weekday, phrase = found
+    if target.weekday() == weekday:
+        return
+    # The nearest day with that weekday: backwards shares the number of days
+    # that forwards does, so prefer the future one.
+    delta = (weekday - target.weekday()) % 7
+    nearest = target + timedelta(days=delta)
+    raise UserError(
+        f'{jalali.format_date(target)} {jalali.weekday_name(target)} است، نه {phrase}. '
+        f'نزدیک‌ترین {phrase} {jalali.format_date(nearest)} است؛ منظورتان همان است؟')
 
 
 def _jalali_date(value, now, require_day=True):
@@ -123,7 +225,14 @@ def _jalali_date(value, now, require_day=True):
     if numeric:
         jy, jm, jd = (int(part) for part in numeric.groups())
     else:
-        month = next((index for index, name in enumerate(JALALI_MONTHS, 1) if name in value), None)
+        # SPEC-026: a month name must stand alone.  Without the boundaries the
+        # short month «دی» matches inside «هفته بعدی» and invents a month with no
+        # day, which used to fail closed with a confusing message.
+        month = None
+        for index, name in enumerate(JALALI_MONTHS, 1):
+            if re.search(rf'(?<![\u0600-\u06FF]){name}(?![\u0600-\u06FF])', value):
+                month = index
+                break
         if month is None:
             return None
         name = JALALI_MONTHS[month - 1]
@@ -211,23 +320,13 @@ def parse_session_datetime(value, now=None):
             raise UserError('تاریخ سانس معتبر نیست.')
     elif jalali_target is not None:
         target = jalali_target
-    elif 'پسفردا' in raw:
-        target += timedelta(days=2)
-    elif 'فردا' in raw:
-        target += timedelta(days=1)
     else:
-        weekday = next((day for name, day in WEEKDAYS.items() if name in raw), None)
-        if weekday is not None:
-            delta = (weekday - now.weekday()) % 7
-            candidate = target + timedelta(days=delta)
-            if candidate == target and time(hour, minute) <= now.timetz().replace(tzinfo=None):
-                candidate += timedelta(days=7)
-            target = candidate
-        elif not any(word in raw for word in ('امروز', 'امشب')):
-            # A clock without a date is unambiguously today in the Tehran
-            # context supplied to the bot; an explicit relative date is still
-            # preferred by the prompt.
-            target = now.date()
+        # SPEC-026: relatives, «هفته بعد», «آخر هفته» and weekdays are resolved
+        # by one helper, so «پس فردا» can no longer fall through to «فردا».
+        target = resolve_relative_date(date_text, now, hour, minute)
+    # SPEC-026: a weekday the operator wrote is a constraint on the date, not an
+    # offset.  Any weekday is a valid session day; only a contradiction fails.
+    _require_matching_weekday(target, date_text)
     return datetime.combine(target, time(hour, minute), tzinfo=TEHRAN).isoformat(timespec='minutes')
 
 

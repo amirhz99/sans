@@ -1337,6 +1337,48 @@ class ChatMemoryWindowTests(unittest.TestCase):
         self.assertTrue(payload['history'][0]['content'].startswith('12 '))
         self.assertTrue(payload['history'][-1]['content'].startswith('19 '))
 
+class SnapshotDateContextTests(unittest.TestCase):
+    """SPEC-026: the model gets a Jalali «now», never a Gregorian weekday name."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp.name) / 'dates.sqlite3')
+        self.service = Service(self.db)
+        self.bot = Bot(self.db, SimpleNamespace(admin_group=-100, bot_name='sans',
+                                                reminder_hours=0, admins=frozenset({1})), None)
+        with self.db.conn:
+            self.service.apply(self.service.prepare('new_player', {'name': 'علی رضایی'}), 1, 'test:1')
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def test_snapshot_now_is_jalali_with_persian_weekday(self):
+        snapshot = json.loads(SansAgent(self.bot)._build_live_snapshot(-100, 1, True, None))
+
+        self.assertIn('now_tehran', snapshot)
+        # «۵ آبان ۱۴۰۵، سه‌شنبه، ساعت ۱۲:۴۲»
+        self.assertRegex(snapshot['now_tehran'], r'^\d{1,2} \S+ \d{4}، ')
+        weekdays = ('شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه')
+        self.assertTrue(any(day in snapshot['now_tehran'] for day in weekdays))
+        self.assertIn('ساعت', snapshot['now_tehran'])
+        self.assertNotIn('Monday', snapshot['now_tehran'])
+        self.assertNotIn('Tuesday', snapshot['now_tehran'])
+
+        self.assertRegex(snapshot['tomorrow'], r'^\d{4}/\d{2}/\d{2}$')
+        self.assertRegex(snapshot['day_after'], r'^\d{4}/\d{2}/\d{2}$')
+        tomorrow = [int(part) for part in snapshot['tomorrow'].split('/')]
+        day_after = [int(part) for part in snapshot['day_after'].split('/')]
+        self.assertNotEqual(tomorrow, day_after)
+
+    def test_snapshot_dates_add_no_private_data(self):
+        snapshot = json.loads(SansAgent(self.bot)._build_live_snapshot(-100, 1, False, None))
+
+        # AGENTS.md: the directory never travels; only its size does.
+        self.assertEqual(snapshot['players_count'], 1)
+        self.assertNotIn('players', snapshot)
+        text = json.dumps(snapshot, ensure_ascii=False)
+        self.assertNotIn('علی رضایی', text)
 
 class OutreachPromptTests(unittest.TestCase):
     """SPEC-019: the prompt and the tool must not invent a reply-only bot."""

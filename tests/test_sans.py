@@ -368,6 +368,83 @@ class JalaliDateTests(BaseCase):
         self.assertIsNone(no_hour['session_at'])
         self.assertEqual(no_hour['when_text'], '۹ خرداد')
 
+class RelativeDateTests(BaseCase):
+    """SPEC-026: relatives resolve forward and a weekday never contradicts a date."""
+
+    # Tuesday 5 آبان 1405.
+    NOW = datetime(2026, 10, 27, 10, 0, tzinfo=ZoneInfo('Asia/Tehran'))
+
+    def parse(self, value, now=None):
+        return parse_session_datetime(value, now or self.NOW)
+
+    def test_post_tomorrow_works_with_and_without_zwnj(self):
+        self.assertEqual(self.parse('فردا ساعت ۲۱'), '2026-10-28T21:00+03:30')
+        self.assertEqual(self.parse('پس‌فردا ساعت ۲۱'), '2026-10-29T21:00+03:30')
+        self.assertEqual(self.parse('پس فردا ساعت ۲۱'), '2026-10-29T21:00+03:30')
+
+    def test_next_week_phrases_resolve_forward(self):
+        self.assertEqual(self.parse('هفته بعد ساعت ۲۱'), '2026-11-03T21:00+03:30')
+        self.assertEqual(self.parse('جمعه هفته بعد ساعت ۲۱'), '2026-11-06T21:00+03:30')
+        self.assertEqual(self.parse('جمعه هفته بعدی ساعت ۲۱'), '2026-11-06T21:00+03:30')
+        self.assertEqual(self.parse('جمعه این هفته ساعت ۲۱'), '2026-10-30T21:00+03:30')
+        # Even on a Friday evening, «جمعه هفته بعد» is at least a week away.
+        friday_night = datetime(2026, 10, 30, 22, 0, tzinfo=ZoneInfo('Asia/Tehran'))
+        self.assertEqual(self.parse('جمعه هفته بعد ساعت ۲۱', friday_night),
+                         '2026-11-06T21:00+03:30')
+        self.assertEqual(self.parse('جمعه این هفته ساعت ۲۱', friday_night),
+                         '2026-10-30T21:00+03:30')
+
+    def test_weekend_and_bare_weekday_use_next_occurrence(self):
+        self.assertEqual(self.parse('آخر هفته ساعت ۲۱'), '2026-10-30T21:00+03:30')
+        # A bare weekday is its next occurrence, today included.
+        self.assertEqual(self.parse('سه شنبه ساعت ۲۱'), '2026-10-27T21:00+03:30')
+        self.assertEqual(self.parse('شنبه ساعت ۲۱'), '2026-10-31T21:00+03:30')
+        self.assertEqual(self.parse('پنج شنبه ساعت ۲۱'), '2026-10-31T21:00+03:30')
+        # Once today's clock has passed, the next occurrence is a week away.
+        self.assertEqual(self.parse('سه شنبه ساعت ۲۱', datetime(2026, 10, 27, 22, 0,
+                                                                tzinfo=ZoneInfo('Asia/Tehran'))),
+                         '2026-11-03T21:00+03:30')
+
+    def test_weekday_that_contradicts_the_date_fails_closed(self):
+        # 9 آذر 1405 is a Monday; the nearest Friday is 13 آذر.
+        with self.assertRaises(UserError) as caught:
+            self.parse('۹ آذر جمعه ساعت ۲۱')
+        message = str(caught.exception)
+        self.assertIn('دوشنبه', message)
+        self.assertIn('نه جمعه', message)
+        self.assertIn('۱۳ آذر ۱۴۰۵', message)
+        with self.assertRaises(UserError):
+            self.parse('2026-11-30 جمعه ساعت ۲۱')
+        self.assertIsNone(self.db.one('SELECT id FROM sessions'))
+
+    def test_any_weekday_is_allowed_when_it_matches(self):
+        # Friday and Saturday both resolve; there is no allow-list.
+        self.assertEqual(self.parse('جمعه ۱۴۰۵/۰۸/۰۸ ساعت ۲۱'), '2026-10-30T21:00+03:30')
+        self.assertEqual(self.parse('شنبه ۹ آبان ساعت ۲۱'), '2026-10-31T21:00+03:30')
+        self.assertEqual(self.parse('دوشنبه ۹ آذر ساعت ۲۱'), '2026-11-30T21:00+03:30')
+        # A session on Saturday is created without any complaint.
+        self.apply('new_session', title='سانس شنبه', when_text='شنبه ۹ آبان ساعت ۲۱',
+                   person_fee=2500000)
+        row = self.db.one('SELECT * FROM sessions WHERE title=?', ('سانس شنبه',))
+        self.assertEqual(row['session_at'], '2026-10-31T21:00+03:30')
+
+        # A session whose weekday is wrong stores nothing.
+        with self.assertRaises(UserError):
+            self.apply('new_session', title='سانس اشتباه', when_text='۹ آذر جمعه ساعت ۲۱')
+        self.assertIsNone(self.db.one('SELECT id FROM sessions WHERE title=?', ('سانس اشتباه',)))
+
+    def test_explicit_dates_win_over_relative_words(self):
+        self.assertEqual(self.parse('۹ خرداد ساعت ۲۱'), '2026-05-30T21:00+03:30')
+        self.assertEqual(self.parse('۱۴۰۵/۰۳/۰۹ ۲۱:۰۰'), '2026-05-30T21:00+03:30')
+        self.assertEqual(self.parse('2026-10-30 21:00'), '2026-10-30T21:00+03:30')
+
+    def test_roster_importer_still_requires_fridays(self):
+        from app.backfill import planned_sessions
+        with self.assertRaises(UserError) as caught:
+            planned_sessions(['۹ آذر'])
+        message = str(caught.exception)
+        self.assertIn('دوشنبه', message)
+        self.assertIn('نه جمعه', message)
 
 class PermissionAndConversationTests(BaseCase):
     def test_all_group_members_can_manage_only_in_designated_group(self):

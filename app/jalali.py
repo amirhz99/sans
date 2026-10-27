@@ -119,6 +119,15 @@ def persian_digits(value):
     return str(value).translate(_PERSIAN_DIGITS)
 
 
+# ``date.weekday()`` order: Monday is 0 and Sunday is 6.
+WEEKDAY_NAMES = ('دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه', 'شنبه', 'یکشنبه')
+
+
+def weekday_name(value):
+    """Return the Persian weekday of a ``datetime.date`` («سه‌شنبه»)."""
+    return WEEKDAY_NAMES[value.weekday()]
+
+
 def format_date(value, with_year=True):
     """Render a Gregorian date as «۹ خرداد ۱۴۰۵»."""
     jy, jm, jd = from_gregorian(value)
