@@ -869,8 +869,35 @@ class SansAgent:
         sender: dict | None = None,
         llm_override: Any = None,
         current_message: str | None = None,
+        progress: Any = None,
     ) -> tuple[str, list | None, dict[str, Any]]:
-        """Execute the LangGraph StateGraph for one conversational turn."""
+        """Execute the LangGraph StateGraph for one conversational turn.
+
+        ``progress`` is an optional SPEC-028 feed: a callable that receives one of
+        the fixed ``PROGRESS_*`` step texts.  It is called from inside the graph
+        nodes, so the acknowledgement message can advance while ``graph.invoke``
+        is still running, and it never affects the result of the turn.
+        """
+        # SPEC-028: the step texts live in ``bot`` to keep the catalogue in one
+        # place; importing locally avoids a circular import at module load.
+        from .bot import PROGRESS_ANSWERING, PROGRESS_READING, PROGRESS_START, PROGRESS_WRITING
+
+        def report(step_text):
+            if progress is None:
+                return
+            try:
+                progress(step_text)
+            except Exception:  # a progress line must never break a turn.
+                LOG.debug('Progress feed raised; ignoring', exc_info=True)
+
+        # SPEC-028: tools that only read may announce the read step; anything else
+        # may change state, so it announces the write step.  The split is a fixed
+        # catalogue keyed by a fixed set of names, so no tool name reaches a user.
+        read_only_tools = {'query_database', 'list_sessions', 'get_session',
+                           'list_players', 'get_player', 'player_debt', 'report',
+                           'duplicates', 'pending_proposals', 'session_info'}
+        tool_steps_announced = set()
+        tool_results = {'count': 0}
         turn_start = time.monotonic()
         sender_name = (
             ' '.join(filter(None, [(sender or {}).get('first_name', ''), (sender or {}).get('last_name', '')]))
@@ -921,6 +948,9 @@ class SansAgent:
 
         def call_model(state: MessagesState):
             t0 = time.monotonic()
+            # SPEC-028: the first model call is the start of the work; a call that
+            # follows tool results is the composition of the answer.
+            report(PROGRESS_ANSWERING if tool_results['count'] else PROGRESS_START)
             messages = [SystemMessage(content=sys_text)] + state['messages']
             # Start from the model that last answered; within one turn there are
             # usually two model calls (tool round + final answer) and there is no
@@ -990,6 +1020,14 @@ class SansAgent:
                 t_id = tc.get('id', '')
                 t0 = time.monotonic()
                 tool_fn = tool_map.get(t_name)
+                # SPEC-028: announce what this tool is about to do.  Only the fixed
+                # catalogue text is sent, never the tool name or its arguments.
+                if tool_fn is not None:
+                    if t_name in read_only_tools:
+                        report(PROGRESS_READING)
+                    else:
+                        report(PROGRESS_WRITING)
+                    tool_steps_announced.add(t_name)
                 if tool_fn is None:
                     res_text = f'ابزار ناشناخته: {t_name}'
                 else:
@@ -1008,6 +1046,9 @@ class SansAgent:
                     duration_ms=dt_ms,
                 )
                 out_messages.append(ToolMessage(content=res_text, name=t_name, tool_call_id=t_id))
+                # SPEC-028: the next model call composes the answer from results.
+                if tool_fn is not None:
+                    tool_results['count'] += 1
             return {'messages': out_messages}
 
         builder = StateGraph(MessagesState)

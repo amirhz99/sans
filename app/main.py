@@ -312,7 +312,7 @@ def run(db, config):
                     message_id = send_acknowledgement(client, chat_id)
                     if message_id is not None:
                         acknowledgement = {'chat_id': chat_id, 'message_id': message_id}
-                bot.process(update, acknowledgement)
+                bot.process(update, acknowledgement, client=client)
                 flush_outbox(db, client)
         except APIError as exc:
             LOG.warning('API unavailable: %s', exc)

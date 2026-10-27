@@ -26,19 +26,73 @@ GREETING_REPLY = 'سلام! در خدمتم؛ بفرمایید چه کاری ب�
 
 LOG = logging.getLogger('sans')
 
-# SPEC-027: one short, data-free line edited onto the acknowledgement message
-# while a turn is still running.  The final reply reuses the same message.
-PROGRESS_TEXT = '⏳ پیامتان دریافت شد؛ در حال بررسی و آماده‌سازی پاسخ هستم…'
+# SPEC-028: the acknowledgement message is a progress feed.  It is edited step by
+# step while a turn runs and is then left alone forever: the answer always goes
+# out as a new message.  The four texts below are a fixed catalogue, so no tool
+# name, player name, amount, or receipt content can reach it.
+PROGRESS_START = '⏳ در حال بررسی درخواست…'
+PROGRESS_READING = '🔎 در حال خواندن اطلاعات…'
+PROGRESS_WRITING = '✍️ در حال ثبت تغییرات…'
+PROGRESS_ANSWERING = '💬 در حال آماده‌سازی پاسخ…'
+PROGRESS_STEPS = frozenset({PROGRESS_START, PROGRESS_READING,
+                            PROGRESS_WRITING, PROGRESS_ANSWERING})
+# Two edits closer than this would burst the provider on a very fast turn.
+PROGRESS_MIN_INTERVAL = 0.0
 
 
 def progress_enabled():
-    """SPEC-027: ``PROGRESS_UPDATES=0`` disables the intermediate edit."""
+    """SPEC-027/028: ``PROGRESS_UPDATES=0`` disables the progress feed."""
     raw = os.getenv('PROGRESS_UPDATES', '').strip().lower()
     return raw not in {'0', 'false', 'no', 'off'}
 
 
 def _valid_id(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+class TurnProgress:
+    """SPEC-028: a de-duplicated, rate-limited editor for one progress message.
+
+    The feed is intentionally fail-open.  Every failure is swallowed: progress is
+    a UX aid and must never abort, retry, or slow down a turn.
+    """
+
+    def __init__(self, client, chat_id, message_id, min_interval=PROGRESS_MIN_INTERVAL):
+        self.client = client
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.min_interval = max(0.0, float(min_interval))
+        self.shown = None
+        self.closed = False
+        self.last_at = None
+
+    def step(self, text):
+        """Show ``text`` on the progress message; return ``True`` if it was sent."""
+        if self.closed or text not in PROGRESS_STEPS or text == self.shown:
+            return False
+        now = time.monotonic()
+        if self.last_at is not None and now - self.last_at < self.min_interval:
+            return False
+        # Mark first so a retried model path cannot send the same line twice.
+        self.shown = text
+        self.last_at = now
+        try:
+            self.client.call('editMessageText', {'chat_id': self.chat_id,
+                                                 'message_id': self.message_id,
+                                                 'text': text})
+            return True
+        except APIError as exc:
+            LOG.debug('Progress edit skipped for chat %s (%s)', self.chat_id, exc)
+        except Exception as exc:  # a progress line must never break a turn.
+            LOG.debug('Progress edit failed for chat %s (%s)', self.chat_id, exc)
+        return False
+
+    def close(self):
+        """SPEC-028: stop the feed; the answer takes over from here."""
+        self.closed = True
+
+    def __call__(self, text):
+        return self.step(text)
 
 
 # SPEC-016: a contact card can only be obtained through a reply-keyboard button.
@@ -242,12 +296,12 @@ class Bot:
                            (chat_id, message_id))
 
     def progress(self, client, acknowledgement):
-        """SPEC-027: return a one-shot ``step`` callable, or ``None``.
+        """SPEC-028: return a ``TurnProgress`` for this turn, or ``None``.
 
-        The edit is sent straight through the client, never through the
-        transactional outbox: a progress line is a UX aid, so it must neither
-        wait for the ``BEGIN IMMEDIATE`` transaction to commit nor be rolled
-        back with it.  Every failure is swallowed by design (AC-005).
+        The feed edits the acknowledgement message directly through the client,
+        never through the transactional outbox: progress is a UX aid, so it must
+        neither wait for the ``BEGIN IMMEDIATE`` transaction to commit nor be
+        rolled back with it.  Every failure is swallowed by design.
         """
         if client is None or not progress_enabled():
             return None
@@ -256,25 +310,7 @@ class Bot:
         message_id = edit.get('message_id')
         if not (_valid_id(chat_id) and _valid_id(message_id)):
             return None
-        sent = []
-
-        def step():
-            # AC-007: at most one edit per turn, even if the model path retries.
-            if sent:
-                return False
-            sent.append(True)
-            try:
-                client.call('editMessageText', {'chat_id': chat_id,
-                                                'message_id': message_id,
-                                                'text': PROGRESS_TEXT})
-                return True
-            except APIError as exc:
-                LOG.debug('Progress edit skipped for chat %s (%s)', chat_id, exc)
-            except Exception as exc:  # AC-005: progress never breaks a turn.
-                LOG.debug('Progress edit failed for chat %s (%s)', chat_id, exc)
-            return False
-
-        return step
+        return TurnProgress(client, chat_id, message_id)
 
     def process(self, update, acknowledgement=None, client=None):
         uid = update.get('update_id')
@@ -489,6 +525,9 @@ class Bot:
             return ResponseLevel.SUMMARY
 
     def message(self, msg, acknowledgement=None, client=None):
+        # SPEC-028: the progress feed is created lazily, only on the model paths,
+        # and stays ``None`` for every deterministic route.
+        progress = None
         chat = msg.get('chat', {})
         chat_id = chat.get('id')
         user_id = msg.get('from', {}).get('id')
@@ -632,12 +671,10 @@ class Bot:
                     if amount is not None:
                         command = {'action': 'payment_amount', 'args': {'amount': amount}}
                     elif getattr(self.ai, 'use_langgraph', False):
+                        # SPEC-028: the acknowledgement message becomes a live
+                        # progress feed while the agent works.
+                        progress = self.progress(client, acknowledgement)
                         try:
-                            # SPEC-027: show activity on the acknowledgement before
-                            # the (possibly slow) model call starts.
-                            step = self.progress(client, acknowledgement)
-                            if step:
-                                step()
                             reply, markup, effects = self.agent.run(
                                 processing_body,
                                 history,
@@ -647,6 +684,7 @@ class Bot:
                                 sender=sender,
                                 llm_override=getattr(self.ai, 'llm_override', None),
                                 current_message=body,
+                                progress=progress,
                             )
                             if effects.get('last_session_id'):
                                 s = self.service.session(effects['last_session_id'])
@@ -658,9 +696,7 @@ class Bot:
                         except Exception as exc:
                             raise APIError(f'LangGraph execution error: {exc}') from None
                     else:
-                        step = self.progress(client, acknowledgement)
-                        if step:
-                            step()
+                        progress = self.progress(client, acknowledgement)
                         try:
                             command = Intent.from_dict(self.ai.parse(
                                 processing_body, history, self.context(chat_id, user_id, admin, reply_to)
@@ -839,27 +875,12 @@ class Bot:
         history += [{'role': 'user', 'content': processing_body[:4000]}, {'role': 'assistant', 'content': reply[:2500]}]
         self.db.save_conversation(chat_id, user_id, state, history)
         self.db.log_message(chat_id, 0, self.config.bot_name, reply, 'assistant')
-        # The polling loop may have sent a short-lived processing notice before
-        # entering this transaction. Replace it with the final response when
-        # possible; otherwise preserve the established chunking/send behavior.
-        edit = (acknowledgement if isinstance(acknowledgement, dict) else {})
-        edit_chat = edit.get('chat_id')
-        edit_message = edit.get('message_id')
-        can_edit = (isinstance(edit_chat, int) and not isinstance(edit_chat, bool)
-                    and edit_chat == chat_id
-                    and isinstance(edit_message, int) and not isinstance(edit_message, bool)
-                    and edit_message > 0 and len(reply) <= 3500
-                    and not had_receipt_step
-                    # SPEC-016: editMessageText cannot attach a reply keyboard.
-                    and not keyboard
-                    and not msg.get('contact') and not msg.get('photo') and not msg.get('document'))
-        if can_edit:
-            payload = {'chat_id': edit_chat, 'message_id': edit_message, 'text': reply}
-            if markup:
-                payload['reply_markup'] = {'inline_keyboard': markup}
-            self.db.queue('editMessageText', payload, self.card_ref(markup))
-        else:
-            self.db.say(chat_id, reply, markup, self.card_ref(markup), keyboard=keyboard)
+        # SPEC-028: the acknowledgement message is a progress feed; the answer is
+        # always a fresh message, so a long reply can never leave a stale
+        # progress line on screen and the feed is never overwritten.
+        if progress is not None:
+            progress.close()
+        self.db.say(chat_id, reply, markup, self.card_ref(markup), keyboard=keyboard)
 
     @staticmethod
     def parse_amount(body):

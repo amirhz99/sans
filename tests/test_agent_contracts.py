@@ -13,7 +13,7 @@ from app.config import Config
 from app.content import DEFAULTS, SYSTEM_PROMPT
 from app.db import Database
 from app.domain import ConversationState, EntityRef, EntityType, Intent, ResponseLevel
-from app.bot import PROGRESS_TEXT, Bot
+from app.bot import PROGRESS_STEPS, Bot
 from app.presentation import SessionView
 from app.prompt_loader import PromptLoader
 from app.service import Service
@@ -1544,16 +1544,15 @@ class LangGraphProgressTests(unittest.TestCase):
         }}, {'chat_id': 1, 'message_id': 77}, client=Client())
 
         edits = [payload for method, payload in recorded if method == 'editMessageText']
-        self.assertEqual(len(edits), 1)
-        self.assertEqual(edits[0]['message_id'], 77)
-        self.assertEqual(edits[0]['text'], PROGRESS_TEXT)
-        # The final answer reuses the same message, as before: the outbox holds
-        # one edit to message 77 whose text is the answer, not the progress line.
+        # SPEC-028: the feed advances through the real steps of the turn.
+        self.assertGreaterEqual(len(edits), 2)
+        self.assertEqual({edit['message_id'] for edit in edits}, {77})
+        self.assertTrue(all(edit['text'] in PROGRESS_STEPS for edit in edits))
+        # ...and the answer is a new message, never an edit of the progress line.
         final = self.db.all("SELECT payload FROM outbox WHERE method='editMessageText'")
-        self.assertEqual(len(final), 1)
-        answer = json.loads(final[0]['payload'])
-        self.assertEqual(answer['message_id'], 77)
-        self.assertNotEqual(answer['text'], PROGRESS_TEXT)
+        self.assertEqual(final, [])
+        answers = self.db.all("SELECT payload FROM outbox WHERE method='sendMessage'")
+        self.assertEqual(len(answers), 1)
 
 
 if __name__ == '__main__':

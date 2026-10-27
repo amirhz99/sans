@@ -1,8 +1,18 @@
 # SPEC-027: Live progress on the acknowledgement message
 
-Status: verified
+Status: superseded
 Owner: agent
 Created: 2026-10-27
+Superseded-by: 028-live-progress-message
+
+> **Superseded.** SPEC-027 showed progress by editing the acknowledgement
+> message, but that message was already where the final answer was written, so a
+> long answer left a frozen progress line on screen, coalesced turns had no
+> acknowledgement at all, and the command path never passed a client.  Its
+> AC-007 («at most one edit per turn») also made a real multi-step feed
+> impossible.  See `specs/028-live-progress-message.md`, which keeps the
+> acknowledgement as a progress feed and always sends the answer as a new
+> message.  The AC list below is kept as history only.
 
 ## Problem
 
@@ -61,13 +71,15 @@ the bot is still working.  The final answer keeps its current behaviour.
 
 ## Test Mapping
 
-- AC-001 -> `tests/test_sans.py::ProgressUpdateTests::test_progress_edit_precedes_the_reply`
-- AC-002 -> `tests/test_sans.py::ProgressUpdateTests::test_progress_edit_bypasses_the_outbox`
+Superseded by `specs/028-live-progress-message.md`; these tests were replaced.
+
+- AC-001 -> `tests/test_sans.py::ProgressUpdateTests::test_answer_is_a_new_message_not_an_edit`
+- AC-002 -> `tests/test_sans.py::ProgressUpdateTests::test_steps_follow_the_tools_that_run`
 - AC-003 -> `tests/test_sans.py::ProgressUpdateTests::test_missing_acknowledgement_emits_no_progress`
-- AC-004 -> `tests/test_sans.py::ProgressUpdateTests::test_disabled_progress_emits_nothing`
+- AC-004 -> `tests/test_sans.py::ProgressUpdateTests::test_disabled_progress_sends_no_edit`
 - AC-005 -> `tests/test_sans.py::ProgressUpdateTests::test_progress_failure_never_breaks_the_turn`
 - AC-006 -> `tests/test_sans.py::ProgressUpdateTests::test_progress_text_carries_no_data`
-- AC-007 -> `tests/test_sans.py::ProgressUpdateTests::test_progress_is_emitted_once_per_turn`
+- AC-007 -> `tests/test_sans.py::ProgressUpdateTests::test_repeated_step_is_not_resent`
 
 ## Safety Constraints
 

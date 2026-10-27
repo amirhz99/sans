@@ -60,6 +60,7 @@ class TurnBuffer:
         if entry is None:
             self._pending[key] = {
                 'update': update,
+                'first': update,
                 'texts': [body],
                 'ids': [update.get('update_id')],
                 'deadline': now + self.window,
@@ -102,6 +103,7 @@ class TurnBuffer:
 
     def _pop(self, key):
         entry = self._pending.pop(key)
+        first = entry.get('first') or {}
         update = dict(entry['update'])
         if len(entry['texts']) > 1:
             # One turn, one reply: the model sees the whole thought in order.
@@ -110,4 +112,9 @@ class TurnBuffer:
             update['message'] = message
             update['_coalesced'] = [ident for ident in entry['ids']
                                     if isinstance(ident, int) and not isinstance(ident, bool)]
+            # SPEC-028: the progress acknowledgement is attached to the *first*
+            # fragment, but this merged turn is built from the *last* one.  Carry
+            # it over so a coalesced turn still has a progress message to edit.
+            if update.get('_ack') is None and first.get('_ack') is not None:
+                update['_ack'] = first['_ack']
         return update

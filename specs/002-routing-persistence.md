@@ -110,7 +110,8 @@ state formats.
   `test_every_group_member_gets_admin_access_in_designated_group` and
   `test_all_members_policy_does_not_grant_private_management`
 - AC-011 -> `tests/test_sans.py::PermissionAndConversationTests::test_private_start_gives_private_user_guidance_only`,
-  `test_final_response_edits_acknowledgement_message`, and
+  `test_final_response_uses_a_new_message_after_acknowledgement` (SPEC-028 replaced
+  the in-place edit), and
   `test_failed_acknowledgement_edit_falls_back_to_new_message`, and
   `test_media_response_keeps_normal_send_path_after_acknowledgement`
 - AC-012 -> `tests/test_sans.py::PermissionAndConversationTests::test_positive_group_id_grants_group_admin_access`,
