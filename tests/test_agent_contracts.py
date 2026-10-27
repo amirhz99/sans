@@ -13,7 +13,7 @@ from app.config import Config
 from app.content import DEFAULTS, SYSTEM_PROMPT
 from app.db import Database
 from app.domain import ConversationState, EntityRef, EntityType, Intent, ResponseLevel
-from app.bot import Bot
+from app.bot import PROGRESS_TEXT, Bot
 from app.presentation import SessionView
 from app.prompt_loader import PromptLoader
 from app.service import Service
@@ -1492,6 +1492,68 @@ class OnboardingAgentContextTests(unittest.TestCase):
         self.assertFalse(caller['needs_introduction'])
         self.assertTrue(caller['has_pending_identity'])
         self.assertEqual(caller['linked_player']['id'], 1)
+
+
+class LangGraphProgressTests(unittest.TestCase):
+    """SPEC-027: the progress edit also fires on the LangGraph route."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / 'progress.sqlite3'
+        self.db = Database(self.path)
+        self.service = Service(self.db)
+        self.config = Config('fake-token', -100, frozenset({1}), 'https://example.invalid/v1',
+                             'fake-key', 'fake-model', self.path)
+        self.db.set_setting('welcomed:1', 1)
+        with self.db.conn:
+            self.service.apply(self.service.prepare('new_player', {'name': 'علی رضایی'}), 1, 't:1')
+            self.service.bind(1, 1, 1)
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def test_langgraph_route_edits_the_acknowledgement_before_the_answer(self):
+        from langchain_core.messages import AIMessage
+        from app import agent as agent_module
+
+        class Scripted:
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, messages):
+                # One real tool round, then the final answer.
+                if not any(getattr(m, 'type', '') == 'tool' for m in messages):
+                    return AIMessage(content='', tool_calls=[{
+                        'id': 'c0', 'name': 'query_database', 'args': {'target': 'overview'},
+                    }])
+                return AIMessage(content='همه‌چیز مرتب است.')
+
+        recorded = []
+
+        class Client:
+            def call(self, method, payload):
+                recorded.append((method, dict(payload)))
+                return {'message_id': 9}
+
+        bot = Bot(self.db, self.config, SimpleNamespace(use_langgraph=True,
+                                                        llm_override=Scripted()))
+        bot.process({'update_id': 1, 'message': {
+            'message_id': 1, 'chat': {'id': 1, 'type': 'private'},
+            'from': {'id': 1}, 'text': 'وضعیت کلی چطوره؟',
+        }}, {'chat_id': 1, 'message_id': 77}, client=Client())
+
+        edits = [payload for method, payload in recorded if method == 'editMessageText']
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]['message_id'], 77)
+        self.assertEqual(edits[0]['text'], PROGRESS_TEXT)
+        # The final answer reuses the same message, as before: the outbox holds
+        # one edit to message 77 whose text is the answer, not the progress line.
+        final = self.db.all("SELECT payload FROM outbox WHERE method='editMessageText'")
+        self.assertEqual(len(final), 1)
+        answer = json.loads(final[0]['payload'])
+        self.assertEqual(answer['message_id'], 77)
+        self.assertNotEqual(answer['text'], PROGRESS_TEXT)
 
 
 if __name__ == '__main__':

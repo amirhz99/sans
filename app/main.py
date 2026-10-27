@@ -282,7 +282,7 @@ def run(db, config):
             # SPEC-018: deliver the turns whose short window has closed before
             # asking for new updates, so a reply never waits on the long poll.
             for turn in turns.ready(time.time()):
-                bot.process(turn, turn.get('_ack'))
+                bot.process(turn, turn.get('_ack'), client=client)
                 flush_outbox(db, client)
             # A pending turn must not sit behind the 20 second long poll.
             poll_timeout = 20 if not len(turns) else 1
@@ -304,7 +304,7 @@ def run(db, config):
                 # Not coalesced (command, receipt, contact): keep this person's
                 # earlier fragments ahead of it so order is preserved.
                 for pending in turns.flush_key(update):
-                    bot.process(pending, pending.get('_ack'))
+                    bot.process(pending, pending.get('_ack'), client=client)
                     flush_outbox(db, client)
                 chat_id = bot.acknowledgement_chat(update)
                 acknowledgement = None

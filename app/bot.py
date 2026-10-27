@@ -1,4 +1,6 @@
 import json
+import logging
+import os
 import re
 import sqlite3
 import time
@@ -21,6 +23,23 @@ from .service import (ADMIN_ACTIONS, Service, UserError, integer, normalize,
 # action.  This line is only the fail-closed fallback and the reply for a
 # greeting that the model tried to turn into an operation.
 GREETING_REPLY = 'سلام! در خدمتم؛ بفرمایید چه کاری برایتان انجام دهم؟ برای راهنما /help را بفرستید.'
+
+LOG = logging.getLogger('sans')
+
+# SPEC-027: one short, data-free line edited onto the acknowledgement message
+# while a turn is still running.  The final reply reuses the same message.
+PROGRESS_TEXT = '⏳ پیامتان دریافت شد؛ در حال بررسی و آماده‌سازی پاسخ هستم…'
+
+
+def progress_enabled():
+    """SPEC-027: ``PROGRESS_UPDATES=0`` disables the intermediate edit."""
+    raw = os.getenv('PROGRESS_UPDATES', '').strip().lower()
+    return raw not in {'0', 'false', 'no', 'off'}
+
+
+def _valid_id(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
 
 # SPEC-016: a contact card can only be obtained through a reply-keyboard button.
 # SPEC-019: the markup itself lives in ``app/keyboards.py`` so the service layer
@@ -222,7 +241,42 @@ class Bot:
         return self.db.one('SELECT * FROM outreach WHERE chat_id=? AND message_id=?',
                            (chat_id, message_id))
 
-    def process(self, update, acknowledgement=None):
+    def progress(self, client, acknowledgement):
+        """SPEC-027: return a one-shot ``step`` callable, or ``None``.
+
+        The edit is sent straight through the client, never through the
+        transactional outbox: a progress line is a UX aid, so it must neither
+        wait for the ``BEGIN IMMEDIATE`` transaction to commit nor be rolled
+        back with it.  Every failure is swallowed by design (AC-005).
+        """
+        if client is None or not progress_enabled():
+            return None
+        edit = acknowledgement if isinstance(acknowledgement, dict) else {}
+        chat_id = edit.get('chat_id')
+        message_id = edit.get('message_id')
+        if not (_valid_id(chat_id) and _valid_id(message_id)):
+            return None
+        sent = []
+
+        def step():
+            # AC-007: at most one edit per turn, even if the model path retries.
+            if sent:
+                return False
+            sent.append(True)
+            try:
+                client.call('editMessageText', {'chat_id': chat_id,
+                                                'message_id': message_id,
+                                                'text': PROGRESS_TEXT})
+                return True
+            except APIError as exc:
+                LOG.debug('Progress edit skipped for chat %s (%s)', chat_id, exc)
+            except Exception as exc:  # AC-005: progress never breaks a turn.
+                LOG.debug('Progress edit failed for chat %s (%s)', chat_id, exc)
+            return False
+
+        return step
+
+    def process(self, update, acknowledgement=None, client=None):
         uid = update.get('update_id')
         if not isinstance(uid, int):
             return
@@ -249,7 +303,7 @@ class Bot:
             if callback:
                 self.callback(callback)
             elif update.get('message'):
-                self.message(update['message'], acknowledgement)
+                self.message(update['message'], acknowledgement, client=client)
             self.db.execute('INSERT INTO processed_updates(update_id) VALUES (?)', (uid,))
             for ident in coalesced:
                 self.db.execute('INSERT OR IGNORE INTO processed_updates(update_id) VALUES (?)',
@@ -434,7 +488,7 @@ class Bot:
         except (TypeError, ValueError):
             return ResponseLevel.SUMMARY
 
-    def message(self, msg, acknowledgement=None):
+    def message(self, msg, acknowledgement=None, client=None):
         chat = msg.get('chat', {})
         chat_id = chat.get('id')
         user_id = msg.get('from', {}).get('id')
@@ -579,6 +633,11 @@ class Bot:
                         command = {'action': 'payment_amount', 'args': {'amount': amount}}
                     elif getattr(self.ai, 'use_langgraph', False):
                         try:
+                            # SPEC-027: show activity on the acknowledgement before
+                            # the (possibly slow) model call starts.
+                            step = self.progress(client, acknowledgement)
+                            if step:
+                                step()
                             reply, markup, effects = self.agent.run(
                                 processing_body,
                                 history,
@@ -599,6 +658,9 @@ class Bot:
                         except Exception as exc:
                             raise APIError(f'LangGraph execution error: {exc}') from None
                     else:
+                        step = self.progress(client, acknowledgement)
+                        if step:
+                            step()
                         try:
                             command = Intent.from_dict(self.ai.parse(
                                 processing_body, history, self.context(chat_id, user_id, admin, reply_to)

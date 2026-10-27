@@ -11,7 +11,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from app import jalali
-from app.bot import (Bot, CONTACT_BUTTON, GREETING_REPLY, RELAY_CONFIRMATION,
+from app.bot import (Bot, CONTACT_BUTTON, GREETING_REPLY, PROGRESS_TEXT, RELAY_CONFIRMATION,
                      WELCOME_COMPLETE, WELCOME_NAME_ONLY, WELCOME_NEW, WELCOME_PHONE_ONLY)
 from app.ai_context import AIContextBuilder
 from app.clients import AIClient, APIError
@@ -3576,3 +3576,127 @@ class LinkCandidateTests(BaseCase):
             self.service.link_players(1, 3, 1)
 
         self.assertEqual(self.service.link_candidates(), [])
+
+
+class RecordingClient:
+    """SPEC-027: a stand-in Bale client that records every outbound call."""
+
+    def __init__(self, error=None):
+        self.calls = []
+        self.error = error
+
+    def call(self, method, payload):
+        self.calls.append((method, dict(payload)))
+        if self.error is not None:
+            raise self.error
+        return {'message_id': payload.get('message_id') or 1, 'ok': True}
+
+    def methods(self):
+        return [method for method, _ in self.calls]
+
+    def edits(self):
+        return [payload for method, payload in self.calls if method == 'editMessageText']
+
+
+class ProgressUpdateTests(BaseCase):
+    """SPEC-027: the acknowledgement is edited in place while a turn runs."""
+
+    ACK = {'chat_id': 10, 'message_id': 555}
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+
+    def tearDown(self):
+        os.environ.pop('PROGRESS_UPDATES', None)
+        super().tearDown()
+
+    def ask(self, client, body='وضعیت این هفته چطوره؟', acknowledgement=None):
+        self.update_id += 1
+        update = {'update_id': self.update_id, 'message': {
+            'message_id': self.update_id,
+            'chat': {'id': 10, 'type': 'private'},
+            'from': {'id': 10},
+            'text': body,
+        }}
+        self.bot.process(update, acknowledgement, client=client)
+        return update
+
+    def test_progress_edit_precedes_the_reply(self):
+        client = RecordingClient()
+        self.ask(client, acknowledgement=self.ACK)
+        methods = client.methods()
+        # AC-001: exactly one edit, to the acknowledgement message.
+        self.assertEqual(methods.count('editMessageText'), 1)
+        self.assertEqual(client.edits()[0]['message_id'], 555)
+        self.assertEqual(client.edits()[0]['chat_id'], 10)
+        # AC-001: the progress edit happens before the final reply is queued.
+        final = self.db.all("SELECT payload FROM outbox WHERE method='sendMessage'")
+        self.assertEqual(len(final), 1)
+        sent_before = client.calls.index(('editMessageText', client.edits()[0]))
+        self.assertEqual(sent_before, 0)
+
+    def test_progress_edit_bypasses_the_outbox(self):
+        client = RecordingClient()
+        self.ask(client, acknowledgement=self.ACK)
+        # AC-002: the progress line is a direct call, so the outbox holds only
+        # the final reply.  That reply *also* edits message 555 — that is the
+        # pre-existing behaviour — but it carries the answer, not PROGRESS_TEXT.
+        queued = self.db.all("SELECT payload FROM outbox WHERE method='editMessageText'")
+        self.assertEqual(len(queued), 1)
+        payload = json.loads(queued[0]['payload'])
+        self.assertEqual(payload['message_id'], 555)
+        self.assertNotEqual(payload['text'], PROGRESS_TEXT)
+        self.assertEqual(client.methods().count('editMessageText'), 1)
+
+    def test_missing_acknowledgement_emits_no_progress(self):
+        client = RecordingClient()
+        self.ask(client, acknowledgement=None)
+        # AC-003: no ack means no message to edit.
+        self.assertEqual(client.calls, [])
+
+    def test_disabled_progress_emits_nothing(self):
+        os.environ['PROGRESS_UPDATES'] = '0'
+        client = RecordingClient()
+        self.ask(client, acknowledgement=self.ACK)
+        # AC-004: the switch suppresses the edit only.
+        self.assertEqual(client.calls, [])
+        self.assertEqual(len(self.db.all("SELECT 1 FROM outbox WHERE method='sendMessage'")), 1)
+
+    def test_progress_failure_never_breaks_the_turn(self):
+        client = RecordingClient(error=APIError('Bale API error 400', code=400))
+        self.ask(client, acknowledgement=self.ACK)
+        # AC-005: the turn still answers, and the edit was attempted once.
+        self.assertEqual(client.methods(), ['editMessageText'])
+        self.assertEqual(len(self.db.all("SELECT 1 FROM outbox WHERE method='sendMessage'")), 1)
+
+    def test_progress_failure_with_unexpected_exception_is_safe(self):
+        client = RecordingClient(error=RuntimeError('socket exploded'))
+        self.ask(client, acknowledgement=self.ACK)
+        # AC-005: even a non-API exception is swallowed.
+        self.assertEqual(len(self.db.all("SELECT 1 FROM outbox WHERE method='sendMessage'")), 1)
+
+    def test_progress_text_carries_no_data(self):
+        client = RecordingClient()
+        self.ask(client, acknowledgement=self.ACK)
+        text = client.edits()[0]['text']
+        # AC-006: a fixed catalogue line, never domain content.
+        self.assertEqual(text, PROGRESS_TEXT)
+        for leaked in ('علی رضایی', '150000', '2,400,000', '2400000', '09'):
+            self.assertNotIn(leaked, text)
+
+    def test_progress_is_emitted_once_per_turn(self):
+        client = RecordingClient()
+        step = self.bot.progress(client, self.ACK)
+        self.assertTrue(step())
+        self.assertFalse(step())
+        step()
+        # AC-007: a retried model path cannot spam the provider.
+        self.assertEqual(client.methods().count('editMessageText'), 1)
+
+    def test_progress_ignores_malformed_acknowledgement(self):
+        client = RecordingClient()
+        for bad in ({}, {'chat_id': 10}, {'chat_id': '10', 'message_id': 555},
+                    {'chat_id': 10, 'message_id': 0}, {'chat_id': True, 'message_id': 555}):
+            self.assertIsNone(self.bot.progress(client, bad))
+        self.assertEqual(client.calls, [])
