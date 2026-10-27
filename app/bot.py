@@ -770,6 +770,15 @@ class Bot:
                     reply = text(command.get('question'), 'سؤال', limit=1500)
                 elif action == 'card':
                     reply = self.service.card()
+                    # SPEC-029: the caller about to pay should see the linked
+                    # balances next to the account number, using the very block
+                    # /debt already shows (SPEC-025).  Only when a card is set:
+                    # next to "no card yet" the block would only confuse, and an
+                    # unlinked caller gets the plain card text anyway.
+                    if self.db.setting('card'):
+                        linked = self.service.linked(user_id)
+                        if linked:
+                            reply += self.service.shared_links(linked['id'])
                     if not self.db.setting('card'):
                         self.ask_admin('card', 'لطفاً شماره کارت و نام صاحب حساب را اعلام کنید؛ مثلاً «مسئول، شماره کارت ...».')
                 elif action == 'debt':

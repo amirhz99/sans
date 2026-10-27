@@ -3520,6 +3520,59 @@ class SharedReportTests(BaseCase):
         self.assertNotIn('حسن رضایی', reply)
 
 
+class CardShowsLinksTests(BaseCase):
+    """SPEC-029: the card reply carries the same linked block as /debt."""
+
+    CARD = 'مسئول، 6037-1234-5678-9012'
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.apply('new_player', name='حسن رضایی')
+        self.apply('adjustment', player='#3', amount=200000, note='بدهی قبلی')
+        self.apply('settings', key='card', value=self.CARD)
+
+    def link(self):
+        with self.db.conn:
+            self.service.link_players(1, 3, 1)
+
+    def test_a_linked_player_card_lists_the_partner_balance(self):
+        self.link()
+
+        self.send('/card', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertIn('حساب‌های پیوندی', reply)
+        self.assertIn('حسن رضایی', reply)
+        self.assertIn('200,000', reply)
+
+    def test_an_unlinked_player_card_is_unchanged(self):
+        self.send('/card', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertIn(self.CARD, reply)
+        self.assertNotIn('حساب‌های پیوندی', reply)
+        self.assertNotIn('حسن رضایی', reply)
+
+    def test_the_card_number_comes_first(self):
+        self.link()
+
+        self.send('/card', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertLess(reply.index(self.CARD), reply.index('حساب‌های پیوندی'))
+
+    def test_a_missing_card_setting_still_asks_the_admin(self):
+        self.link()
+        self.apply('settings', key='card', value='')
+
+        self.send('/card', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertNotIn('حساب‌های پیوندی', reply)
+        self.assertIn('شماره کارت', self.replies(-100))
+
+
 class LinkedSettleTests(BaseCase):
     """SPEC-025: settling a partner still needs the admin's click."""
 

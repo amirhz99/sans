@@ -93,3 +93,7 @@ git diff --check
 
 The family-name suggestion is advisory by design: `similar_players` already shows
 how expensive a false identity guess is, so this feature only proposes.
+
+SPEC-029 later reuses the same `Service.shared_links()` block in the `/card`
+reply, so a player about to pay sees the account number and the partners'
+balances in one message.  Nothing about the permission or the payload changed.
