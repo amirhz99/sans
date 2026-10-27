@@ -26,12 +26,26 @@ def _jalali_short(value):
     return f'{jy:04d}/{jm:02d}/{jd:02d}'
 
 
+def support_contact(bot):
+    """Return the configured support handle for any bot-like object (SPEC-031).
+
+    ``getattr`` keeps lightweight config stand-ins (and the legacy bot paths)
+    working: an unset field simply means support is not configured.
+    """
+    return getattr(getattr(bot, 'config', None), 'support_handle', '') or ''
+
+
+
 # SPEC-018: how much conversation the agent may look at.  The database keeps
 # HISTORY_LIMIT entries; the agent reads this window and sends a shorter tail to
 # the model so a long chat cannot inflate the prompt without bound.
 CHAT_MEMORY_WINDOW = 30
 SNAPSHOT_MESSAGES = 20
 CONVERSATION_HISTORY = 20
+
+# SPEC-031: the prompt never invents a contact.  When no support handle is
+# configured, the rule points at the admins instead of showing a bare "@".
+SUPPORT_FALLBACK_TEXT = 'با ادمین‌های گروه مدیریتی در تماس باش'
 
 
 AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمند، صمیمی، دقیق و همه‌فن‌حریفِ مدیریت سانس فوتبال در پیام‌رسان بله.
@@ -88,6 +102,11 @@ AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمن�
    - فقط و فقط متن طبیعی فارسی بنویس؛ هرگز خروجی JSON یا ساختار کد نده.
    - همه مبالغ به تومان است (مگر کاربر صراحتاً ریال بگوید که به تومان تبدیل می‌کنی).
    - هزینه زمین (`venue_cost`) در بدهی بازیکنان وارد نمی‌شود و بدهی هر نفر در سانس نهایی‌شده برابر است با `سهم هر نفر × (۱ + تعداد مهمان)`.
+
+۵. ارجاع به پشتیبان انسانی ({support_contact}):
+   - اگر کاربر گفت مشکلی پیش آمده که خودت نتوانستی حل کنی، یا صریحاً پرسید «با کی صحبت کنم»، «پشتیبان کیه»، «کجا پیام بدم» یا «با آدم واقعی حرف بزنم»، آیدی {support_contact} را همان‌طور که نوشته شده بده و بگو برای پیگیری مستقیم به همین آیدی پیام بدهد.
+   - این آیدی را از خودت نساز، تغییر نده، به شکل لینک یا یوزرنیم دیگری بازنویسی نکن و به کاربر دیگری نسبت نده. فقط همین یک مقدار درست است.
+   - اگر خودت توانستی مشکل را حل کنی، اول راه‌حل را بده؛ لازم نیست هر پاسخ را با آیدی پشتیبان تمام کنی. در پاسخ‌های نامرتبط به این آیدی اشاره نکن.
 
 ۴. مرز موضوعی:
    - فقط دربارهٔ مدیریت سانس فوتبال و امور مستقیم آن مثل برنامهٔ سانس، بازیکنان، حضور، بدهی، پرداخت، رسید و راهنمایی ربات پاسخ بده.
@@ -959,7 +978,9 @@ class SansAgent:
         snapshot = self._build_live_snapshot(chat_id, user_id, admin, sender)
         # Do NOT append self.bot.system_prompt (which instructs legacy JSON-only output).
         sys_text = (
-            AGENT_SYSTEM_PROMPT.format(bot_name=self.bot.config.bot_name)
+            AGENT_SYSTEM_PROMPT.format(bot_name=self.bot.config.bot_name,
+                                       support_contact=support_contact(self.bot)
+                                       or SUPPORT_FALLBACK_TEXT)
             + '\n\nوضعیت زنده دیتابیس و چت (JSON):\n'
             + snapshot
         )

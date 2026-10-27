@@ -6,7 +6,7 @@ import sqlite3
 import time
 import uuid
 
-from .agent import SansAgent
+from .agent import SansAgent, support_contact
 from .ai_context import AIContextBuilder
 from .clients import APIError
 from .content import ADMIN_HELP, DEFAULTS, HELP, SYSTEM_PROMPT
@@ -799,6 +799,15 @@ class Bot:
                     reply = HELP + ('\n\n' + ADMIN_HELP if admin else '')
                     if private and self.service.linked(user_id):
                         reply += '\n\n' + self.service.debt(self.service.linked(user_id)['id'])
+                elif action == 'support':
+                    # SPEC-031: the handle comes from configuration only; when no
+                    # human hand-off is configured this must not invent one.
+                    handle = support_contact(self)
+                    if handle:
+                        reply = ('اگر مشکلت حل نشد یا چیزی درست پیش نرفت، برای پیگیری مستقیم به '
+                                 f'{handle} پیام بده.')
+                    else:
+                        reply = 'در حال حاضر پشتیبان جداگانه‌ای تنظیم نشده؛ برای پیگیری با ادمین‌های گروه مدیریتی در تماس باش.'
                 elif action == 'config':
                     if not admin:
                         raise UserError('نمایش تنظیمات فقط برای ادمین‌های مجاز در گروه مدیریتی است.')
@@ -966,7 +975,7 @@ class Bot:
         rest = parts[1].strip() if len(parts) > 1 else ''
         simple = {'start': 'help', 'help': 'help', 'card': 'card', 'cancel': 'cancel', 'config': 'config', 'report': 'report',
                   'players': 'list_players', 'sessions': 'list_sessions', 'pending': 'pending', 'phone': 'phone',
-                  'defaults': 'defaults'}
+                  'defaults': 'defaults', 'support': 'support'}
         if name in simple:
             return {'action': simple[name], 'args': {}}
         if name in ('debt', 'session', 'identify', 'amount', 'confirm', 'deny', 'approve', 'reject'):

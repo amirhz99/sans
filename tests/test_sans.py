@@ -17,7 +17,7 @@ from app.bot import (Bot, CONTACT_BUTTON, GREETING_REPLY, PROGRESS_ANSWERING,
                      WELCOME_NEW, WELCOME_PHONE_ONLY)
 from app.ai_context import AIContextBuilder
 from app.clients import AIClient, APIError
-from app.config import Config
+from app.config import Config, parse_support_handle
 from app.content import DEFAULTS
 from app.db import Database
 from app.domain import ConversationState, EntityRef, Intent, ResponseLevel
@@ -3989,3 +3989,71 @@ class BatchCardLayoutTests(BaseCase):
         summary = self.bot.pending_summary(row)
         self.assertIn('| بازیکن |', summary)
         self.assertEqual(summary.count('| بازیکن |'), 1)
+
+
+class SupportHandleTests(BaseCase):
+    """SPEC-031: one configured handle, given verbatim on an explicit request."""
+
+    ENV = {'BALE_BOT_TOKEN': 'token', 'ADMIN_GROUP_ID': '-100',
+           'AI_BASE_URL': 'https://example.com/v1', 'AI_API_KEY': 'key',
+           'AI_MODEL': 'model'}
+
+    def from_env(self, **extra):
+        env = dict(self.ENV, **extra)
+        for key in ('SUPPORT_HANDLE',):
+            env.setdefault(key, '')
+        with patch.dict(os.environ, env, clear=True), \
+                patch('app.config.load_env', lambda *a, **k: None):
+            return Config.from_env()
+
+    def test_handle_is_normalized(self):
+        self.assertEqual(self.from_env(SUPPORT_HANDLE='@amirhz99').support_handle,
+                         '@amirhz99')
+        self.assertEqual(self.from_env(SUPPORT_HANDLE='amirhz99').support_handle,
+                         '@amirhz99')
+        self.assertEqual(self.from_env(SUPPORT_HANDLE='  @amirhz99  ').support_handle,
+                         '@amirhz99')
+
+    def test_invalid_handle_fails_closed(self):
+        # A malformed value would be injected into the prompt, so it must stop
+        # the process at startup instead of reaching the model.
+        for bad in ('@', 'amir hz', '@amir-hz', 'https://t.me/amirhz99',
+                    't.me/amirhz99', 'ab', 'a' * 65, 'امیر'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse_support_handle(bad)
+                with self.assertRaises(ValueError):
+                    self.from_env(SUPPORT_HANDLE=bad)
+
+    def test_missing_handle_disables_support(self):
+        self.assertEqual(self.from_env().support_handle, '')
+        self.assertEqual(self.from_env(SUPPORT_HANDLE='').support_handle, '')
+        self.assertEqual(parse_support_handle(''), '')
+        self.assertEqual(parse_support_handle('   '), '')
+
+    def test_support_command_shows_the_handle(self):
+        self.bot = Bot(self.db, replace(self.config, support_handle='@amirhz99'), self.ai)
+        self.assertEqual(self.bot.command('/support', admin=False)['action'], 'support')
+
+        self.send('/support', user=10)
+
+        self.assertIn('@amirhz99', self.replies(chat=10))
+
+    def test_support_command_without_a_handle(self):
+        self.send('/support', user=10)
+        reply = self.replies(chat=10)
+        self.assertNotIn('@amirhz', reply)
+        self.assertIn('پشتیبان', reply)
+        self.assertIn('ادمین', reply)
+
+    def test_api_failure_reply_stays_unchanged(self):
+        # The decision is explicit: an AI outage answers with the existing text
+        # and never advertises the support handle.
+        self.bot = Bot(self.db, replace(self.config, support_handle='@amirhz99'), self.ai)
+        self.ai.answer = APIError('boom')
+
+        self.send('بدهی من چقدر است؟', user=10)
+
+        reply = self.replies(chat=10)
+        self.assertIn('سرویس هوش مصنوعی فعلاً پاسخ معتبر نداد', reply)
+        self.assertNotIn('@amirhz99', reply)

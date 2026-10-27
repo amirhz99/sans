@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.ai_context import AIContextBuilder
-from app.agent import AGENT_SYSTEM_PROMPT, SansAgent
+from app.agent import AGENT_SYSTEM_PROMPT, SUPPORT_FALLBACK_TEXT, SansAgent, support_contact
 from app.clients import AIClient
 from app.config import Config
 from app.content import DEFAULTS, SYSTEM_PROMPT
@@ -1624,6 +1624,31 @@ class LangGraphProgressTests(unittest.TestCase):
         self.assertEqual(final, [])
         answers = self.db.all("SELECT payload FROM outbox WHERE method='sendMessage'")
         self.assertEqual(len(answers), 1)
+
+
+class SupportPromptTests(unittest.TestCase):
+    """SPEC-031: the prompt shows the configured handle verbatim, or none at all."""
+
+    def render(self, handle):
+        bot = SimpleNamespace(config=SimpleNamespace(bot_name='مسئول',
+                                                     support_handle=handle))
+        return AGENT_SYSTEM_PROMPT.format(
+            bot_name=bot.config.bot_name,
+            support_contact=support_contact(bot) or SUPPORT_FALLBACK_TEXT)
+
+    def test_prompt_offers_the_configured_handle(self):
+        prompt = self.render('@amirhz99')
+        self.assertIn('@amirhz99', prompt)
+        self.assertIn('ارجاع به پشتیبان انسانی', prompt)
+        self.assertNotIn('{support_contact}', prompt)
+
+    def test_prompt_without_a_handle_invents_none(self):
+        # A stand-in config that predates SPEC-031 must not break rendering.
+        prompt = self.render('')
+        self.assertNotIn('{support_contact}', prompt)
+        self.assertNotIn('@amirhz99', prompt)
+        self.assertIn(SUPPORT_FALLBACK_TEXT, prompt)
+        self.assertEqual(support_contact(SimpleNamespace(config=SimpleNamespace())), '')
 
 
 if __name__ == '__main__':
