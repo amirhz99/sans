@@ -35,7 +35,6 @@ def support_contact(bot):
     return getattr(getattr(bot, 'config', None), 'support_handle', '') or ''
 
 
-
 # SPEC-018: how much conversation the agent may look at.  The database keeps
 # HISTORY_LIMIT entries; the agent reads this window and sends a shorter tail to
 # the model so a long chat cannot inflate the prompt without bound.

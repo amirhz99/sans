@@ -84,15 +84,12 @@ def parse_support_handle(raw):
     value = raw.strip()
     if not value:
         return ''
-    # A bare "@" is a malformed value, not "disabled": an operator who wrote it
-    # meant to give a contact, so silently disabling the hand-off would hide it.
-    if value.startswith('@'):
-        value = value[1:].strip()
-    if not value:
+    # A bare "@" is malformed rather than "disabled": the operator clearly meant
+    # to name a contact, so silently turning the hand-off off would hide it.
+    name = value[1:].strip() if value.startswith('@') else value
+    if not SUPPORT_HANDLE.fullmatch(name):
         raise ValueError('SUPPORT_HANDLE must be a plain handle such as @amirhz99')
-    if not SUPPORT_HANDLE.fullmatch(value):
-        raise ValueError('SUPPORT_HANDLE must be a plain handle such as @amirhz99')
-    return '@' + value
+    return '@' + name
 
 
 def parse_fallback_models(raw, primary=''):
