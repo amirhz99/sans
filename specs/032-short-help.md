@@ -91,7 +91,9 @@ share-contact button.
 - [x] AC-007: `/debt` still returns the full ledger.
 - [x] AC-008: `GREETING_REPLY` and `WELCOME_COMPLETE` advertise no command.
 - [x] AC-009: A name without a number gets the reminder line and the
-  share-contact keyboard.
+  share-contact keyboard. Superseded by SPEC-033: the card is now held back
+  instead of sent without a number, so the reply asks for the number rather
+  than adding a reminder to a reply about a card.
 - [x] AC-010: A name that already carries a number gets no reminder.
 - [x] AC-011: An introduction reply names no command, while its admin card still
   carries the request id and the wanted name.
@@ -107,7 +109,7 @@ share-contact button.
 - AC-006 -> `tests/test_sans.py::ShortHelpTests::test_help_balance_is_a_separate_short_message`
 - AC-007 -> `tests/test_sans.py::ShortHelpTests::test_debt_command_still_shows_the_full_ledger`
 - AC-008 -> `tests/test_sans.py::ShortHelpTests::test_welcome_and_greeting_advertise_no_command`
-- AC-009 -> `tests/test_sans.py::ShortHelpTests::test_name_without_a_number_is_reminded_with_the_button`
+- AC-009 -> `tests/test_sans.py::ShortHelpTests::test_name_without_a_number_asks_for_it_with_the_button`
 - AC-010 -> `tests/test_sans.py::ShortHelpTests::test_a_name_that_carries_a_number_is_not_reminded`
 - AC-011 -> `tests/test_sans.py::ShortHelpTests::test_introduction_never_answers_with_a_command`
 - AC-012 -> `tests/test_sans.py::ShortHelpTests::test_a_second_introduction_never_names_a_command_either`

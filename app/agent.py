@@ -390,7 +390,16 @@ class SansAgent:
                     return 'فرمت data_json باید یک آبجکت JSON باشد.'
 
                 if operation == 'identify':
-                    return bot.identify(data.get('name', ''), user_id, chat_id, sender)
+                    # SPEC-033: the card may be deferred until the number
+                    # arrives, so the tool returns only the reply text; a reply
+                    # keyboard cannot be attached to a tool result anyway.  The
+                    # held name goes to the conversation state, which is where
+                    # the contact handler looks for it.
+                    held, _history = db.conversation(chat_id, user_id)
+                    reply, _keyboard = bot.identify_request(
+                        data.get('name', ''), user_id, chat_id, sender, state=held)
+                    db.save_conversation(chat_id, user_id, held, _history)
+                    return reply
 
                 if operation == 'attendance_self':
                     linked = service.linked(user_id)

@@ -138,9 +138,10 @@ RELAY_CONFIRMATION = 'پیام شما برای ادمین‌ها ارسال شد
 # model, so a stranger always sees the same short instruction and never an
 # internal term such as «اتصال حساب» or a provider error.
 WELCOME_NEW = ('سلام 👋 خوش آمدی.\n'
-               'برای شروع این دو تا را برایم بفرست:\n'
-               '• نام و نام خانوادگی کاملت (مثل «علی رضایی»)\n'
-               '• شمارهٔ موبایلت با دکمهٔ زیر')
+               'دو چیز برای شروع لازم است:\n'
+               '• نام و نام خانوادگی کاملت را بنویس (مثل «علی رضایی»)\n'
+               '• شمارهٔ موبایلت را با دکمهٔ زیر بفرست\n'
+               'هر کدام را اول فرستادی، بعدی را خودم می‌پرسم.')
 WELCOME_NAME_ONLY = ('سلام 👋 خوش آمدی. شماره‌ات را دارم ✅\n'
                      'فقط نام و نام خانوادگی کاملت را بنویس.')
 WELCOME_PHONE_ONLY = ('سلام {name} 👋 خوش آمدی.\n'
@@ -287,11 +288,37 @@ class Bot:
         if (not msg.get('contact') and not msg.get('photo') and not msg.get('document')
                 and self.short_greeting(body, self.config.bot_name, self.db.setting('bot_username'))):
             return None
+        # SPEC-033: a slash command is answered deterministically, so there is no
+        # wait to explain.  `command()` decides, so the command list stays in one
+        # place.  Media messages are exempt: an upload is slow enough to justify
+        # the notice, and a receipt photo is not a command anyway.
+        if (body.startswith('/') and not msg.get('photo') and not msg.get('document')
+                and self.local_answer(body, self.is_admin(chat_id, user_id))):
+            return None
         if private:
             return chat_id
         if not self.addressed(msg, body):
             return None
         return chat_id if (not body.startswith('/') or self.is_admin(chat_id, user_id)) else None
+
+    def local_answer(self, body, admin):
+        """Return whether ``message()`` answers ``body`` without the model (SPEC-033).
+
+        ``command()`` is the single source of truth for the command list, so this
+        asks it instead of repeating the names.  ``identify`` still gets the
+        processing notice: it may rename, match and write to the ledger, and
+        SPEC-033 makes it wait for a number.  Everything else is a plain read
+        whose answer is ready immediately.
+        """
+        if not isinstance(body, str) or not body.startswith('/'):
+            return False
+        try:
+            command = self.command(body, admin)
+        except UserError:
+            # A malformed command still gets its error, so no notice is needed.
+            return True
+        action = command.get('action') if isinstance(command, dict) else None
+        return action not in (None, 'identify')
 
     def proactive_answer(self, msg, chat_id, user_id):
         """Return the outreach row when ``msg`` answers a proactive notice.
@@ -800,6 +827,14 @@ class Bot:
                             elif effects.get('last_player_id'):
                                 p = self.service.player(effects['last_player_id'])
                                 state['last_entity'] = EntityRef('player', p['id'], p['name']).to_dict()
+                            # SPEC-033: `identify` can hold a name in the
+                            # conversation state until the number arrives.  A
+                            # tool writes that row directly, so the copy loaded
+                            # before the turn would drop it when this turn is
+                            # saved; carry it over explicitly.
+                            held = self.db.conversation(chat_id, user_id)[0].get('identity_name')
+                            if held and not state.get('identity_name'):
+                                state['identity_name'] = held
                             command = {'action': '_agent_handled', 'args': {}}
                         except Exception as exc:
                             raise APIError(f'LangGraph execution error: {exc}') from None
@@ -911,8 +946,11 @@ class Bot:
                         self.ask_admin('session', 'زمان، عنوان سانس بعدی و سهم ثابت هر نفر چقدر است؟ لطفاً با خطاب «مسئول» پاسخ دهید.')
                         raise
                 elif action == 'identify' and private:
-                    reply = self.identify(args.get('name'), user_id, chat_id, msg.get('from'),
-                                          state.pop('identity_phone', None))
+                    # SPEC-033: identify() may answer with a request for the
+                    # number instead of a card, so it also returns the state.
+                    reply, keyboard = self.identify_request(
+                        args.get('name'), user_id, chat_id, msg.get('from'), state=state,
+                        phone_number=state.pop('identity_phone', None))
                     if self.player_without_phone(user_id):
                         # SPEC-016: an already linked player may still be missing
                         # a number, so offer the button instead of only a message.
@@ -1130,12 +1168,23 @@ class Bot:
         existing = self.db.one("SELECT id FROM pending WHERE requester=? AND kind IN ('identity','claim') AND status='pending'", (user_id,))
         if existing:
             return 'درخواست شناسایی شما منتظر ادمین است. تا وقتی تأیید نشده، پیشنهاد قبلی را می‌شود پس گرفت.'
+        number = self.known_phone(user_id, phone_number)
+        if not number:
+            # SPEC-033: one card, sent once.  The Bale contact button sends a
+            # user_id, never a number, so the number can never arrive with the
+            # name.  Holding the name here keeps the card complete: the admin
+            # sees the request once, with both facts, instead of twice with the
+            # first copy missing the number.
+            state = {'identity_name': name}
+            return ('نامت را گرفتم ✅\n'
+                    'یک چیز مانده: شمارهٔ موبایلت را با دکمهٔ زیر بفرست؛ بلافاصله '
+                    'برای بررسی به ادمین می‌فرستم.', self.contact_keyboard(), state)
         try:
             player = self.service.player(name)
         except UserError:
             player = None
         payload = {'name': name, 'user_id': user_id, 'player': player['id'] if player else None,
-                   **self.identity_profile(sender, self.known_phone(user_id, phone_number))}
+                   **self.identity_profile(sender, number)}
         ident = self.new_pending('identity' if player else 'claim', payload, user_id, chat_id)
         similar = [] if player else self.service.similar_players(name)[:3]
         note = self.identity_note(ident, payload, player, similar)
@@ -1146,13 +1195,23 @@ class Bot:
             note += (f'\nتطبیق قطعی با بازیکن‌های ثبت‌شده پیدا نشد؛ باید بازیکن را دستی بسازید و بعد پیوند بزنید.'
                      f'\nشناسهٔ درخواست: {ident} — نام مورد نظر: {name}')
         self.db.say(self.config.admin_group, note, markup)
-        reply = 'معرفی شما برای بررسی به ادمین‌ها ارسال شد؛ بعد از تأیید، بدهی حساب خودتان قابل مشاهده است.'
-        if not payload.get('phone_number'):
-            # SPEC-032: the card says the number is missing, so the person must
-            # be told too, and given the one button that can send it.
-            reply += ('\nیک چیز مانده: شمارهٔ موبایلت را هم با دکمهٔ زیر بفرست '
-                      'تا ادمین در صورت نیاز تماس بگیرد.')
-        return reply
+        return 'معرفی شما برای بررسی به ادمین‌ها ارسال شد؛ بعد از تأیید، بدهی حساب خودتان قابل مشاهده است.'
+
+    def identify_request(self, name, user_id, chat_id, sender=None, state=None,
+                         phone_number=None):
+        """Run ``identify()`` and apply the ``(reply, keyboard, state)`` union.
+
+        ``identify()`` may ask for a number instead of building the card
+        (SPEC-033).  Callers keep the plain string or tuple they already handle,
+        so this unwraps the result and merges any follow-up state.
+        """
+        result = self.identify(name, user_id, chat_id, sender, phone_number)
+        if not isinstance(result, tuple):
+            return result, None
+        reply, keyboard, follow_up = result
+        if isinstance(state, dict) and isinstance(follow_up, dict):
+            state.update(follow_up)
+        return reply, keyboard
 
     def known_phone(self, user_id, phone_number=None):
         """Return one canonical number for an identity card (SPEC-021).
@@ -1219,6 +1278,14 @@ class Bot:
                               "AND kind IN ('identity','claim') AND status='pending' "
                               "ORDER BY created_at DESC LIMIT 1", (user_id, chat_id))
         if not pending:
+            saved = state.pop('identity_name', None) if isinstance(state, dict) else None
+            if saved:
+                # SPEC-033: the name arrived first, so the card is built now,
+                # once, complete.  Everything below mirrors the `identify`
+                # branch of `message()` so the button behaves the same.
+                reply, keyboard = self.identify_request(saved, user_id, chat_id,
+                                                        phone_number=phone)
+                return reply, keyboard or self.hide_keyboard()
             state['identity_phone'] = phone
             # SPEC-021: the number is saved, so the only missing piece is the
             # name; the share keyboard is dismissed to keep the chat clean.

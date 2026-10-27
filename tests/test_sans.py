@@ -538,6 +538,10 @@ class PermissionAndConversationTests(BaseCase):
 
     def test_unknown_user_identity_is_admin_confirmed(self):
         self.seed(linked=False)
+        # SPEC-033: the card waits for the number, so this test states one.
+        with self.db.conn:
+            self.db.execute('INSERT INTO contacts(user_id, chat_id, phone) VALUES (?,?,?)',
+                            (10, 10, '+989121234567'))
         self.send('/identify علی رضایی')
         self.assertIsNone(self.service.linked(10))
         claim = self.db.one('SELECT id FROM pending')['id']
@@ -550,13 +554,15 @@ class PermissionAndConversationTests(BaseCase):
 
     def test_identity_request_shows_sender_username_and_display_name_to_admin(self):
         self.seed(linked=False)
+        # SPEC-033: a card is only built once a number is known.
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'})
         self.send('/identify علی رضایی', sender={'id': 10, 'username': '@ali_rezaei',
                                                  'first_name': 'علی', 'last_name': 'رضایی'})
         admin = self.replies(-100)
         self.assertIn('نام نمایشی: علی رضایی', admin)
         self.assertIn('username: @ali_rezaei', admin)
         self.assertIn('شناسهٔ داخلی بله: 10', admin)
-        self.assertIn('شماره تماس: ارسال نشده', admin)
+        self.assertIn('شماره تماس: +989121234567', admin)
 
     def test_own_contact_is_added_to_identity_request_and_pending_summary(self):
         self.seed(linked=False)
@@ -581,17 +587,21 @@ class PermissionAndConversationTests(BaseCase):
 
     def test_contact_for_another_user_is_rejected_and_not_stored(self):
         self.seed(linked=False)
+        # SPEC-033: state the number first, so the rejected contact is the only
+        # thing that can put a number on the card.
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'})
         self.send('/identify علی رضایی', sender={'id': 10, 'username': 'ali_rezaei'})
         self.send(sender={'id': 10, 'username': 'ali_rezaei'},
-                  contact={'user_id': 99, 'phone_number': '+989121234567'})
+                  contact={'user_id': 99, 'phone_number': '+989351111111'})
         payload = json.loads(self.db.one("SELECT payload FROM pending WHERE kind='identity'")['payload'])
-        self.assertNotIn('phone_number', payload)
+        self.assertEqual(payload['phone_number'], '+989121234567')
         self.assertIn('فقط contact متعلق به خودتان پذیرفته می‌شود', self.replies(10))
-        self.assertNotIn('+989121234567', self.replies(-100))
+        self.assertNotIn('+989351111111', self.replies(-100))
 
     def test_ambiguous_identity_resolved_without_private_data_leak(self):
         self.seed(linked=False)
         self.apply('new_player', name='علی محمدی')
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'})
         self.send('/identify علی')
         claim = self.db.one('SELECT * FROM pending')
         self.assertEqual(claim['kind'], 'claim')
@@ -604,6 +614,9 @@ class PermissionAndConversationTests(BaseCase):
 
     def test_already_bound_identity_cannot_be_stolen(self):
         self.seed()
+        # SPEC-033: the card is built once the number is known.
+        self.send(sender={'id': 20}, contact={'user_id': 20, 'phone_number': '+989121234567'},
+                  user=20, chat=20)
         self.send('/identify علی رضایی', user=20, chat=20)
         ident = self.db.one('SELECT id FROM pending')['id']
         self.click('yes:' + ident)
@@ -2520,6 +2533,11 @@ class AudienceOutreachTests(BaseCase):
         self.assertEqual(announced, self.replies(-100))
 
     def test_identity_approval_offers_the_contact_button(self):
+        # SPEC-033: a number must be on file before a card exists.  The approval
+        # attaches that number, so the player no longer needs the button: the
+        # point of this test is that the approval itself never loses it.
+        self.send(sender={'id': 60}, contact={'user_id': 60, 'phone_number': '+989121234567'},
+                  user=60, chat=60)
         self.send('/identify حسین نوری', user=60, chat=60)
         ident = self.db.one("SELECT id FROM pending WHERE kind='identity' AND requester=60")['id']
         with self.db.conn:
@@ -2531,8 +2549,8 @@ class AudienceOutreachTests(BaseCase):
                     self.db.all("SELECT payload FROM outbox WHERE method='sendMessage'")]
         keyboards = [p['reply_markup'] for p in payloads
                      if p['chat_id'] == 60 and 'reply_markup' in p]
-        self.assertEqual(keyboards, [{'keyboard': [[{'text': CONTACT_BUTTON,
-                                                     'request_contact': True}]]}])
+        self.assertEqual(keyboards, [])
+        self.assertEqual(self.service.player(4)['phone'], '+989121234567')
 
     def test_non_player_reply_is_relayed(self):
         with self.db.conn:
@@ -3129,7 +3147,7 @@ class FirstContactTests(BaseCase):
 
         self.send('بدهی من چقدره؟', user=50, chat=50)
 
-        self.assertEqual(self.replies(50).count('برای شروع این دو تا را برایم بفرست'), 1)
+        self.assertEqual(self.replies(50).count(WELCOME_NEW), 1)
         self.assertTrue(self.bot.welcomed(50))
 
     def test_linked_player_without_a_number_is_asked_for_the_number_only(self):
@@ -3180,6 +3198,9 @@ class FirstContactTests(BaseCase):
     def test_identity_request_as_a_first_message_gets_no_welcome(self):
         self.seed(linked=False)
 
+        # SPEC-033: the card needs a number, so it is sent first.
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'},
+                  user=10, chat=10, first_contact=True)
         self.send('/identify علی رضایی', user=10, chat=10, first_contact=True)
 
         self.assertNotIn('خوش آمدی', self.replies(10))
@@ -3205,7 +3226,7 @@ class FirstContactTests(BaseCase):
 
         reply = self.replies(50)
         self.assertIn('این کارها را برایت انجام می‌دهم', reply)
-        self.assertEqual(reply.count('برای شروع این دو تا را برایم بفرست'), 1)
+        self.assertEqual(reply.count(WELCOME_NEW), 1)
 
     def test_contact_before_the_name_asks_for_the_full_name(self):
         self.send(sender={'id': 50}, contact={'user_id': 50, 'phone_number': '09121234567'},
@@ -3283,13 +3304,168 @@ class FirstContactTests(BaseCase):
         self.seed(linked=False)
         self.apply('new_player', name='رضا کریمی')
 
-        self.send('/identify رضا', user=10, chat=10, first_contact=True)
+        # SPEC-033: the card waits for a number, so this test shares one first.
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'},
+                  user=10, chat=10, first_contact=True)
+        self.send('/identify رضا', user=10, chat=10)
 
         admin = self.replies(-100)
         self.assertIn('نام‌های مشابه', admin)
         self.assertIn('#2 رضا محمدی', admin)
         self.assertIn('#3 رضا کریمی', admin)
         self.assertIn('/link', admin)
+
+
+class QuietCommandTests(BaseCase):
+    """SPEC-033: only a turn that waits for the model gets a processing notice."""
+
+    def notice(self, body='', **extra):
+        return self.bot.acknowledgement_chat({'update_id': 1, 'message': {
+            'chat': {'id': 10, 'type': 'private'}, 'from': {'id': 10},
+            'text': body, **extra}})
+
+    def test_help_gets_no_processing_notice(self):
+        self.seed()
+        self.assertIsNone(self.notice('/help'))
+
+        self.send('/help')
+
+        self.assertNotIn('دریافت شد', self.replies(10))
+        self.assertIn('سانس', self.replies(10))
+
+    def test_slash_commands_get_no_processing_notice(self):
+        self.seed()
+        for body in ('/card', '/players', '/debt', '/sessions', '/support',
+                     '/help@SansBot', '/cancel'):
+            self.assertIsNone(self.notice(body), body)
+
+    def test_a_question_still_gets_the_processing_notice(self):
+        self.seed()
+        self.assertEqual(self.notice('بدهی من چقدره؟'), 10)
+
+    def test_a_photo_still_gets_the_processing_notice(self):
+        self.seed()
+        self.assertEqual(self.notice('', caption='رسید',
+                                     photo=[{'file_id': 'f1', 'file_unique_id': 'f1'}]), 10)
+
+    def test_a_command_answered_by_the_service_keeps_its_notice(self):
+        # `/identify` may rename, match, and now wait for a number, so the turn
+        # is not a plain read; it must not be silently instant.
+        self.seed(linked=False)
+        self.assertEqual(self.notice('/identify علی رضایی'), 10)
+
+    def test_a_malformed_command_gets_no_notice_either(self):
+        # The error is produced without any wait, so a notice would only flash.
+        self.seed()
+        self.assertIsNone(self.notice('/setcard'))
+
+
+class OneIdentityCardTests(BaseCase):
+    """SPEC-033: the admin receives one identity card, complete."""
+
+    def card(self):
+        return self.replies(-100)
+
+    def cards(self):
+        return [text for text in self.card().split('\n') if text.startswith('درخواست شناسایی')]
+
+    def test_a_name_without_a_number_sends_no_card(self):
+        self.seed(linked=False)
+        self.ai.answer = {'action': 'identify', 'args': {'name': 'علی رضایی'}}
+        self.send('علی رضایی هستم', user=10, chat=10)
+
+        self.assertEqual(self.card(), '')
+        self.assertFalse(self.db.all('SELECT * FROM pending'))
+
+    def test_the_number_completes_the_card_once(self):
+        self.seed(linked=False)
+        self.ai.answer = {'action': 'identify', 'args': {'name': 'علی رضایی'}}
+        self.send('علی رضایی هستم', user=10, chat=10)
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'},
+                  user=10, chat=10)
+
+        self.assertEqual(len(self.cards()), 1)
+        self.assertIn('نام اعلامی: «علی رضایی»', self.card())
+        self.assertIn('شماره تماس: +989121234567', self.card())
+        payload = json.loads(self.db.one('SELECT payload FROM pending')['payload'])
+        self.assertEqual(payload['phone_number'], '+989121234567')
+        # The verdict is still the admin's.
+        self.click('yes:' + self.db.one('SELECT id FROM pending')['id'])
+        self.assertEqual(self.service.linked(10)['id'], 1)
+
+    def test_the_number_first_then_the_name_makes_one_card(self):
+        self.seed(linked=False)
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'},
+                  user=10, chat=10)
+        self.assertEqual(self.card(), '')
+
+        self.ai.answer = {'action': 'identify', 'args': {'name': 'علی رضایی'}}
+        self.send('علی رضایی هستم', user=10, chat=10)
+
+        self.assertEqual(len(self.cards()), 1)
+        self.assertIn('شماره تماس: +989121234567', self.card())
+
+    def test_cancel_forgets_a_saved_name(self):
+        self.seed(linked=False)
+        self.ai.answer = {'action': 'identify', 'args': {'name': 'علی رضایی'}}
+        self.send('علی رضایی هستم', user=10, chat=10)
+        self.send('/cancel', user=10, chat=10)
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'},
+                  user=10, chat=10)
+
+        self.assertFalse(self.db.all('SELECT * FROM pending'))
+        self.assertEqual(self.card(), '')
+
+    def test_a_name_after_a_number_is_kept_for_the_next_message(self):
+        # The model path stores the held name in the conversation state, so the
+        # contact that follows is the one that builds the card.
+        self.seed(linked=False)
+        with self.db.conn:
+            self.db.set_setting('welcomed:10', 1)
+        reply, keyboard = self.bot.identify_request('علی رضایی', 10, 10)
+        self.assertIn('شمارهٔ موبایلت را با دکمهٔ زیر بفرست', reply)
+        self.assertEqual(keyboard, {'keyboard': [[{'text': CONTACT_BUTTON, 'request_contact': True}]]})
+
+
+class AgentHeldNameTests(BaseCase):
+    """SPEC-033: the agent's identify tool must persist the held name."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed(linked=False)
+        with self.db.conn:
+            self.db.set_setting('welcomed:10', 1)
+        self.ai = ScriptedAgent().script('manage_records', {
+            'operation': 'identify',
+            'data_json': json.dumps({'name': 'علی رضایی'}, ensure_ascii=False)})
+        self.bot = Bot(self.db, self.config, self.ai)
+
+    def ask(self, body='من علی رضایی هستم', **extra):
+        self.update_id += 1
+        self.bot.process({'update_id': self.update_id, 'message': {
+            'message_id': self.update_id, 'chat': {'id': 10, 'type': 'private'},
+            'from': {'id': 10}, 'text': body, **extra}})
+
+    def test_the_tool_holds_the_name_in_the_conversation_state(self):
+        self.ask()
+
+        self.assertFalse(self.db.all('SELECT * FROM pending'))
+        # The request for the number is the tool result the model reasons over.
+        self.assertIn('شمارهٔ موبایلت را با دکمهٔ زیر بفرست',
+                      self.db.one("SELECT summary FROM agent_logs WHERE event='TOOL_RESULT'")['summary'])
+        state, _history = self.db.conversation(10, 10)
+        self.assertEqual(state.get('identity_name'), 'علی رضایی')
+
+    def test_the_held_name_builds_the_card_when_the_contact_arrives(self):
+        self.ask()
+        self.ask(sender={'id': 10},
+                 contact={'user_id': 10, 'phone_number': '+989121234567'})
+
+        self.assertEqual(self.replies(-100).count('درخواست شناسایی'), 1)
+        self.assertIn('شماره تماس: +989121234567', self.replies(-100))
+        payload = json.loads(self.db.one('SELECT payload FROM pending')['payload'])
+        self.assertEqual(payload['name'], 'علی رضایی')
+        self.assertEqual(payload['phone_number'], '+989121234567')
 
 
 if __name__ == '__main__':
@@ -4082,15 +4258,19 @@ class ShortHelpTests(BaseCase):
         self.assertNotIn('/help', reply)
         self.assertNotIn('/debt', reply)
 
-    def test_name_without_a_number_is_reminded_with_the_button(self):
+    def test_name_without_a_number_asks_for_it_with_the_button(self):
+        # SPEC-033: the card is held back until the number is known, so the
+        # admin sees the request once instead of twice.
         self.seed(linked=False)
         self.ai.answer = {'action': 'identify', 'args': {'name': 'علی رضایی'}}
         self.send('علی رضایی هستم', user=10, chat=10)
 
         reply = self.replies(10)
-        self.assertIn('شمارهٔ موبایلت را هم با دکمهٔ زیر بفرست', reply)
+        self.assertIn('شمارهٔ موبایلت را با دکمهٔ زیر بفرست', reply)
         self.assertEqual(self.sent(10)[-1]['reply_markup'],
                          {'keyboard': [[{'text': CONTACT_BUTTON, 'request_contact': True}]]})
+        self.assertFalse(self.replies(-100))
+        self.assertFalse(self.db.all('SELECT * FROM pending'))
 
     def test_a_name_that_carries_a_number_is_not_reminded(self):
         self.seed(linked=False)
@@ -4106,6 +4286,7 @@ class ShortHelpTests(BaseCase):
         # SPEC-032: the intro reply used to end with "/players", "/link" and
         # "/debt", which is exactly the syntax the help text no longer teaches.
         self.seed(linked=False)
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'})
         self.ai.answer = {'action': 'identify', 'args': {'name': 'کسی که نیست'}}
         self.send('من کسی هستم که ثبت نشده', user=10, chat=10)
 
@@ -4116,6 +4297,7 @@ class ShortHelpTests(BaseCase):
 
     def test_a_second_introduction_never_names_a_command_either(self):
         self.seed(linked=False)
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'})
         self.ai.answer = {'action': 'identify', 'args': {'name': 'رضا محمدی'}}
         self.send('رضا محمدی هستم', user=10, chat=10)
         self.send('رضا محمدی هستم', user=10, chat=10)
