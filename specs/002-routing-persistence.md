@@ -99,7 +99,7 @@ state formats.
   `test_greeting_keeps_conversation_context_for_the_next_request` and
   `test_bot_username_mention_is_a_valid_group_trigger`
 - AC-007 -> `tests/test_sans.py::PermissionAndConversationTests::test_user_help_is_short_and_does_not_show_admin_commands` and
-  `test_admin_help_separates_public_and_admin_commands`
+  `test_admin_help_replaces_the_player_guide`
 - AC-008 -> `tests/test_sans.py::PermissionAndConversationTests::test_bare_greeting_never_runs_a_model_action` and
   `test_bare_greeting_falls_back_when_the_model_fails` and
   `test_greeting_caption_on_a_receipt_keeps_the_receipt_flow`

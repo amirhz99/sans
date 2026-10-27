@@ -132,7 +132,7 @@ def _unwrap_accidental_json(reply: str) -> str:
                         return val.strip()
                 action = obj.get('action')
                 if action == 'help':
-                    return 'من می‌توانم سانس‌ها، بازیکنان، حضور و غیاب، رسیدها و بدهی‌ها را مدیریت کنم. هر کاری دارید به زبان ساده بگویید!'
+                    return 'هر کاری داشتی به فارسی ساده بگو؛ سانس، بازیکن، حضور و غیاب، رسید و بدهی را انجام می‌دهم.'
         except Exception:
             pass
     return reply.strip()

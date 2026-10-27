@@ -695,7 +695,7 @@ class PermissionAndConversationTests(BaseCase):
         self.ai.answer = {'action': 'help', 'args': {}}
         self.send('مسئول راهنما', user=99, chat=-100)
         self.assertEqual(len(self.ai.calls), 1)
-        self.assertIn('دستورات ادمین', self.replies(-100))
+        self.assertIn('راهنمای مدیریت', self.replies(-100))
         self.assertTrue(self.bot.is_admin(-100, 99))
 
         self.ai.answer = {'action': 'adjustment', 'args': {'player': 1, 'amount': 500, 'note': 'نباید ثبت شود'}}
@@ -708,7 +708,7 @@ class PermissionAndConversationTests(BaseCase):
         self.ai.answer = {'action': 'help', 'args': {}}
         self.send('مسئول راهنما', user=99, chat=4766035811, chat_type='group')
         self.assertTrue(self.bot.is_admin(4766035811, 99))
-        self.assertIn('دستورات ادمین', self.replies(4766035811))
+        self.assertIn('راهنمای مدیریت', self.replies(4766035811))
         self.assertFalse(self.bot.is_admin(4766035810, 99))
         self.assertFalse(self.bot.is_admin(4766035811, 0))
 
@@ -781,8 +781,8 @@ class PermissionAndConversationTests(BaseCase):
     def test_user_help_is_short_and_does_not_show_admin_commands(self):
         self.send('/help', user=10, chat=10)
         reply = self.replies(10)
-        self.assertIn('دستورات کاربران', reply)
-        self.assertNotIn('دستورات ادمین', reply)
+        self.assertIn('این کارها را برایت انجام می‌دهم', reply)
+        self.assertNotIn('راهنمای مدیریت', reply)
         self.assertNotIn('/players', reply)
         self.assertLessEqual(len(reply.splitlines()), 10)
 
@@ -792,21 +792,24 @@ class PermissionAndConversationTests(BaseCase):
         self.send('/start', user=10, chat=10, first_contact=True)
         self.send('/start', user=10, chat=10)
         reply = self.replies(10)
-        self.assertIn('دستورات کاربران', reply)
+        self.assertIn('این کارها را برایت انجام می‌دهم', reply)
         self.assertIn('عکس رسید', reply)
         self.assertNotIn('گروه مدیریتی', reply)
-        self.assertNotIn('دستورات ادمین', reply)
+        self.assertNotIn('راهنمای مدیریت', reply)
         self.assertNotIn('/players', reply)
 
-    def test_admin_help_separates_public_and_admin_commands(self):
+    def test_admin_help_replaces_the_player_guide(self):
+        # SPEC-032: one audience, one guide.  The admin guide used to be appended
+        # to the player guide, which buried the useful part below eight lines a
+        # player needs and an admin never does.
         self.send('/help', user=1, chat=-100)
         reply = self.replies(-100)
-        self.assertIn('دستورات کاربران', reply)
-        self.assertIn('دستورات ادمین', reply)
-        self.assertIn('/players', reply)
-        self.assertIn('/link2', reply)
-        # SPEC-025 adds one line; the help stays compact enough to read.
-        self.assertLessEqual(len(reply.splitlines()), 19)
+        self.assertIn('راهنمای مدیریت', reply)
+        self.assertNotIn('این کارها را برایت انجام می‌دهم', reply)
+        self.assertNotIn('عکس رسید را در پیوی بفرست', reply)
+        # SPEC-032: help describes processes, not commands.
+        self.assertNotIn('/', reply)
+        self.assertLessEqual(len(reply.splitlines()), 22)
 
     def test_linked_user_can_declare_debt_only_after_confirmation(self):
         self.seed()
@@ -909,7 +912,7 @@ class PermissionAndConversationTests(BaseCase):
         answered = calls[-1][1]
         self.assertEqual(answered['chat_id'], 10)
         self.assertNotIn('message_id', answered)
-        self.assertIn('دستورات کاربران', answered['text'])
+        self.assertIn('این کارها را برایت انجام می‌دهم', answered['text'])
 
     def test_failed_acknowledgement_edit_falls_back_to_new_message(self):
         calls = []
@@ -939,7 +942,7 @@ class PermissionAndConversationTests(BaseCase):
         fallback = calls[-1][1]
         self.assertEqual(fallback['chat_id'], 10)
         self.assertNotIn('message_id', fallback)
-        self.assertIn('دستورات کاربران', fallback['text'])
+        self.assertIn('این کارها را برایت انجام می‌دهم', fallback['text'])
 
     def test_media_response_keeps_normal_send_path_after_acknowledgement(self):
         self.seed()
@@ -1408,7 +1411,7 @@ class SettingsApprovalTests(BaseCase):
         self.send('/setcard ' + self.CARD, user=10, chat=10)
         self.assertEqual(self.proposals(), [])
         self.assertEqual(self.db.setting('card'), '')
-        self.assertIn('دستورات کاربران', self.replies(10))
+        self.assertIn('این کارها را برایت انجام می‌دهم', self.replies(10))
 
         # The admin command still needs a value in the same message.
         self.send('/setcard', user=1, chat=-100)
@@ -3169,7 +3172,7 @@ class FirstContactTests(BaseCase):
 
         reply = self.replies(50)
         self.assertIn(WELCOME_NEW, reply)
-        self.assertNotIn('دستورات کاربران', reply)
+        self.assertNotIn('این کارها را برایت انجام می‌دهم', reply)
         self.assertEqual(self.ai.calls, [])
         self.assertIsNone(self.bot.acknowledgement_chat({'update_id': 99, 'message': {
             'chat': {'id': 50, 'type': 'private'}, 'from': {'id': 50}, 'text': '/start'}}))
@@ -3191,7 +3194,7 @@ class FirstContactTests(BaseCase):
         self.send('مسئول سلام', user=50, chat=-100, first_contact=True)
 
         self.assertNotIn('خوش آمدی', self.replies(1))
-        self.assertIn('دستورات ادمین', self.replies(1))
+        self.assertIn('راهنمای مدیریت', self.replies(1))
         self.assertNotIn('خوش آمدی', self.replies(-100))
         self.assertFalse(self.bot.welcomed(50))
 
@@ -3201,7 +3204,7 @@ class FirstContactTests(BaseCase):
         self.send('/help', user=50, chat=50)
 
         reply = self.replies(50)
-        self.assertIn('دستورات کاربران', reply)
+        self.assertIn('این کارها را برایت انجام می‌دهم', reply)
         self.assertEqual(reply.count('برای شروع این دو تا را برایم بفرست'), 1)
 
     def test_contact_before_the_name_asks_for_the_full_name(self):
@@ -3989,6 +3992,135 @@ class BatchCardLayoutTests(BaseCase):
         summary = self.bot.pending_summary(row)
         self.assertIn('| بازیکن |', summary)
         self.assertEqual(summary.count('| بازیکن |'), 1)
+
+
+class ShortHelpTests(BaseCase):
+    """SPEC-032: one guide per audience, processes not commands, debt apart."""
+
+    PLAYER_TITLE = 'این کارها را برایت انجام می‌دهم'
+    ADMIN_TITLE = 'راهنمای مدیریت'
+
+    def debt(self, player, amount):
+        self.apply('adjustment', player=player, amount=amount, note='بدهی قبلی')
+
+    def sent(self, chat):
+        payloads = (json.loads(row['payload']) for row in
+                    self.db.all("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id"))
+        return [payload for payload in payloads if payload.get('chat_id') == chat]
+
+    def test_player_help_advertises_no_command(self):
+        self.seed()
+        self.send('/help', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertIn(self.PLAYER_TITLE, reply)
+        self.assertNotIn('/', reply)
+
+    def test_admin_group_gets_only_the_admin_guide(self):
+        self.seed()
+        self.send('/help', user=1, chat=-100)
+
+        reply = self.replies(-100)
+        self.assertIn(self.ADMIN_TITLE, reply)
+        self.assertNotIn(self.PLAYER_TITLE, reply)
+        self.assertNotIn('عکس رسید را در پیوی بفرست', reply)
+        self.assertNotIn('/', reply)
+
+    def test_private_player_never_sees_the_admin_guide(self):
+        self.seed()
+        self.send('/help', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertNotIn(self.ADMIN_TITLE, reply)
+        self.assertNotIn('مرز کار', reply)
+
+    def test_private_admin_gets_only_the_admin_guide(self):
+        self.seed()
+        # user 1 is in the admin allowlist, so his private chat keeps the powers.
+        self.send('/help', user=1, chat=1)
+
+        reply = self.replies(1)
+        self.assertIn(self.ADMIN_TITLE, reply)
+        self.assertNotIn(self.PLAYER_TITLE, reply)
+
+    def test_help_balance_is_a_separate_short_message(self):
+        self.seed()
+        self.debt(1, 350000)
+        self.send('/help', user=10, chat=10)
+
+        payloads = [json.loads(r['payload']) for r in self.db.all(
+            "SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id")]
+        texts = [p['text'] for p in payloads if p['chat_id'] == 10]
+        # The guide is constant, so it is always the first message...
+        self.assertIn(self.PLAYER_TITLE, texts[0])
+        self.assertNotIn('350,000', texts[0])
+        # ...and the balance arrives on its own, as one short line.
+        self.assertEqual(texts[1], 'بدهی فعلی: 350,000 تومان')
+
+    def test_help_balance_says_settled_when_nothing_is_owed(self):
+        self.seed()
+        self.send('/help', user=10, chat=10)
+
+        self.assertIn('تسویه شده‌ای ✅', self.replies(10))
+
+    def test_debt_command_still_shows_the_full_ledger(self):
+        self.seed()
+        self.debt(1, 350000)
+        self.send('/debt', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertIn('گردش حساب', reply)
+        self.assertIn('بدهی قبلی', reply)
+
+    def test_welcome_and_greeting_advertise_no_command(self):
+        self.seed()
+        self.ai.answer = 'سلام'
+        self.send('سلام', user=10, chat=10)
+        self.send('/start', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertNotIn('/help', reply)
+        self.assertNotIn('/debt', reply)
+
+    def test_name_without_a_number_is_reminded_with_the_button(self):
+        self.seed(linked=False)
+        self.ai.answer = {'action': 'identify', 'args': {'name': 'علی رضایی'}}
+        self.send('علی رضایی هستم', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertIn('شمارهٔ موبایلت را هم با دکمهٔ زیر بفرست', reply)
+        self.assertEqual(self.sent(10)[-1]['reply_markup'],
+                         {'keyboard': [[{'text': CONTACT_BUTTON, 'request_contact': True}]]})
+
+    def test_a_name_that_carries_a_number_is_not_reminded(self):
+        self.seed(linked=False)
+        with self.db.conn:
+            self.db.execute('INSERT INTO contacts(user_id, chat_id, phone) VALUES (?,?,?)',
+                            (10, 10, '+989121234567'))
+        self.ai.answer = {'action': 'identify', 'args': {'name': 'علی رضایی'}}
+        self.send('علی رضایی هستم', user=10, chat=10)
+
+        self.assertNotIn('شمارهٔ موبایلت را هم با دکمهٔ زیر بفرست', self.replies(10))
+
+    def test_introduction_never_answers_with_a_command(self):
+        # SPEC-032: the intro reply used to end with "/players", "/link" and
+        # "/debt", which is exactly the syntax the help text no longer teaches.
+        self.seed(linked=False)
+        self.ai.answer = {'action': 'identify', 'args': {'name': 'کسی که نیست'}}
+        self.send('من کسی هستم که ثبت نشده', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertNotIn('/', reply)
+        # The admin card must still carry the request id, or nobody can act on it.
+        self.assertIn('شناسهٔ درخواست', self.replies(-100))
+
+    def test_a_second_introduction_never_names_a_command_either(self):
+        self.seed(linked=False)
+        self.ai.answer = {'action': 'identify', 'args': {'name': 'رضا محمدی'}}
+        self.send('رضا محمدی هستم', user=10, chat=10)
+        self.send('رضا محمدی هستم', user=10, chat=10)
+
+        self.assertNotIn('/', self.replies(10))
 
 
 class SupportHandleTests(BaseCase):

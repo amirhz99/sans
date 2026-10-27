@@ -22,7 +22,7 @@ from .service import (ADMIN_ACTIONS, Service, UserError, integer, normalize,
 # A greeting is answered by the model, but it is never allowed to trigger an
 # action.  This line is only the fail-closed fallback and the reply for a
 # greeting that the model tried to turn into an operation.
-GREETING_REPLY = 'سلام! در خدمتم؛ بفرمایید چه کاری برایتان انجام دهم؟ برای راهنما /help را بفرستید.'
+GREETING_REPLY = 'سلام! در خدمتم؛ بفرمایید چه کاری برایتان انجام دهم؟'
 
 LOG = logging.getLogger('sans')
 
@@ -146,7 +146,7 @@ WELCOME_NAME_ONLY = ('سلام 👋 خوش آمدی. شماره‌ات را دا
 WELCOME_PHONE_ONLY = ('سلام {name} 👋 خوش آمدی.\n'
                       'فقط شمارهٔ موبایلت را با دکمهٔ زیر بفرست.')
 WELCOME_COMPLETE = ('سلام {name} 👋 خوش آمدی. هر کاری داشتی بگو:\n'
-                    'بدهی /debt، سانس /session، شمارهٔ کارت /card، راهنما /help.')
+                    'بدهی، سانس، شمارهٔ کارت یا راهنما.')
 
 
 def buttons(yes, no):
@@ -395,9 +395,55 @@ class Bot:
         player = self.service.linked(user_id)
         return player if player and not player['phone'] else None
 
+    def phone_missing(self, user_id):
+        """Return whether this user still has no number on file (SPEC-032).
+
+        A brand-new identity request carries the number it already knows, so the
+        only source of truth is the pending card.  Reading it here keeps the
+        reply and the admin card consistent: both say a number is missing.
+        """
+        pending = self.pending_identity(user_id)
+        if not pending:
+            return False
+        row = self.db.one('SELECT payload FROM pending WHERE id=?', (pending['id'],))
+        if not row:
+            return False
+        try:
+            payload = json.loads(row['payload'])
+        except ValueError:
+            return False
+        return not payload.get('phone_number')
+
     def welcomed(self, user_id):
         """Return whether this account already received the first-contact text."""
         return bool(self.db.setting(f'welcomed:{user_id}'))
+
+    def help_reply(self, user_id, admin, private):
+        """Return ``(text, keyboard, debt_line)`` for the ``help`` action (SPEC-032).
+
+        One audience, one guide: the admin guide replaces the player guide
+        instead of being appended to it, because an admin in the management
+        group has no use for "send a receipt from your private chat".  The
+        balance is returned separately so the guide itself stays constant,
+        short, and free of a database round-trip.
+        """
+        if admin:
+            return ADMIN_HELP, None, None
+        player = self.service.linked(user_id) if private else None
+        keyboard = None
+        debt = None
+        if player:
+            balance = self.service.balance(player['id'])
+            if balance > 0:
+                debt = f'بدهی فعلی: {balance:,} تومان'
+            elif balance < 0:
+                debt = f'بستانکار: {abs(balance):,} تومان'
+            else:
+                debt = 'تسویه شده‌ای ✅'
+            if not player['phone']:
+                # SPEC-016: the one button that can share a number.
+                keyboard = self.contact_keyboard()
+        return HELP, keyboard, debt
 
     def pending_identity(self, user_id):
         """Return the open identity request of this user, if any (SPEC-021)."""
@@ -589,6 +635,7 @@ class Bot:
         # SPEC-028: the progress feed is created lazily, only on the model paths,
         # and stays ``None`` for every deterministic route.
         progress = None
+        followup = None
         chat = msg.get('chat', {})
         chat_id = chat.get('id')
         user_id = msg.get('from', {}).get('id')
@@ -796,9 +843,11 @@ class Bot:
                                     (user_id, chat_id))
                     reply = 'مرحلهٔ فعلی و پیشنهادهای تأییدنشدهٔ شما لغو شدند؛ رسید ثبت‌شده یا حساب مالی تغییر نکرد.'
                 elif action == 'help':
-                    reply = HELP + ('\n\n' + ADMIN_HELP if admin else '')
-                    if private and self.service.linked(user_id):
-                        reply += '\n\n' + self.service.debt(self.service.linked(user_id)['id'])
+                    # SPEC-032: one guide per audience, never both.  The
+                    # balance is held in `followup` and queued after the
+                    # guide at the bottom of this method, so the person
+                    # reads what the bot can do before what they owe.
+                    reply, keyboard, followup = self.help_reply(user_id, admin, private)
                 elif action == 'support':
                     # SPEC-031: the handle comes from configuration only; when no
                     # human hand-off is configured this must not invent one.
@@ -867,6 +916,10 @@ class Bot:
                     if self.player_without_phone(user_id):
                         # SPEC-016: an already linked player may still be missing
                         # a number, so offer the button instead of only a message.
+                        keyboard = self.contact_keyboard()
+                    elif self.phone_missing(user_id):
+                        # SPEC-032: a brand-new request without a number gets the
+                        # same button, so the reply and the card agree.
                         keyboard = self.contact_keyboard()
                 elif action == 'payment_amount' and private:
                     reply = self.submit_amount(args.get('amount'), state, user_id)
@@ -958,6 +1011,8 @@ class Bot:
         # always a fresh message.  The feed is closed only *after* the answer is
         # queued, so a failed removal can never cost the person their reply.
         self.db.say(chat_id, reply, markup, self.card_ref(markup), keyboard=keyboard)
+        if followup:
+            self.db.say(chat_id, followup)
         if progress is not None:
             progress.close()
 
@@ -1070,11 +1125,11 @@ class Bot:
 
     def identify(self, name, user_id, chat_id, sender=None, phone_number=None):
         if self.service.linked(user_id):
-            return 'حساب شما قبلاً شناسایی شده است. برای مشاهدهٔ بدهی /debt را بفرستید.'
+            return 'حساب شما قبلاً شناسایی شده است؛ بدهی‌ات را با پرسیدن «چقدر بدهکارم؟» می‌بینی.'
         name = text(name, 'نام کامل')
         existing = self.db.one("SELECT id FROM pending WHERE requester=? AND kind IN ('identity','claim') AND status='pending'", (user_id,))
         if existing:
-            return 'درخواست شناسایی شما منتظر ادمین است. برای اصلاح نام ابتدا /cancel کنید.'
+            return 'درخواست شناسایی شما منتظر ادمین است. تا وقتی تأیید نشده، پیشنهاد قبلی را می‌شود پس گرفت.'
         try:
             player = self.service.player(name)
         except UserError:
@@ -1088,9 +1143,16 @@ class Bot:
         if player:
             markup = buttons('yes:' + ident, 'no:' + ident)
         else:
-            note += f'\nتطبیق قطعی پیدا نشد. با /players بررسی کنید؛ در صورت نیاز بازیکن بسازید و سپس:\n/link {ident} شناسه_بازیکن'
+            note += (f'\nتطبیق قطعی با بازیکن‌های ثبت‌شده پیدا نشد؛ باید بازیکن را دستی بسازید و بعد پیوند بزنید.'
+                     f'\nشناسهٔ درخواست: {ident} — نام مورد نظر: {name}')
         self.db.say(self.config.admin_group, note, markup)
-        return 'معرفی شما برای بررسی به ادمین‌ها ارسال شد؛ بعد از تأیید، بدهی حساب خودتان قابل مشاهده است.'
+        reply = 'معرفی شما برای بررسی به ادمین‌ها ارسال شد؛ بعد از تأیید، بدهی حساب خودتان قابل مشاهده است.'
+        if not payload.get('phone_number'):
+            # SPEC-032: the card says the number is missing, so the person must
+            # be told too, and given the one button that can send it.
+            reply += ('\nیک چیز مانده: شمارهٔ موبایلت را هم با دکمهٔ زیر بفرست '
+                      'تا ادمین در صورت نیاز تماس بگیرد.')
+        return reply
 
     def known_phone(self, user_id, phone_number=None):
         """Return one canonical number for an identity card (SPEC-021).
