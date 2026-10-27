@@ -399,7 +399,10 @@ class RelativeDateTests(BaseCase):
         # A bare weekday is its next occurrence, today included.
         self.assertEqual(self.parse('سه شنبه ساعت ۲۱'), '2026-10-27T21:00+03:30')
         self.assertEqual(self.parse('شنبه ساعت ۲۱'), '2026-10-31T21:00+03:30')
-        self.assertEqual(self.parse('پنج شنبه ساعت ۲۱'), '2026-10-31T21:00+03:30')
+        # Thursday is 2026-10-29; a naive scan would read «پنج شنبه» as Saturday.
+        self.assertEqual(self.parse('پنج شنبه ساعت ۲۱'), '2026-10-29T21:00+03:30')
+        self.assertEqual(self.parse('پنج‌شنبه ساعت ۲۱'), '2026-10-29T21:00+03:30')
+        self.assertEqual(self.parse('یک‌شنبه ساعت ۲۱'), '2026-11-01T21:00+03:30')
         # Once today's clock has passed, the next occurrence is a week away.
         self.assertEqual(self.parse('سه شنبه ساعت ۲۱', datetime(2026, 10, 27, 22, 0,
                                                                 tzinfo=ZoneInfo('Asia/Tehran'))),
@@ -437,6 +440,30 @@ class RelativeDateTests(BaseCase):
         self.assertEqual(self.parse('۹ خرداد ساعت ۲۱'), '2026-05-30T21:00+03:30')
         self.assertEqual(self.parse('۱۴۰۵/۰۳/۰۹ ۲۱:۰۰'), '2026-05-30T21:00+03:30')
         self.assertEqual(self.parse('2026-10-30 21:00'), '2026-10-30T21:00+03:30')
+
+    def test_weekday_names_are_matched_longest_first_on_normalized_text(self):
+        # Regression: «شنبه» is a suffix of «سه‌شنبه»/«پنج‌شنبه»/«یک‌شنبه», so a
+        # naive substring scan reported Saturday for three different days.
+        from app.service import weekday_phrase
+        expectations = {
+            'دوشنبه': 0, 'سه‌شنبه': 1, 'سه شنبه': 1, 'چهارشنبه': 2,
+            'پنجشنبه': 3, 'پنج‌شنبه': 3, 'پنج شنبه': 3, 'جمعه': 4,
+            'شنبه': 5, 'یک‌شنبه': 6, 'یکشنبه': 6, 'يكشنبه': 6,
+        }
+        for phrase, weekday in expectations.items():
+            with self.subTest(phrase=phrase):
+                self.assertEqual(weekday_phrase(phrase)[0], weekday)
+        # A day word inside a longer word is still that day, by design.
+        self.assertEqual(weekday_phrase('شنبه‌ها')[0], 5)
+
+    def test_every_weekday_resolves_to_its_own_day(self):
+        # Each weekday must resolve forward to a date whose real weekday matches.
+        from app.service import weekday_phrase
+        for phrase in ('شنبه', 'یک‌شنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنج‌شنبه', 'جمعه'):
+            with self.subTest(phrase=phrase):
+                stamp = datetime.fromisoformat(self.parse(f'{phrase} ساعت ۲۱'))
+                self.assertEqual(stamp.weekday(), weekday_phrase(phrase)[0])
+                self.assertGreaterEqual(stamp.date(), self.NOW.date())
 
     def test_roster_importer_still_requires_fridays(self):
         from app.backfill import planned_sessions

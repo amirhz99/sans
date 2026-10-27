@@ -103,11 +103,11 @@ def setting_value_is_explicit(message, key, value):
 
 
 TEHRAN = ZoneInfo('Asia/Tehran')
-# SPEC-026: the lookup is done on ``normalize()`` output, so every name is stored
-# in its space form.  A ZWNJ («سه‌شنبه») and a space («سه شنبه») are the same key.
+# SPEC-026: the lookup runs on ``normalize()`` output, which turns the ZWNJ into a
+# space, so «سه‌شنبه» arrives as «سه شنبه».  Both spellings are therefore keys.
 WEEKDAYS = {
-    'دوشنبه': 0, 'سه شنبه': 1, 'چهارشنبه': 2, 'پنجشنبه': 3,
-    'جمعه': 4, 'شنبه': 5, 'یکشنبه': 6,
+    'دوشنبه': 0, 'سه شنبه': 1, 'چهارشنبه': 2, 'پنجشنبه': 3, 'پنج شنبه': 3,
+    'جمعه': 4, 'شنبه': 5, 'یکشنبه': 6, 'یک شنبه': 6,
 }
 # SPEC-026: «شنبه» is a suffix of «پنجشنبه»/«یکشنبه», so a longest-key-first scan
 # is required; a plain ``in`` test over the mapping would match the wrong day.
@@ -119,11 +119,12 @@ JALALI_MONTHS = jalali.MONTHS
 def weekday_phrase(value):
     """Return ``(weekday, phrase)`` for the weekday the operator wrote, or None.
 
-    The phrase is the matched key in its space form, so «پنج‌شنبه» and «پنج شنبه»
-    report the same day.  A day word inside a longer word («شنبه‌ها») still counts:
-    it is a weekday, and the consistency check below decides whether the date
-    agrees with it.
+    The input is normalized first, so «سه‌شنبه» (ZWNJ) and «سه شنبه» (space) are
+    the same day.  The phrase is returned in its space form.  A day word inside a
+    longer word («شنبه‌ها») still counts: it is a weekday, and the consistency
+    check below decides whether the date agrees with it.
     """
+    value = normalize(value)
     position = -1
     found = None
     for key in _WEEKDAY_KEYS:

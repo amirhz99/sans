@@ -111,6 +111,8 @@ weekday that does match.
 - AC-003 -> `tests/test_sans.py::RelativeDateTests::test_weekend_and_bare_weekday_use_next_occurrence`
 - AC-004 -> `tests/test_sans.py::RelativeDateTests::test_weekday_that_contradicts_the_date_fails_closed`
 - AC-005 -> `tests/test_sans.py::RelativeDateTests::test_any_weekday_is_allowed_when_it_matches`
+- AC-005 -> `tests/test_sans.py::RelativeDateTests::test_weekday_names_are_matched_longest_first_on_normalized_text`
+- AC-005 -> `tests/test_sans.py::RelativeDateTests::test_every_weekday_resolves_to_its_own_day`
 - AC-006 -> `tests/test_sans.py::RelativeDateTests::test_explicit_dates_win_over_relative_words`
 - AC-007 -> `tests/test_agent_contracts.py::SnapshotDateContextTests::test_snapshot_now_is_jalali_with_persian_weekday`
 - AC-008 -> `tests/test_sans.py::RelativeDateTests::test_roster_importer_still_requires_fridays`
@@ -142,6 +144,15 @@ git diff --check
   phrase therefore looked like a month with no day and failed with a confusing
   message. Month names are now matched as whole words
   (`(?<![\u0600-\u06FF])name(?![\u0600-\u06FF])`).
+- A fifth, more serious defect was found only while smoke-testing the deployed
+  code: «شنبه» is a suffix of «سه‌شنبه»، «پنج‌شنبه» and «یک‌شنبه», so a naive
+  substring scan reported **Saturday for three different days**. `normalize()`
+  also turns the ZWNJ into a space, so «پنج‌شنبه» arrives as «پنج شنبه» and never
+  matched the ZWNJ-free key. `weekday_phrase` now normalizes its own input and
+  scans longest-key-first over both spellings, and
+  `test_weekday_names_are_matched_longest_first_on_normalized_text` pins it.
+  This is why the smoke test after deployment mattered: the unit tests only
+  exercised «پنج شنبه» and happened to agree with the bug.
 - «پنج شنبه» and «پنج‌شنبه» already worked because `normalize()` collapses the
   ZWNJ into a space and `WEEKDAYS` happened to contain the space form for that
   entry. The new helper normalizes the key lookup instead of relying on that
