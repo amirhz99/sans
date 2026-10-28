@@ -13,8 +13,8 @@ from zoneinfo import ZoneInfo
 from app import jalali
 from app.bot import (Bot, CONTACT_BUTTON, GREETING_REPLY, PROGRESS_ANSWERING,
                      PROGRESS_READING, PROGRESS_START, PROGRESS_STEPS, PROGRESS_WRITING,
-                     RELAY_CONFIRMATION, TurnProgress, WELCOME_COMPLETE, WELCOME_NAME_ONLY,
-                     WELCOME_NEW, WELCOME_PHONE_ONLY)
+                     RELAY_CONFIRMATION, TurnProgress, UNKNOWN_COMMAND, WELCOME_COMPLETE,
+                     WELCOME_NAME_ONLY, WELCOME_NEW, WELCOME_PHONE_ONLY)
 from app.ai_context import AIContextBuilder
 from app.clients import AIClient, APIError
 from app.config import Config, parse_support_handle
@@ -24,7 +24,8 @@ from app.domain import ConversationState, EntityRef, Intent, ResponseLevel
 from app.main import ACKNOWLEDGEMENT, flush_outbox, import_players, instance_lock, send_acknowledgement
 from app.presentation import SessionView
 from app.prompt_loader import PromptLoader
-from app.service import Service, UserError, integer, normalize, normalize_phone, parse_session_datetime
+from app.service import (ADMIN_ACTIONS, Service, UserError, integer, normalize,
+                         normalize_phone, parse_session_datetime)
 from app.turns import TurnBuffer
 from tests.test_backfill import write_xlsx
 
@@ -144,13 +145,13 @@ class FinancialTests(BaseCase):
         session = self.db.one('SELECT * FROM sessions WHERE title=?', ('پیش‌فرض‌ها',))
         self.assertEqual(session['venue_cost'], 2500000)
         self.assertEqual(session['person_fee'], 150000)
-        self.assertEqual(session['location'], 'سالن فوتسال تیموری')
+        self.assertEqual(session['location'], 'سالن فوتسال نمونه')
         with self.assertRaises(UserError):
             self.apply('finalize', session=1)
 
     def test_admin_can_override_new_session_defaults(self):
         self.apply('new_session', title='قیمت متفاوت', when_text='فردا ساعت ۲۱', venue_cost=3000000, person_fee=200000,
-                   location='سالن دیگر')
+                   location= 'سالن دیگر')
         session = self.db.one('SELECT * FROM sessions WHERE title=?', ('قیمت متفاوت',))
         self.assertEqual(session['venue_cost'], 3000000)
         self.assertEqual(session['person_fee'], 200000)
@@ -162,7 +163,7 @@ class FinancialTests(BaseCase):
         reply = self.replies(-100)
         self.assertIn('2,500,000', reply)
         self.assertIn('150,000', reply)
-        self.assertIn('سالن فوتسال تیموری', reply)
+        self.assertIn('سالن فوتسال نمونه', reply)
         self.assertIn('سانس تنظیمات', reply)
 
     def test_ambiguous_names_and_sessions(self):
@@ -723,13 +724,13 @@ class PermissionAndConversationTests(BaseCase):
         self.assertTrue(self.db.all('SELECT * FROM pending'))
 
     def test_positive_group_id_grants_group_admin_access(self):
-        self.bot.config = replace(self.config, admin_group=4766035811)
+        self.bot.config = replace(self.config, admin_group=1000000001)
         self.ai.answer = {'action': 'help', 'args': {}}
-        self.send('مسئول راهنما', user=99, chat=4766035811, chat_type='group')
-        self.assertTrue(self.bot.is_admin(4766035811, 99))
-        self.assertIn('راهنمای مدیریت', self.replies(4766035811))
+        self.send('مسئول راهنما', user=99, chat=1000000001, chat_type='group')
+        self.assertTrue(self.bot.is_admin(1000000001, 99))
+        self.assertIn('راهنمای مدیریت', self.replies(1000000001))
         self.assertFalse(self.bot.is_admin(4766035810, 99))
-        self.assertFalse(self.bot.is_admin(4766035811, 0))
+        self.assertFalse(self.bot.is_admin(1000000001, 0))
 
     def test_ambiguous_group_acknowledgement_cannot_set_card(self):
         self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': '6037997512345678'}}
@@ -1282,7 +1283,7 @@ class OperationalTests(BaseCase):
             # it points at the context that carries the effective defaults.
             self.assertIn('session_defaults', post.call_args.args[1]['messages'][0]['content'])
             self.assertNotIn('۲٬۵۰۰٬۰۰۰', post.call_args.args[1]['messages'][0]['content'])
-            self.assertNotIn('سالن فوتسال تیموری', post.call_args.args[1]['messages'][0]['content'])
+            self.assertNotIn('سالن فوتسال نمونه', post.call_args.args[1]['messages'][0]['content'])
         for invalid in ('not json', '[]', '{"action":"card","args":[]}'):
             with patch('app.clients.post_json', return_value={'choices': [{'message': {'content': invalid}}]}):
                 with self.assertRaises(APIError):
@@ -3125,6 +3126,255 @@ class PrivateAdminTests(BaseCase):
         self.assertEqual(len(self.ai.calls), 1)
 
 
+class AdminActionSweepTests(BaseCase):
+    """SPEC-038: one gate, proven exhaustively, in front of every admin action.
+
+    Two ways of reaching a privileged branch are swept.  The slash-command
+    route comes through ``Bot.command``, which answers every admin command with
+    the uniform refusal for a non-admin.  The model-routing route comes through
+    ``Bot.message``'s allow-list gate.  A few admin action names are absent
+    from that allow-list on purpose (``broadcast``) or in effect
+    (``player_link``/``player_unlink`` are not routable by the model), so for
+    those the two layers are asserted separately instead of pretending the
+    refusal text is the same.
+    """
+
+    REFUSAL = 'فقط برای ادمین'
+
+    # Admin actions the model is allowed to route; each must hit the admin gate.
+    ROUTABLE = sorted(ADMIN_ACTIONS - {'broadcast', 'player_link', 'player_unlink'})
+
+    # Privileged actions handled next to `ADMIN_ACTIONS` rather than in it.  They
+    # sit below the same gate, so they are swept too.  `expire` and `list_links`/
+    # `duplicates` are only parsed for an admin, so they are covered by
+    # ``COMMANDS`` instead.
+    NEIGHBOURS = ('list_players', 'list_sessions', 'report', 'pending', 'config',
+                  'defaults')
+
+    # Admin actions that are reachable as slash commands, with the real command
+    # name for each.  ``Bot.command`` only parses these when the caller is an
+    # admin; a player falls through to SPEC-034's unknown-command refusal.
+    COMMANDS = {'new_player': '/newplayer تست', 'player_delete': '/delplayer 1',
+                'player_rename': '/rename 1 نام تازه', 'player_merge': '/merge 1 2',
+                'void_session': '/void 1', 'duplicates': '/duplicates',
+                'player_link': '/link2 1 2', 'player_unlink': '/unlink2 1 2',
+                'list_links': '/links', 'expire': '/expire 0',
+                'batch': '/do {"action":"batch","args":{"commands":[]}}',
+                'config': '/config', 'report': '/report', 'pending': '/pending',
+                'list_players': '/players', 'list_sessions': '/sessions',
+                'defaults': '/defaults'}
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        # The test config allowlists {1, 2}.  User 10 is the *player*: linked to
+        # player 1 and deliberately absent from the allow-list.
+        self.bot.config = replace(self.config, admins=frozenset({1, 2}),
+                                  admin_access='allowlist')
+        self.player = 10
+        self.admin = 1
+
+    def route(self, action, args, user=10, chat=10):
+        """Send one routed action and return the reply text for that chat."""
+        self.ai.answer = {'action': action, 'args': args}
+        self.send('انجامش بده', user=user, chat=chat)
+        return self.last_reply(chat)
+
+    def route_group(self, action, args, user=10, chat=-100):
+        """Send a routed action into the admin group.
+
+        ``message()`` drops an unaddressed group message before routing, so a
+        bare request there never reaches the model.  Addressing the bot is what
+        a player has to do anyway to be heard in the group.
+        """
+        self.ai.answer = {'action': action, 'args': args}
+        self.send('مسئول انجامش بده', user=user, chat=chat)
+        return self.last_reply(chat)
+
+    def snapshot(self):
+        """A comparable picture of everything an admin action could move."""
+        return {
+            'players': self.db.one('SELECT COUNT(*) n FROM players')['n'],
+            'sessions': self.db.one('SELECT COUNT(*) n FROM sessions')['n'],
+            'pending': self.db.one('SELECT COUNT(*) n FROM pending')['n'],
+            'ledger': self.db.one('SELECT COUNT(*) n FROM ledger')['n'],
+            'receipts': self.db.one('SELECT COUNT(*) n FROM receipts')['n'],
+            'balances': tuple((p['id'], self.service.balance(p['id']))
+                              for p in self.db.all('SELECT id FROM players ORDER BY id')),
+        }
+
+    def test_every_admin_action_is_refused_for_a_player(self):
+        for action in self.ROUTABLE:
+            with self.subTest(action=action):
+                before = self.snapshot()
+                reply = self.route(action, {'player': 1, 'session': 1, 'name': 'x'})
+                self.assertIn(self.REFUSAL, reply)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_an_admin_command_from_a_player_in_the_group_gets_no_reply(self):
+        # SPEC-038 correction: under the default policy every member of the
+        # configured group *is* an admin, so `user 10` sending `/newplayer` in
+        # the group legitimately creates a card.  What the sweep must prove is
+        # that the same command from a chat that is NOT the admin group, sent by
+        # a sender who is not allowlisted, is refused and creates nothing.
+        for action, command in sorted(self.COMMANDS.items()):
+            with self.subTest(action=action):
+                before = self.snapshot()
+                self.send(command, user=self.player, chat=-200)
+                self.assertEqual(self.snapshot(), before)
+                self.assertFalse(self.bot.is_admin(-200, self.player))
+
+    def test_an_admin_still_gets_the_same_commands_parsed(self):
+        # The command table is live: with an admin sender the same strings do
+        # reach their branches, so the refusal above is about the caller.
+        for action, command in sorted(self.COMMANDS.items()):
+            with self.subTest(action=action):
+                self.send(command, user=self.admin, chat=-100)
+                self.assertNotIn(UNKNOWN_COMMAND, self.last_reply(-100))
+
+    def test_the_model_cannot_route_the_agent_only_actions(self):
+        # SPEC-014: `broadcast` is not in the domain Action enum, so an Intent
+        # carrying it fails validation before the routing allow-list and long
+        # before the admin gate.  `player_link`/`player_unlink` are in
+        # ADMIN_ACTIONS but not in the enum either, so the model can never mint
+        # one; only an explicit admin command does.
+        for action in ('broadcast', 'player_link', 'player_unlink'):
+            with self.subTest(action=action):
+                before = self.snapshot()
+                reply = self.route(action, {'player': 1, 'partner': 2, 'message': 'سلام'})
+                self.assertIn('درخواست معتبر', reply)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_privileged_neighbours_are_refused_for_a_player(self):
+        # Two independent layers refuse these, and the sweep must not pretend
+        # they are the same:
+        #   * `defaults` is not in the domain Action enum, so validation rejects
+        #     the Intent before routing exists ("درخواست معتبر").
+        #   * `pending` is in the enum but not in the routing allow-list, so it
+        #     is rejected as "مجاز نیست"; SPEC-038 also gave its branch an
+        #     explicit admin gate, swept via `/pending` in COMMANDS.
+        # `report`, `config`, `list_players` and `list_sessions` do reach the
+        # admin gate, so they answer with the gate's own refusal.
+        gated = {'report', 'config', 'list_players', 'list_sessions'}
+        for action in sorted(gated):
+            with self.subTest(action=action, layer='gate'):
+                before = self.snapshot()
+                reply = self.route(action, {'player': 1, 'session': 1})
+                self.assertIn(self.REFUSAL, reply)
+                self.assertEqual(self.snapshot(), before)
+        with self.subTest(action='pending', layer='allow-list'):
+            before = self.snapshot()
+            self.assertIn('مجاز نیست', self.route('pending', {}))
+            self.assertEqual(self.snapshot(), before)
+        with self.subTest(action='defaults', layer='validation'):
+            before = self.snapshot()
+            self.assertIn('درخواست معتبر', self.route('defaults', {}))
+            self.assertEqual(self.snapshot(), before)
+
+    def test_the_unroutable_neighbours_are_refused_for_a_player(self):
+        # Same two actions, each at the layer that actually stops it.  Kept
+        # separate from the test above so that a future change which moves one
+        # of them to a different layer shows up as a specific failure rather
+        # than a vague one.
+        cases = (('pending', 'مجاز نیست'), ('defaults', 'درخواست معتبر'))
+        for action, expected in cases:
+            with self.subTest(action=action):
+                before = self.snapshot()
+                reply = self.route(action, {})
+                self.assertIn(expected, reply)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_a_stranger_in_the_admin_group_gets_no_admin_powers(self):
+        # Under the default `group_members` policy, membership of the configured
+        # group **is** admin access — that is the documented contract, and the
+        # audit trail records who acted.  This sweep therefore asserts the
+        # contract rather than inventing a stricter one: a stranger inside the
+        # group can create a card, and the same stranger outside it cannot.
+        bot = Bot(self.db, replace(self.config, admins=frozenset({1, 2}),
+                                   admin_access='group_members'), FakeAI())
+        self.assertTrue(bot.is_admin(-100, 99))
+        self.assertFalse(bot.is_admin(-200, 99))
+        self.assertFalse(bot.is_admin(99, 99))
+
+    def test_allowlist_policy_confines_private_admin_to_the_listed_ids(self):
+        # `admin_access` only governs *private* chats.  The configured admin
+        # group is a separate boundary that wins regardless of the policy, so
+        # `is_admin(-100, 99)` is True here by design.  This test pins that
+        # ordering explicitly, because SPEC-038's first draft wrongly assumed
+        # the allow-list also applied inside the group.
+        bot = Bot(self.db, replace(self.config, admins=frozenset({1, 2}),
+                                   admin_access='allowlist'), FakeAI())
+        self.assertTrue(bot.is_admin(1, 1))          # allowlisted, private
+        self.assertFalse(bot.is_admin(99, 99))       # not allowlisted, private
+        self.assertTrue(bot.is_admin(-100, 99))      # group boundary wins
+
+    def test_pending_is_gated_even_when_routed(self):
+        # SPEC-038: `/pending` was admin-only, but the routed `pending` action
+        # reached the branch through a different path.  It lists every open
+        # card with the player names, amounts and phone numbers on them, so a
+        # caller who is not an admin must not be able to read it that way.
+        with self.db.conn:
+            self.db.execute("INSERT INTO pending(id,kind,status,requester,chat_id,payload,revision,created_at) "
+                            "VALUES ('abc','commands','pending',1,-100,'[]',0,1)")
+        before = self.snapshot()
+        reply = self.route('pending', {}, user=self.player, chat=10)
+        self.assertIn('مجاز نیست', reply)
+        self.assertNotIn('abc', reply)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_the_sweep_leaves_the_database_untouched(self):
+        before = self.snapshot()
+        for action in self.ROUTABLE + list(self.NEIGHBOURS):
+            self.route(action, {'player': 1, 'session': 1, 'name': 'x'})
+        for command in self.COMMANDS.values():
+            self.send(command, user=self.player, chat=-200)
+        self.assertEqual(self.snapshot(), before)
+        # A refused request must not leave a clickable card behind.
+        self.assertEqual(self.db.one("SELECT COUNT(*) n FROM pending")['n'], 0)
+
+    def test_the_same_actions_still_reach_an_admin(self):
+        # The sweep is only meaningful if the route is live for an admin.
+        for action in ('new_player', 'new_session', 'attendance'):
+            with self.subTest(action=action):
+                reply = self.route(action, {'name': 'بازیکن تازه',
+                                            'title': 'سانس تازه',
+                                            'when_text': 'فردا ساعت ۲۱',
+                                            'session': 1, 'player': 1,
+                                            'present': True,
+                                            'guests': 0}, user=self.admin, chat=-100)
+                self.assertNotIn(self.REFUSAL, reply)
+
+    def test_player_actions_stay_available(self):
+        # `declare_debt` is a player action, not an admin one: a player may use
+        # it for their own record, and only for that record.  It is a private
+        # chat action, which is exactly why the gate must not be a blanket one.
+        self.assertNotIn('declare_debt', ADMIN_ACTIONS)
+        # A first private message is the welcome, so mark the account as known
+        # before asserting on the action itself.
+        with self.db.conn:
+            self.db.set_setting('welcomed:10', 1)
+        reply = self.route('declare_debt', {'player': 1, 'amount': 100000}, user=10, chat=10)
+        self.assertNotIn(self.REFUSAL, reply)
+        self.assertIn('بده', reply)
+
+    def test_the_same_player_action_in_a_group_is_refused(self):
+        # Outside a private chat the private-only branches do not match, so the
+        # request is refused, but not always by the same layer: `declare_debt`
+        # and `identify` fall through to the final "unknown request" branch,
+        # while `request_link`/`settle_partner` also fall through — they are
+        # ordinary Action values, they simply require `private`.  What matters
+        # is the shared outcome: refused, nothing created.  Asserting the exact
+        # sentence would pin wording rather than the contract.
+        for action in ('declare_debt', 'identify', 'request_link', 'settle_partner'):
+            with self.subTest(action=action):
+                before = self.snapshot()
+                reply = self.route_group(action, {'player': 1, 'name': 'علی رضایی',
+                                                  'partner': 2, 'amount': 1000})
+                self.assertTrue(reply.strip(), 'a refusal must say something')
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(self.db.one("SELECT COUNT(*) n FROM pending")['n'], 0)
+
+
 class FirstContactTests(BaseCase):
     """SPEC-021: the first private message is a deterministic welcome."""
 
@@ -4523,18 +4773,18 @@ class SupportHandleTests(BaseCase):
             return Config.from_env()
 
     def test_handle_is_normalized(self):
-        self.assertEqual(self.from_env(SUPPORT_HANDLE='@amirhz99').support_handle,
-                         '@amirhz99')
-        self.assertEqual(self.from_env(SUPPORT_HANDLE='amirhz99').support_handle,
-                         '@amirhz99')
-        self.assertEqual(self.from_env(SUPPORT_HANDLE='  @amirhz99  ').support_handle,
-                         '@amirhz99')
+        self.assertEqual(self.from_env(SUPPORT_HANDLE='@club_support').support_handle,
+                         '@club_support')
+        self.assertEqual(self.from_env(SUPPORT_HANDLE='club_support').support_handle,
+                         '@club_support')
+        self.assertEqual(self.from_env(SUPPORT_HANDLE='  @club_support  ').support_handle,
+                         '@club_support')
 
     def test_invalid_handle_fails_closed(self):
         # A malformed value would be injected into the prompt, so it must stop
         # the process at startup instead of reaching the model.
-        for bad in ('@', 'amir hz', '@amir-hz', 'https://t.me/amirhz99',
-                    't.me/amirhz99', 'ab', 'a' * 65, 'امیر'):
+        for bad in ('@', 'club support', '@club-support', 'https://t.me/club_support',
+                    't.me/club_support', 'ab', 'a' * 65, 'امیر'):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     parse_support_handle(bad)
@@ -4548,31 +4798,31 @@ class SupportHandleTests(BaseCase):
         self.assertEqual(parse_support_handle('   '), '')
 
     def test_support_command_shows_the_handle(self):
-        self.bot = Bot(self.db, replace(self.config, support_handle='@amirhz99'), self.ai)
+        self.bot = Bot(self.db, replace(self.config, support_handle='@club_support'), self.ai)
         self.assertEqual(self.bot.command('/support', admin=False)['action'], 'support')
 
         self.send('/support', user=10)
 
-        self.assertIn('@amirhz99', self.replies(chat=10))
+        self.assertIn('@club_support', self.replies(chat=10))
 
     def test_support_command_without_a_handle(self):
         self.send('/support', user=10)
         reply = self.replies(chat=10)
-        self.assertNotIn('@amirhz', reply)
+        self.assertNotIn('@club', reply)
         self.assertIn('پشتیبان', reply)
         self.assertIn('ادمین', reply)
 
     def test_api_failure_reply_stays_unchanged(self):
         # The decision is explicit: an AI outage answers with the existing text
         # and never advertises the support handle.
-        self.bot = Bot(self.db, replace(self.config, support_handle='@amirhz99'), self.ai)
+        self.bot = Bot(self.db, replace(self.config, support_handle='@club_support'), self.ai)
         self.ai.answer = APIError('boom')
 
         self.send('بدهی من چقدر است؟', user=10)
 
         reply = self.replies(chat=10)
         self.assertIn('سرویس هوش مصنوعی فعلاً پاسخ معتبر نداد', reply)
-        self.assertNotIn('@amirhz99', reply)
+        self.assertNotIn('@club_support', reply)
 
 
 class VoidSessionTests(BaseCase):

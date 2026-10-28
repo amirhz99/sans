@@ -177,6 +177,14 @@ class Bot:
         SPEC-020: an allowlisted user id also keeps admin powers in a private
         chat, so the owner of the bot is not treated as a stranger in his own
         private conversation.
+
+        SPEC-038: ``admin_access`` decides *who counts as an admin*, and the
+        default ``group_members`` means "everyone in the admin group".  That is
+        the documented contract (``ADMIN_USER_IDS`` is optional), so it is kept
+        as-is.  An installation that wants a stricter rule sets
+        ``admin_access=allowlist``; the gate then trusts the id, not the chat,
+        everywhere.  The point of the sweep that found this was to state the
+        contract precisely rather than to change it silently.
         """
         if (isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0
                 or isinstance(chat_id, bool) or not isinstance(chat_id, int)):
@@ -1028,6 +1036,12 @@ class Bot:
                     hours = self.expiry_hours(args.get('older_than_hours'))
                     reply = self.expiry_report(hours, self.expire_proposals(hours, user_id))
                 elif action == 'pending':
+                    # SPEC-038: the card list names players, amounts and phone
+                    # numbers, so it must sit behind the same gate as the cards
+                    # themselves.  `/pending` was admin-only; the routed action
+                    # was not, which let any player list what is waiting.
+                    if not admin:
+                        raise UserError('فقط برای ادمین است.')
                     closed = self.expire_stale_proposals()
                     rows = self.db.all("SELECT * FROM pending WHERE status='pending' ORDER BY created_at DESC LIMIT 30")
                     reply = '\n\n'.join(self.pending_summary(r) for r in rows) or 'درخواست منتظری نیست.'
