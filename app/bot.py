@@ -1293,8 +1293,17 @@ class Bot:
             return ('شماره‌ات ثبت شد ✅ حالا نام و نام خانوادگی کاملت را بنویس '
                     'تا برای بررسی برای ادمین بفرستم.', self.hide_keyboard())
         payload = json.loads(pending['payload'])
+        already = payload.get('phone_number')
         payload['phone_number'] = phone
         self.db.execute('UPDATE pending SET payload=? WHERE id=?', (dumps(payload), pending['id']))
+        if already == phone and pending['kind'] == 'claim':
+            # SPEC-033: the person pressed the button again.  The card is
+            # already on file with this number, so re-sending it would show the
+            # admins the same request twice.  This mirrors the linked-player
+            # path, where an unchanged number is silent too.  An `identity`
+            # card keeps its button, so it is re-sent to stay clickable.
+            return (f'شمارهٔ {phone} از قبل روی درخواست شناسایی شما ثبت است ✅\n'
+                    'منتظر تأیید ادمین بمانید.'), self.hide_keyboard()
         player = self.db.one('SELECT id,name FROM players WHERE id=?', (payload.get('player'),)) if payload.get('player') else None
         markup = buttons('yes:' + pending['id'], 'no:' + pending['id']) if pending['kind'] == 'identity' else None
         self.db.say(self.config.admin_group, self.identity_note(pending['id'], payload, player) +

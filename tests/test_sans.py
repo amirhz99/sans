@@ -3405,6 +3405,38 @@ class OneIdentityCardTests(BaseCase):
         self.assertEqual(len(self.cards()), 1)
         self.assertIn('شماره تماس: +989121234567', self.card())
 
+    def test_pressing_the_button_twice_does_not_send_a_second_card(self):
+        # SPEC-033: one person, one card.  The pending request already carries
+        # this number, so a repeat must not show the admins the same claim again.
+        self.seed(linked=False)
+        self.ai.answer = {'action': 'identify', 'args': {'name': 'سعید کاظمی'}}
+        self.send('سعید کاظمی هستم', user=10, chat=10)
+        contact = {'user_id': 10, 'phone_number': '+989121234567'}
+        self.send(sender={'id': 10}, contact=contact, user=10, chat=10)
+        self.send(sender={'id': 10}, contact=contact, user=10, chat=10)
+
+        self.assertEqual(len(self.cards()), 1)
+        self.assertIn('از قبل روی درخواست شناسایی شما ثبت است', self.replies(10))
+
+    def test_a_name_in_two_chats_then_the_number_makes_one_card(self):
+        # SPEC-033: a held name is per conversation, so the obvious risk is one
+        # card per chat.  Only the chat that receives the number builds it, and
+        # the existing "already waiting" guard stops the duplicate.
+        self.seed(linked=False)
+        self.ai.answer = {'action': 'identify', 'args': {'name': 'سعید کاظمی'}}
+        self.send('سعید کاظمی هستم', user=10, chat=10)
+        self.send('سعید کاظمی هستم', user=10, chat=11)
+
+        # Neither name created a request yet: no number was known.
+        self.assertFalse(self.db.all('SELECT * FROM pending'))
+
+        self.send(sender={'id': 10}, contact={'user_id': 10, 'phone_number': '+989121234567'},
+                  user=10, chat=11)
+
+        self.assertEqual(len(self.cards()), 1)
+        self.assertIn('شماره تماس: +989121234567', self.card())
+        self.assertEqual(len(self.db.all('SELECT * FROM pending')), 1)
+
     def test_cancel_forgets_a_saved_name(self):
         self.seed(linked=False)
         self.ai.answer = {'action': 'identify', 'args': {'name': 'علی رضایی'}}

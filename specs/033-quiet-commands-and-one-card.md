@@ -76,6 +76,8 @@ known.
 - [x] AC-007: the number first and the name second also builds exactly one card.
 - [x] AC-008: `/cancel` forgets a saved name, so a later number does not resurrect
       a cancelled introduction.
+- [x] AC-009: pressing the share button twice does not show the admins the same
+      claim twice.
 
 ## Test Mapping
 
@@ -87,8 +89,10 @@ known.
 - AC-006 -> `tests/test_sans.py::OneIdentityCardTests::test_the_number_completes_the_card_once`
 - AC-007 -> `tests/test_sans.py::OneIdentityCardTests::test_the_number_first_then_the_name_makes_one_card`
 - AC-008 -> `tests/test_sans.py::OneIdentityCardTests::test_cancel_forgets_a_saved_name`
+- AC-009 -> `tests/test_sans.py::OneIdentityCardTests::test_pressing_the_button_twice_does_not_send_a_second_card`
 - AC-006 -> `tests/test_sans.py::AgentHeldNameTests::test_the_held_name_builds_the_card_when_the_contact_arrives`
 - AC-005 -> `tests/test_sans.py::AgentHeldNameTests::test_the_tool_holds_the_name_in_the_conversation_state`
+- AC-006 -> `tests/test_sans.py::OneIdentityCardTests::test_a_name_in_two_chats_then_the_number_makes_one_card`
 
 ## Safety Constraints
 
@@ -129,3 +133,15 @@ git diff --check
   `AgentHeldNameTests` exists.
 - `/identify` deliberately keeps its processing notice even though it no longer
   calls the model: it may still match, rename, and now waits for a number.
+- A re-sent contact used to show the admins the same card again.  The behaviour
+  predates this specification; it became reachable more often once the card is
+  built from held state, so it is fixed here.  An `identity` card keeps its
+  button and is still re-sent, so the admin never loses a clickable approval.
+- A held name is per conversation, so a person who types their name in two
+  chats and then shares one number still produces exactly one card: only the
+  chat that receives the number builds it, and the existing "already waiting"
+  guard blocks the second.  Nothing is stored until a number arrives, so the
+  two chats cannot both create a request.
+- `/identify` sent inside a group is not recognised as an identity request; it
+  is answered as an unknown command.  That is pre-existing, unrelated to this
+  specification, and left untouched.
