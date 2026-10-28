@@ -1702,13 +1702,13 @@ class PlayerIdentityTests(BaseCase):
         self.assertIn('/duplicates', self.replies(-100))
 
     def test_same_family_name_is_not_a_duplicate(self):
-        self.apply('new_player', name='مهیار قهرمان زاده')
-        self.apply('new_player', name='مهراد قهرمان زاده')
+        self.apply('new_player', name='مهیار نمونه آزمایشی')
+        self.apply('new_player', name='مهراد نمونه آزمایشی')
         self.assertEqual(self.service.duplicate_players(), [])
         # The guard must not block a genuinely different given name either.
         with self.db.conn:
-            created = self.service.ensure_player('مهدی قهرمان زاده')
-        self.assertEqual(created['name'], 'مهدی قهرمان زاده')
+            created = self.service.ensure_player('مهدی نمونه آزمایشی')
+        self.assertEqual(created['name'], 'مهدی نمونه آزمایشی')
 
     def test_duplicate_pairs_keep_the_record_with_history(self):
         self.apply('new_player', name='سید امین هاشمی')

@@ -505,7 +505,7 @@ class Service:
                 reason = 'بخشی از نام کامل'
             elif ratio >= 0.85:
                 # Two full names that only share a family name are different
-                # people («مهیار قهرمان زاده» vs «مهراد قهرمان زاده»); require
+                # people («مهیار نمونه» vs «مهراد نمونه»); require
                 # the given name to match as well before suggesting a merge.
                 if len(clean.split()) > 1 and len(other.split()) > 1:
                     given = difflib.SequenceMatcher(None, clean.split()[0], other.split()[0]).ratio()

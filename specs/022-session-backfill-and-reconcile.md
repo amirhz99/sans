@@ -112,7 +112,7 @@ visible as its own ledger row.
 
   ```csv
   نام,۸ خرداد,۱۵ خرداد,۲۲ خرداد
-  مهیار قهرمان زاده,0,1,
+  مهیار نمونه,0,1,
   ```
 
   An empty cell means absent, `0` means present without a guest, and `n` means
@@ -274,7 +274,7 @@ git diff --check
   nothing; the real run repaired sessions 1–3 in place («۹ خرداد» → «۸ خرداد»,
   `session_at`/`venue_cost` filled, 14 ledger notes re-labelled with their
   amounts unchanged), created the seven later Fridays, added 109 attendance
-  rows, corrected one guest count (حسین فری پور's two guests, one −300,000 T
+  rows, corrected one guest count (a player's two guests, one −300,000 T
   adjustment), removed **zero** rows, renamed #13 and #27 through the aliases
   keeping their history, and created 26 players. `--import-payments` with
   `--workbook-overrides` adjusted 8 lines and left 44 unchanged, and
@@ -316,7 +316,7 @@ git diff --check
 - «علی صدری» has three attendances and one 300,000 T settlement in the live
   database and no sheet row. The approved override gives him 7 attended and 2
   paid, so his line closes instead of keeping the gate red.
-- حسین فری پور's two guests in the first Friday are not in the sheet's count of
+- A player's two guests in the first Friday are not in the sheet's count of
   three attended and one paid, so the roster marks him once per session with no
   guest: his charge falls by 300,000 T and the payment correction raises his
   paid total's shortfall to the sheet's one slot. His balance is unchanged —
