@@ -228,7 +228,7 @@ git diff --check
   operator's record and is imported as given.
 - Decision: the operator approved four corrections and one addition, and they
   live in `data/workbook-overrides.csv` rather than in the workbook:
-  «سید امین طاهری» 10/0, «سید مجتبی طاهری» 9/0 (the roster's «پسر سید»),
+  «حسن کریمی» 10/0, «حسین کریمی» 9/0 (the roster's «پسر سید»),
   «علیرضا نژاد مقدم» 7/0, «مهدی روستایی» 6/3, and «علی صدری» 7/2 — the person
   the sheet never listed, whose existing three attendances and 300,000 T
   settlement are now part of the period. The gate total therefore moves from
@@ -263,7 +263,7 @@ git diff --check
   15/22/13/18/12/15/14.
 - End-to-end rehearsal on a copy of the live database
   (`cp data/sans.sqlite3 /tmp/verify-022.sqlite3`) with
-  `--alias "عباس رسولی=رسولی" --alias "محمد مهدی سبحانی=سبحانی"` and
+  `--alias "رضا محمدی=رسولی" --alias "مرتضی نوری=سبحانی"` and
   `--allow-new "رفیق علی بختیاری" --allow-new "امین"`: `--dry-run` wrote
   nothing; the real run repaired sessions 1–3 in place («۹ خرداد» → «۸ خرداد»,
   `session_at`/`venue_cost` filled, 14 ledger notes re-labelled with their
@@ -301,11 +301,11 @@ git diff --check
   and every row total equals the corrected workbook.
 - Two names stay the operator's decision, not the tool's, and both are answered
   with `--allow-new`: «رفیق علی بختیاری» ≈ «علی بختیاری» and «امین» ≈
-  «سید امین طاهری». They are different people; «رهام» ≈ «پرهام» no longer
-  blocks because «رهام» is already stored.
-- «رسولی» and «سبحانی» in the live database are the sheet's «عباس رسولی» and
-  «محمد مهدی سبحانی»; they are renamed through `--alias "عباس رسولی=رسولی"`
-  and `--alias "محمد مهدی سبحانی=سبحانی"`, which keeps their ids and ledger
+  «حسن کریمی». They are different people; «پویا» ≈ «پپویا» no longer
+  blocks because «پویا» is already stored.
+- «رسولی» and «سبحانی» in the live database are the sheet's «رضا محمدی» and
+  «مرتضی نوری»; they are renamed through `--alias "رضا محمدی=رسولی"`
+  and `--alias "مرتضی نوری=سبحانی"`, which keeps their ids and ledger
   rows.
 - «علی صدری» has three attendances and one 300,000 T settlement in the live
   database and no sheet row. The approved override gives him 7 attended and 2

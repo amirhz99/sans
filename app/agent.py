@@ -368,7 +368,7 @@ class SansAgent:
               کاربر دوباره نپرس و در data_json نگذار.
             - 'attendance_self': data_json='{"present": true, "guests": 0, "guest_names": ["علی"], "session": ""}'
               guest_names is optional: only the names the caller actually stated.
-            - 'upsert_players': (admin) data_json='{"players": [{"name": "علی رضایی", "note": ""}]}'; a name similar to an existing player is refused unless force=true.
+            - 'upsert_players': (admin) data_json='{"players": [{"name": "سعید کاظمی", "note": ""}]}'; a name similar to an existing player is refused unless force=true.
             - 'save_session': (admin) create/update new or historical session; date is accepted as an alias for when_text. Jalali («۹ خرداد ساعت ۲۱», «1405/03/09 21:00») and Gregorian (YYYY-MM-DD) dates are both accepted; a Jalali date without a year uses the current Jalali year.
             - 'set_attendance': (admin) set present/absent players for a session; unknown names are refused, no player is ever created here. Each attendee may carry guest_names: [{"name":"علی","guests":2,"guest_names":["رضا"]}].
             - 'rename_player': (admin) data_json='{"player": "#15", "name": "نام کامل"}' — keeps the id and the whole history.

@@ -9,7 +9,7 @@ Updated: 2026-10-20 (revision 2: follow-up reference safety)
 
 Importing an old session created duplicate and partial player rows. The agent
 turned every unrecognized name in `set_attendance` into a new player, so a
-short name («موحد») and the later full name («محمد مهدی موحد») became two
+short name («موحد») and the later full name («رضا محمدی») became two
 players, and the first one stayed behind as an absent row. There was no way to
 rename, merge, or remove a player: `players` had no delete or rename path, the
 `Action` contract had no such values, and `manage_records` silently ignored

@@ -145,7 +145,7 @@ UNKNOWN_COMMAND = ('این دستور را نمی‌شناسم.\n'
 # internal term such as «اتصال حساب» or a provider error.
 WELCOME_NEW = ('سلام 👋 خوش آمدی.\n'
                'دو چیز برای شروع لازم است:\n'
-               '• نام و نام خانوادگی کاملت را بنویس (مثل «علی رضایی»)\n'
+               '• نام و نام خانوادگی کاملت را بنویس (مثل «سعید کاظمی»)\n'
                '• شمارهٔ موبایلت را با دکمهٔ زیر بفرست\n'
                'هر کدام را اول فرستادی، بعدی را خودم می‌پرسم.')
 WELCOME_NAME_ONLY = ('سلام 👋 خوش آمدی. شماره‌ات را دارم ✅\n'
@@ -1156,7 +1156,7 @@ class Bot:
                 return {'action': 'player_merge', 'args': {'source': pieces[0], 'target': pieces[1]}}
             if name == 'rename':
                 if len(pieces) != 2:
-                    raise UserError('/rename شناسه_یا_نام_فعلی نام کامل جدید — مثلاً /rename 15 محمد مهدی موحد')
+                    raise UserError('/rename شناسه_یا_نام_فعلی نام کامل جدید — مثلاً /rename 15 رضا محمدی')
                 return {'action': 'player_rename', 'args': {'player': pieces[0], 'name': pieces[1]}}
             if name == 'delplayer':
                 if len(pieces) != 1:
