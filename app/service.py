@@ -1021,7 +1021,12 @@ class Service:
     def session(self, ref=None, draft=False):
         if isinstance(ref, bool) or (ref is not None and not isinstance(ref, (str, int))):
             raise UserError('عنوان یا شناسهٔ سانس معتبر نیست.')
-        if ref in (None, '', 'current', 'جاری'):
+        # SPEC-036: only «no argument» means «what is the current session?».
+        # Every other caller was handed a reference it wants to *use*, so a
+        # miss must say the session was not found instead of advising the
+        # admin to announce a new one.
+        current = ref in (None, '', 'current', 'جاری')
+        if current:
             rows = self.db.all('SELECT * FROM sessions WHERE finalized=0 ORDER BY id DESC')
             if not rows and not draft:
                 rows = self.db.all('SELECT * FROM sessions ORDER BY id DESC LIMIT 1')
@@ -1031,7 +1036,10 @@ class Service:
         else:
             rows = self.db.all('SELECT * FROM sessions WHERE title=?', (ref,))
         if not rows:
-            raise UserError('سانسی پیدا نشد؛ عنوان و زمان سانس جدید را اعلام کنید.')
+            if current:
+                raise UserError('سانسی پیدا نشد؛ عنوان و زمان سانس جدید را اعلام کنید.')
+            raise UserError('سانسی با این مشخصات پیدا نشد؛ `/sessions` را ببینید '
+                            'یا شمارهٔ سانس را درست بفرستید.')
         if len(rows) > 1:
             raise UserError('کدام سانس؟\n' + '\n'.join(f"#{r['id']} {r['title']}" for r in rows))
         if draft and rows[0]['finalized']:

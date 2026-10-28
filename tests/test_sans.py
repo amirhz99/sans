@@ -97,6 +97,12 @@ class BaseCase(unittest.TestCase):
         payloads = [json.loads(r['payload']) for r in self.db.all("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id")]
         return '\n'.join(p['text'] for p in payloads if chat is None or p['chat_id'] == chat)
 
+    def last_reply(self, chat=None):
+        """Return only the newest message: ``replies`` accumulates the outbox."""
+        payloads = [json.loads(r['payload']) for r in self.db.all("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id")]
+        texts = [p['text'] for p in payloads if chat is None or p['chat_id'] == chat]
+        return texts[-1] if texts else ''
+
     def proposal(self):
         return self.db.one("SELECT id FROM pending WHERE kind='commands' ORDER BY rowid DESC LIMIT 1")['id']
 
@@ -4651,3 +4657,99 @@ class VoidSessionTests(BaseCase):
             self.assertEqual(db.one('SELECT * FROM sessions WHERE id=1')['voided'], 0)
         finally:
             db.close()
+class MissingSessionAdviceCase(BaseCase):
+    """SPEC-036: a missing reference is not an invitation to create a session."""
+
+    def test_explicit_miss_does_not_advise_creating(self):
+        self.seed()
+        for ref in (999, '999', '#999', 'سانس ناموجود'):
+            with self.subTest(ref=ref):
+                with self.assertRaises(UserError) as caught:
+                    self.service.session(ref)
+                message = str(caught.exception)
+                # The create-session sentence is the wrong advice here.
+                self.assertNotIn('اعلام کنید', message)
+                self.assertIn('/sessions', message)
+
+    def test_current_miss_keeps_create_advice(self):
+        # Compatibility path: with nothing open, «announce a new session» is
+        # exactly the right answer and must not change.
+        for ref in (None, '', 'current', 'جاری'):
+            with self.subTest(ref=ref):
+                with self.assertRaises(UserError) as caught:
+                    self.service.session(ref)
+                self.assertIn('سانس جدید را اعلام کنید', str(caught.exception))
+
+    def test_session_command_does_not_ask_for_a_new_session(self):
+        self.seed()
+        asked_before = self.db.setting('asked:session', '0')
+        self.send('/session 999', user=1, chat=-100)
+        text = self.replies()
+        self.assertIn('/sessions', text)
+        self.assertNotIn('سانس جدید را اعلام کنید', text)
+        # No new-session question may reach the admin group either.
+        self.assertNotIn('زمان، عنوان سانس بعدی', text)
+        self.assertEqual(self.db.setting('asked:session', '0'), asked_before)
+
+    def test_void_with_unknown_reference_fails_closed(self):
+        self.seed()
+        before = self.db.one('SELECT COUNT(*) AS n FROM sessions')['n']
+        pending_before = self.db.one('SELECT COUNT(*) AS n FROM pending')['n']
+        self.send('/void 999', user=1, chat=-100)
+        text = self.replies()
+        self.assertIn('/sessions', text)
+        self.assertNotIn('سانس جدید را اعلام کنید', text)
+        self.assertEqual(self.db.one('SELECT COUNT(*) AS n FROM sessions')['n'], before)
+        self.assertEqual(self.db.one('SELECT COUNT(*) AS n FROM pending')['n'], pending_before)
+
+    def test_finalize_and_attendance_reference_miss(self):
+        self.seed()
+        for command in ('finalize 999', 'attendance 999 1'):
+            with self.subTest(command=command):
+                with self.assertRaises(UserError) as caught:
+                    self.service.prepare(command.split()[0], {'session': '999',
+                                                              'player': '1'})
+                message = str(caught.exception)
+                self.assertNotIn('سانس جدید را اعلام کنید', message)
+                self.assertIn('/sessions', message)
+
+
+class UntestedReadCommandsCase(BaseCase):
+    """SPEC-036: `/links`, `/session` and `/unlink2` had no test at all."""
+
+    def test_links_empty_then_listed(self):
+        self.seed()
+        self.send('/links', user=1, chat=-100)
+        self.assertIn('هیچ پیوندی ثبت نشده.', self.last_reply(chat=-100))
+
+        with self.db.conn:
+            self.service.link_players(1, 2, 1)
+        self.send('/links', user=1, chat=-100)
+        text = self.last_reply(chat=-100)
+        self.assertIn('علی رضایی', text)
+        self.assertIn('رضا محمدی', text)
+        self.assertIn('↔', text)
+        self.assertNotIn('هیچ پیوندی ثبت نشده.', text)
+
+    def test_session_command_current_and_by_id(self):
+        self.seed()
+        self.send('/session', user=1, chat=-100)
+        without_argument = self.replies(chat=-100)
+        self.assertIn('پنجشنبه ۲۳ مهر', without_argument)
+
+        self.send('/session 1', user=1, chat=-100)
+        text = self.replies(chat=-100)
+        self.assertIn('پنجشنبه ۲۳ مهر', text)
+        # Same session, so the card must not have been replaced by an error.
+        self.assertNotIn('/sessions', text)
+
+    def test_unlink2_usage_and_not_linked(self):
+        self.seed()
+        self.send('/unlink2 1', user=1, chat=-100)
+        self.assertIn('/unlink2 شناسه_یا_نام۱ شناسه_یا_نام۲', self.replies(chat=-100))
+
+        # Nothing is linked yet, so the pair check must say so and not link.
+        self.assertFalse(self.service.are_linked(1, 2))
+        self.send('/unlink2 2 1', user=1, chat=-100)
+        self.assertIn('به هم وصل نیستند', self.replies(chat=-100))
+        self.assertFalse(self.service.are_linked(1, 2))

@@ -949,7 +949,11 @@ class Bot:
                         state['last_entity'] = EntityRef('session', session['id'], session['title']).to_dict()
                         state['response_level'] = level.value
                     except UserError:
-                        self.ask_admin('session', 'زمان، عنوان سانس بعدی و سهم ثابت هر نفر چقدر است؟ لطفاً با خطاب «مسئول» پاسخ دهید.')
+                        # SPEC-036: only a miss on «the current session» means
+                        # the admin should announce a new one.  A mistyped
+                        # reference must not post that question to the group.
+                        if ref in (None, '', 'current', 'جاری'):
+                            self.ask_admin('session', 'زمان، عنوان سانس بعدی و سهم ثابت هر نفر چقدر است؟ لطفاً با خطاب «مسئول» پاسخ دهید.')
                         raise
                 elif action == 'identify' and private:
                     # SPEC-033: identify() may answer with a request for the
