@@ -50,6 +50,15 @@ def _valid_id(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _valid_int(value):
+    """SPEC-040: any real integer, including the negative id of a group.
+
+    ``_valid_id`` is deliberately positive-only because it guards user ids; a
+    Bale group id is normally negative, so chat discovery needs its own check.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 class TurnProgress:
     """SPEC-028: a de-duplicated, rate-limited editor for one progress message.
 
@@ -223,6 +232,33 @@ class Bot:
             message = update.get('message')
         return isinstance(message, dict) and self.allowed_chat(message.get('chat'))
 
+    def record_refused_chat(self, update):
+        """SPEC-040: log the id of a chat the outer gate just refused.
+
+        This is observation, not permission.  ``allowed_chat`` has already said
+        no, and nothing here can make it say yes: the only effect is one
+        ``REFUSED_CHAT`` row in the diagnostic log, written solely when the
+        operator set ``discover_chat`` to the exact value ``1``.  Message text
+        is deliberately not stored; only the numeric id, the chat type and the
+        title reach the log.
+        """
+        if self.db.setting('discover_chat', '') != '1':
+            return
+        callback = update.get('callback_query')
+        message = callback.get('message') if isinstance(callback, dict) else update.get('message')
+        if not isinstance(message, dict):
+            return
+        chat = message.get('chat')
+        if not isinstance(chat, dict):
+            return
+        chat_id = chat.get('id')
+        if not _valid_int(chat_id):
+            return
+        kind = str(chat.get('type') or '?')
+        title = str(chat.get('title') or '')[:60]
+        self.db.log_agent_event(chat_id, 0, '', 'REFUSED_CHAT',
+                                summary=f'{chat_id} {kind} {title}'.strip())
+
     def addressed(self, msg, body):
         """Return whether a group message is directed at this bot.
 
@@ -389,6 +425,12 @@ class Bot:
             if self.db.one('SELECT 1 FROM processed_updates WHERE update_id=?', (uid,)):
                 return
             if not self.allowed_update(update):
+                # SPEC-040: an operator cannot ask an unconfigured group for its
+                # own id, because the refusal happens before any handler runs.
+                # With ``discover_chat`` enabled the bot records that id in the
+                # diagnostic log only; the refusal itself is unchanged, so the
+                # gate stays fail-closed.
+                self.record_refused_chat(update)
                 # Advance the polling offset without invoking any bot path for
                 # an unauthorized group.  This is infrastructure bookkeeping,
                 # not message, conversation, or domain persistence.

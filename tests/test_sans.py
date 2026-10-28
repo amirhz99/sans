@@ -3376,6 +3376,133 @@ class AdminActionSweepTests(BaseCase):
                 self.assertEqual(self.db.one("SELECT COUNT(*) n FROM pending")['n'], 0)
 
 
+class DiscoverChatTests(BaseCase):
+    """SPEC-040: reveal the id of a chat the outer gate refuses.
+
+    The bot cannot answer ``/id`` inside a new group, because ``allowed_chat``
+    refuses that group before any handler runs.  These tests pin both halves of
+    the new contract: discovery *reports* the id, and it grants absolutely
+    nothing.
+    """
+
+    UNKNOWN = -1009999999999
+
+    def refused(self, text='مسئول /id'):
+        return self.send(text, user=555, chat=self.UNKNOWN, chat_type='supergroup')
+
+    def log_rows(self, event='REFUSED_CHAT'):
+        rows = self.db.all('SELECT chat_id, event, summary FROM agent_logs WHERE event=?', (event,))
+        return [dict(r) for r in rows]
+
+    def enable(self, value='1'):
+        with self.db.conn:
+            self.db.set_setting('discover_chat', value)
+
+    def test_refused_chat_is_silent_by_default(self):
+        # AC-001: without the key the refusal branch behaves exactly as before.
+        before = self.db.one('SELECT COUNT(*) n FROM agent_logs')['n']
+        outbox_before = self.db.one('SELECT COUNT(*) n FROM outbox')['n']
+        self.refused()
+        self.assertEqual(self.log_rows(), [])
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM agent_logs')['n'], before)
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM outbox')['n'], outbox_before)
+
+    def test_discover_chat_records_refused_group(self):
+        # AC-002: the id and the title reach the diagnostic log.
+        self.enable()
+        self.refused()
+        rows = self.log_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['chat_id'], self.UNKNOWN)
+        self.assertTrue(rows[0]['summary'].startswith(str(self.UNKNOWN)))
+        self.assertIn('supergroup', rows[0]['summary'])
+
+    def test_discover_chat_records_the_title_when_the_update_carries_one(self):
+        # AC-002: the operator recognises the group by its title.
+        self.enable()
+        # The title lives on the chat object, which is where Bale puts it.
+        self.bot.process({'update_id': 8801, 'message': {
+            'message_id': 8801, 'from': {'id': 555}, 'text': 'مسئول /id',
+            'chat': {'id': self.UNKNOWN, 'type': 'supergroup', 'title': 'گروه نمونه'}}})
+        rows = self.log_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertIn('گروه نمونه', rows[0]['summary'])
+
+    def test_discover_chat_grants_no_access(self):
+        # AC-003: this is the security half of the specification.  Discovery
+        # must not become a back door: no reply, no message row, no pending
+        # card, no admin rights, no financial change.
+        self.seed()
+        self.enable()
+        balance = self.service.balance(1)
+        revision = self.db.revision
+        audit_before = self.db.one('SELECT COUNT(*) n FROM audit_logs')['n']
+        self.refused('مسئول بدهی علی را اصلاح کن ۵۰۰')
+        self.assertEqual(self.replies(self.UNKNOWN), '')
+        self.assertEqual(self.db.all('SELECT * FROM chat_messages WHERE chat_id=?', (self.UNKNOWN,)), [])
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM pending')['n'], 0)
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM audit_logs')['n'], audit_before)
+        self.assertEqual(self.db.revision, revision)
+        self.assertEqual(self.service.balance(1), balance)
+        self.assertEqual(len(self.ai.calls), 0)
+        self.assertFalse(self.bot.is_admin(self.UNKNOWN, 555))
+        self.assertFalse(self.bot.allowed_chat({'id': self.UNKNOWN, 'type': 'supergroup'}))
+
+    def test_only_exact_value_one_enables_discovery(self):
+        # AC-004: an operator who types `true` or `on` gets silence, not a
+        # half-enabled feature.
+        for value in ('true', 'on', 'yes', '0', '', ' 1 ', '01'):
+            with self.subTest(value=value):
+                with self.db.conn:
+                    self.db.execute("DELETE FROM agent_logs WHERE event='REFUSED_CHAT'")
+                self.enable(value)
+                self.refused()
+                self.assertEqual(self.log_rows(), [])
+        with self.db.conn:
+            self.db.set_setting('discover_chat', '1')
+        self.refused()
+        self.assertEqual(len(self.log_rows()), 1)
+
+    def test_malformed_payload_is_ignored(self):
+        # AC-005: discovery never becomes a crash path.
+        self.enable()
+        broken = (
+            {'update_id': 9001},
+            {'update_id': 9002, 'message': 'not-a-dict'},
+            {'update_id': 9003, 'message': {'chat': None}},
+            {'update_id': 9004, 'message': {'chat': {'id': 'x', 'type': 'group'}}},
+            {'update_id': 9005, 'message': {'chat': {'id': True, 'type': 'group'}}},
+            {'update_id': 9006, 'message': {}},
+            {'update_id': 9007, 'callback_query': {'message': {'chat': {'id': 1.5}}}},
+        )
+        for update in broken:
+            with self.subTest(update=update):
+                self.bot.process(update)
+        self.assertEqual(self.log_rows(), [])
+
+    def test_admin_group_is_unaffected(self):
+        # AC-006: the authorised group never produces a REFUSED_CHAT row.
+        self.enable()
+        self.ai.answer = {'action': 'help', 'args': {}}
+        self.send('مسئول راهنما', user=99, chat=-100)
+        self.assertEqual(self.log_rows(), [])
+        self.assertIn('راهنمای مدیریت', self.replies(-100))
+
+    def test_discovery_survives_a_callback_from_an_unknown_chat(self):
+        # AC-002/AC-003: a button press from an unknown group is refused too,
+        # and reporting it must not create a pending decision.
+        self.enable()
+        self.update_id += 1
+        self.bot.process({'update_id': self.update_id, 'callback_query': {
+            'id': 'cb-unknown', 'data': 'yes:abc', 'from': {'id': 555},
+            'message': {'chat': {'id': self.UNKNOWN, 'type': 'supergroup'}}}})
+        rows = self.log_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['chat_id'], self.UNKNOWN)
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM pending')['n'], 0)
+        self.assertEqual(self.replies(self.UNKNOWN), '')
+
+
 class FirstContactTests(BaseCase):
     """SPEC-021: the first private message is a deterministic welcome."""
 
