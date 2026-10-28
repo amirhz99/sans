@@ -134,6 +134,12 @@ MAX_EXPIRY_HOURS = 8760
 # SPEC-014: a private reply to a proactive notice is handed back to the admins.
 RELAY_CONFIRMATION = 'پیام شما برای ادمین‌ها ارسال شد ✅'
 
+# SPEC-034: a command that does not exist is answered with one line, never with
+# the whole guide.  The guide looked like a success, so a typo went unnoticed.
+UNKNOWN_COMMAND = ('این دستور را نمی‌شناسم.\n'
+                   'برای دیدن کارهای ممکن /help را بفرست، یا همان درخواست را '
+                   'به فارسی معمولی بنویس.')
+
 # SPEC-021: the first private message is answered by the bot itself, never by the
 # model, so a stranger always sees the same short instruction and never an
 # internal term such as «اتصال حساب» or a provider error.
@@ -1065,6 +1071,10 @@ class Bot:
             return None
         parts = body.split(maxsplit=1)
         name = parts[0].split('@')[0][1:]
+        # SPEC-034: command names are matched without regard to case, so a
+        # phone that capitalises the first letter cannot turn /Help into an
+        # "unknown command" refusal.
+        name = name.lower()
         rest = parts[1].strip() if len(parts) > 1 else ''
         simple = {'start': 'help', 'help': 'help', 'card': 'card', 'cancel': 'cancel', 'config': 'config', 'report': 'report',
                   'players': 'list_players', 'sessions': 'list_sessions', 'pending': 'pending', 'phone': 'phone',
@@ -1072,6 +1082,15 @@ class Bot:
         if name in simple:
             return {'action': simple[name], 'args': {}}
         if name in ('debt', 'session', 'identify', 'amount', 'confirm', 'deny', 'approve', 'reject'):
+            usage = {'debt': '/debt [بازیکن]', 'session': '/session [شماره]',
+                     'identify': '/identify نام و نام خانوادگی',
+                     'amount': '/amount مبلغ به تومان',
+                     'confirm': '/confirm کد پیشنهاد', 'deny': '/deny کد پیشنهاد',
+                     'approve': '/approve شمارهٔ رسید', 'reject': '/reject شمارهٔ رسید'}
+            if name in ('identify', 'amount', 'confirm', 'deny', 'approve', 'reject') and not rest:
+                # SPEC-034: say what is missing instead of sending an empty
+                # argument and letting the handler produce a vaguer error.
+                raise UserError(f'این دستور یک مقدار لازم دارد: {usage[name]}')
             key = {'debt': 'player', 'session': 'session', 'identify': 'name', 'amount': 'amount'}.get(name, 'id')
             return {'action': {'session': 'session_info', 'amount': 'payment_amount'}.get(name, name),
                     'args': {key: rest} if rest else {}}
@@ -1152,7 +1171,10 @@ class Bot:
                 raise UserError('نام یا شناسهٔ طرف مقابل را بنویسید؛ مثلاً /requestlink 15')
             action = 'request_link' if name == 'requestlink' else 'settle_partner'
             return {'action': action, 'args': {'partner': rest.strip()}}
-        return {'action': 'help', 'args': {}}
+        # SPEC-034: an unknown command must say so.  Answering with the whole
+        # guide looked successful, so a typo (or an admin command used by a
+        # player, which lands here) read as if the bot had done what was asked.
+        raise UserError(UNKNOWN_COMMAND)
 
     def rename_player(self, player_ref, new_name, actor):
         """Rename directly: it is reversible and keeps the id and history."""

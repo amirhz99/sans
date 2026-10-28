@@ -1419,12 +1419,13 @@ class SettingsApprovalTests(BaseCase):
     def test_setcard_requires_admin_and_explicit_value(self):
         self.ai.answer = {'action': 'settings', 'args': {'key': 'card', 'value': self.CARD}}
 
-        # A non-admin cannot reach the deterministic command path; the unknown
-        # command falls back to the ordinary help text with no side effect.
+        # A non-admin cannot reach the deterministic command path; the command
+        # is not recognised, so it is refused without any side effect.
+        # SPEC-034: that refusal is one line, not the whole guide.
         self.send('/setcard ' + self.CARD, user=10, chat=10)
         self.assertEqual(self.proposals(), [])
         self.assertEqual(self.db.setting('card'), '')
-        self.assertIn('این کارها را برایت انجام می‌دهم', self.replies(10))
+        self.assertIn('این دستور را نمی‌شناسم', self.replies(10))
 
         # The admin command still needs a value in the same message.
         self.send('/setcard', user=1, chat=-100)
@@ -3314,6 +3315,81 @@ class FirstContactTests(BaseCase):
         self.assertIn('#2 رضا محمدی', admin)
         self.assertIn('#3 رضا کریمی', admin)
         self.assertIn('/link', admin)
+
+
+class UnknownCommandTests(BaseCase):
+    """SPEC-034: a command the bot does not have says so, in one line."""
+
+    def test_an_unknown_command_is_named_as_unknown(self):
+        self.seed()
+        self.send('/bogus', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertIn('این دستور را نمی‌شناسم', reply)
+        # The whole guide must not come back, or the typo looks like success.
+        self.assertNotIn('این کارها را برایت انجام می‌دهم', reply)
+
+    def test_a_bare_slash_is_unknown_rather_than_the_guide(self):
+        self.seed()
+        for body in ('/', '//'):
+            with self.subTest(body=body):
+                with self.db.conn:
+                    self.db.execute('DELETE FROM outbox')
+                self.send(body, user=10, chat=10)
+                self.assertIn('این دستور را نمی‌شناسم', self.replies(10))
+
+    def test_an_admin_command_used_by_a_player_is_refused_not_guided(self):
+        # The command stays unavailable; the answer must not read as if the
+        # player could do it.
+        self.seed(linked=False)
+        self.send('/newplayer سعید کاظمی', user=10, chat=10)
+
+        self.assertIn('این دستور را نمی‌شناسم', self.replies(10))
+        self.assertEqual(len(self.db.all('SELECT * FROM players')), 2)
+
+    def test_an_unknown_command_creates_no_proposal_and_no_side_effect(self):
+        self.seed()
+        self.send('/bogus', user=1, chat=-100)
+
+        self.assertEqual(self.db.all('SELECT * FROM pending'), [])
+
+    def test_a_missing_argument_names_what_is_missing(self):
+        self.seed()
+        for body, expected in (('/identify', '/identify'),
+                               ('/amount', '/amount'),
+                               ('/confirm', '/confirm'),
+                               ('/deny', '/deny'),
+                               ('/approve', '/approve'),
+                               ('/reject', '/reject')):
+            with self.subTest(body=body):
+                with self.db.conn:
+                    self.db.execute('DELETE FROM outbox')
+                self.send(body, user=10, chat=10)
+                reply = self.replies(10)
+                self.assertIn('یک مقدار لازم دارد', reply)
+                self.assertIn(expected, reply)
+
+    def test_command_names_ignore_case(self):
+        self.seed()
+        self.send('/HELP', user=10, chat=10)
+
+        reply = self.replies(10)
+        self.assertIn('این کارها را برایت انجام می‌دهم', reply)
+        self.assertNotIn('این دستور را نمی‌شناسم', reply)
+
+    def test_a_known_command_still_works_with_its_mention(self):
+        # `/help@SansBot` is how a group addresses the bot; it must keep
+        # working and must not be reported as unknown.
+        self.seed()
+        self.send('/help@SansBot', user=10, chat=10)
+
+        self.assertIn('این کارها را برایت انجام می‌دهم', self.replies(10))
+
+    def test_an_unknown_command_gets_no_processing_notice(self):
+        self.seed()
+        update = {'update_id': 1, 'message': {'chat': {'id': 10, 'type': 'private'},
+                                              'from': {'id': 10}, 'text': '/bogus'}}
+        self.assertIsNone(self.bot.acknowledgement_chat(update))
 
 
 class QuietCommandTests(BaseCase):
