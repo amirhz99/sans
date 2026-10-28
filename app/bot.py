@@ -1009,7 +1009,9 @@ class Bot:
                     if admin and self.service.duplicate_players():
                         reply += '\n\n⚠️ نام‌های مشکوک به تکرار پیدا شد؛ /duplicates را ببینید.'
                 elif action == 'list_sessions':
-                    reply = '\n'.join(f"#{s['id']} {s['title']} — {self.service.session_time_display(s)} — {'نهایی' if s['finalized'] else 'باز'}" for s in self.db.all('SELECT * FROM sessions ORDER BY id DESC')) or 'سانسی ثبت نشده.'
+                    reply = '\n'.join(f"#{s['id']} {s['title']} — {self.service.session_time_display(s)} — "
+                                      + ('برگزار نشد' if s['voided'] else 'نهایی' if s['finalized'] else 'باز')
+                                      for s in self.db.all('SELECT * FROM sessions ORDER BY id DESC')) or 'سانسی ثبت نشده.'
                 elif action == 'report':
                     reply = self.service.report()
                 elif action == 'expire':
@@ -1153,6 +1155,17 @@ class Bot:
                 return obj
             except ValueError:
                 raise UserError('پس از /do یک JSON معتبر شامل action و args بفرستید.') from None
+        if name == 'void' and admin:
+            # SPEC-035: closing a session that never took place.  The argument
+            # is optional: with no argument the open session is meant, and the
+            # card names it so the admin can see which one is about to close.
+            pieces = rest.split(maxsplit=1)
+            session = pieces[0] if pieces and pieces[0].strip() else None
+            reason = pieces[1].strip() if len(pieces) > 1 else ''
+            if session is None:
+                self.service.session('current')   # raises when nothing is open
+            return {'action': 'void_session',
+                    'args': {'session': session or 'current', 'reason': reason}}
         if name in ('link2', 'unlink2', 'suggestlinks') and admin:
             # SPEC-025: still only builds an approval card, like every mutation.
             if name == 'suggestlinks':
@@ -1693,6 +1706,8 @@ class Bot:
                 self.db.say(row['chat_id'], 'درخواست شناسایی تأیید نشد. لطفاً با /identify نام کامل دقیق را دوباره بفرستید.')
         if approve and row['kind'] == 'commands':
             for command in payload:
+                # SPEC-035: a voided session has no attendance, so nobody has a
+                # new balance to be told about.
                 if command['action'] == 'finalize':
                     for player in self.db.all('''SELECT p.id,p.bale_id FROM attendance a JOIN players p ON p.id=a.player_id
                                                 WHERE a.session_id=? AND p.bale_id IS NOT NULL''', (command['args']['session'],)):

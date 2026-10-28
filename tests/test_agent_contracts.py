@@ -12,11 +12,11 @@ from app.clients import AIClient
 from app.config import Config
 from app.content import DEFAULTS, SYSTEM_PROMPT
 from app.db import Database
-from app.domain import ConversationState, EntityRef, EntityType, Intent, ResponseLevel
+from app.domain import Action, ConversationState, EntityRef, EntityType, Intent, ResponseLevel
 from app.bot import PROGRESS_STEPS, Bot
 from app.presentation import SessionView
 from app.prompt_loader import PromptLoader
-from app.service import Service
+from app.service import ADMIN_ACTIONS, Service
 
 
 class LinkContextTests(unittest.TestCase):
@@ -1647,6 +1647,26 @@ class SupportPromptTests(unittest.TestCase):
         prompt = self.render('')
         self.assertNotIn('{support_contact}', prompt)
         self.assertNotIn('@amirhz99', prompt)
+class ActionContractTests(unittest.TestCase):
+    """SPEC-035: voiding a session is an admin action, never a read-only one."""
+
+    def test_void_session_is_an_admin_action(self):
+        self.assertEqual(Action.VOID_SESSION.value, 'void_session')
+        self.assertIn('void_session', ADMIN_ACTIONS)
+        # Reading actions are never in the admin set, so this also proves the
+        # void cannot be reached through a read-only route.
+        self.assertNotIn('card', ADMIN_ACTIONS)
+        self.assertNotIn('session_info', ADMIN_ACTIONS)
+
+    def test_void_session_is_not_finalize(self):
+        # The two close a session in opposite ways; sharing one name would let a
+        # «برگزار نشد» request create a debt.
+        self.assertNotEqual(Action.VOID_SESSION, Action.FINALIZE)
+        intent = Intent.from_dict({'action': 'void_session', 'args': {'session': 19}})
+        self.assertIs(intent.action, Action.VOID_SESSION)
+
+
+if __name__ == '__main__':
         self.assertIn(SUPPORT_FALLBACK_TEXT, prompt)
         self.assertEqual(support_contact(SimpleNamespace(config=SimpleNamespace())), '')
 

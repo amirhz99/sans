@@ -25,6 +25,10 @@ class Database:
         columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(sessions)')}
         if 'session_at' not in columns:
             self.conn.execute('ALTER TABLE sessions ADD COLUMN session_at TEXT')
+        # SPEC-035: a session that never took place is closed without any
+        # charge.  The default keeps every existing row a normal session.
+        if 'voided' not in columns:
+            self.conn.execute('ALTER TABLE sessions ADD COLUMN voided INTEGER NOT NULL DEFAULT 0')
         # SPEC-011: proposals expire on their own facts, not on the global revision.
         # Rows written before this column exists get '[]', which skips only the
         # fingerprint check and keeps the 24 hour TTL behavior.

@@ -334,6 +334,9 @@ def parse_session_datetime(value, now=None):
 ADMIN_ACTIONS = {'new_player', 'new_session', 'update_session', 'attendance',
                  'finalize', 'adjustment', 'settings', 'player_note', 'settle',
                  'player_rename', 'player_merge', 'player_delete', 'broadcast',
+                 # SPEC-035: closing a session that never took place.  It moves
+                 # no money, but it closes a row, so it stays an admin card.
+                 'void_session',
                  # SPEC-025: never reachable through the model's own routing; the
                  # allow-list in ``bot.message`` keeps them out and only the
                  # agent tool or an explicit admin command proposes them.
@@ -1032,6 +1035,11 @@ class Service:
         if len(rows) > 1:
             raise UserError('کدام سانس؟\n' + '\n'.join(f"#{r['id']} {r['title']}" for r in rows))
         if draft and rows[0]['finalized']:
+            if rows[0]['voided']:
+                # SPEC-035: a voided session closed with no charge, so pointing
+                # the admin at a ledger adjustment would be wrong advice.
+                raise UserError('این سانس «برگزار نشد» ثبت شده و بسته است؛ بدهی‌ای از آن '
+                                'باقی نمانده که اصلاح شود.')
             raise UserError('حساب این سانس بسته شده؛ برای اصلاح مالی از اصلاح حساب با توضیح استفاده کنید.')
         return rows[0]
 
@@ -1265,7 +1273,8 @@ class Service:
         lines += [f"جمع بدهکارسازی: {totals['charges']:,}", f"جمع پرداخت/بستانکارسازی: {totals['credits']:,}"]
         for s in self.db.all('SELECT * FROM sessions ORDER BY id DESC LIMIT 15'):
             charged = self.db.one('SELECT COALESCE(SUM(amount),0) n FROM ledger WHERE session_id=?', (s['id'],))['n']
-            lines.append(f"سانس #{s['id']} {s['title']}؛ {self.session_time_display(s)}؛ سهم ثبت‌شده {charged:,}؛ هزینهٔ زمین {s['venue_cost']}")
+            lines.append(f"سانس #{s['id']} {s['title']}؛ {self.session_time_display(s)}؛ سهم ثبت‌شده {charged:,}؛ هزینهٔ زمین {s['venue_cost']}"
+                         + ('؛ برگزار نشد (بدون بدهی)' if s['voided'] else ''))
         for r in self.db.all("SELECT r.*,p.name FROM receipts r JOIN players p ON p.id=r.player_id WHERE status='pending'"):
             lines.append(f"رسید منتظر #{r['id']}: {r['name']}، {r['amount']:,} تومان؛ /approve {r['id']} یا /reject {r['id']}")
         return '\n'.join(lines)
@@ -1339,6 +1348,21 @@ class Service:
                     raise UserError('سهم ثابت هر نفر برای این سانس چقدر است؟')
                 if not self.db.one('SELECT 1 FROM attendance WHERE session_id=?', (s['id'],)):
                     raise UserError('ابتدا حاضران سانس را ثبت کنید.')
+        elif action == 'void_session':
+            # SPEC-035: a session that never took place is closed, not charged.
+            # ``draft=True`` reuses the existing rule that a closed session
+            # cannot be changed again.
+            s = self.session(args.get('session'), draft=True)
+            if s['voided']:
+                raise UserError('این سانس قبلاً «برگزار نشد» ثبت شده است.')
+            attendees = self.db.one('SELECT COUNT(*) AS n FROM attendance WHERE session_id=?',
+                                    (s['id'],))['n']
+            if attendees:
+                raise UserError(f'این سانس {attendees} حاضری ثبت‌شده دارد؛ اول حاضران را '
+                                'بردارید. تا وقتی حاضری در این سانس ثبت است، این سانس '
+                                'برگزار نشده حساب نمی‌شود.')
+            a = {'session': s['id'],
+                 'reason': text(args.get('reason', ''), 'دلیل برگزار نشدن', False, limit=300)}
         elif action == 'player_rename':
             p = self.player(args.get('player', ''))
             a = {'player': p['id'], 'name': text(args.get('name'), 'نام جدید')}
@@ -1460,6 +1484,14 @@ class Service:
                 (session['id'],))]
             return {'finalized': int(session['finalized']), 'person_fee': session['person_fee'],
                     'attendance': attendance}
+        if action == 'void_session':
+            # SPEC-035: the card expires if the session was closed elsewhere or
+            # somebody registered attendance while the card was on screen.
+            session = self.session(a['session'])
+            return {'finalized': int(session['finalized']), 'voided': int(session['voided']),
+                    'attendance': self.db.one(
+                        'SELECT COUNT(*) AS n FROM attendance WHERE session_id=?',
+                        (session['id'],))['n']}
         if action == 'settings':
             return {'value': self.db.setting(a['key'])}
         if action == 'attendance':
@@ -1511,10 +1543,34 @@ class Service:
             lines.append('هشدار: بدون بررسی بانکی، هر رسید با مبلغ اعلامی کاربر از بدهی کم خواهد شد.')
         return '\n'.join(lines)
 
+    def void_preview(self, a):
+        """Describe closing a session that never took place (SPEC-035).
+
+        The card is the only thing an admin clicks, and this happens rarely
+        enough that nobody remembers the rules on the day.  So it states, in
+        plain words, the three things an approval here does and the one thing it
+        does not do.
+        """
+        s = self.session(a['session'])
+        lines = ['این سانس برگزار نشد',
+                 f"سانس: #{s['id']} {s['title']}",
+                 self.session_time_display(s),
+                 f"سهم هر نفر: {s['person_fee']:,} تومان برای هر نفرِ حاضر — کسی حاضر نشده، "
+                 'پس هیچ‌کس بدهکار نمی‌شود.',
+                 'هیچ مبلغی در دفتر حساب ثبت نمی‌شود و هزینهٔ زمین بدهی کسی نمی‌شود.',
+                 'هیچ پیامی به بازیکنان فرستاده نمی‌شود.']
+        if a.get('reason'):
+            lines.append('دلیل: ' + a['reason'])
+        lines.append('این سانس بسته می‌شود و دیگر «سانس جاری» نیست؛ بعد از تأیید قابل برگشت '
+                     'نیست. سانس بعدی از این سانس بدهی به ارث نمی‌برد.')
+        return '\n'.join(lines)
+
     def preview(self, command):
         action, a = command['action'], command['args']
         if action == 'settings':
             return self.settings_preview(a)
+        if action == 'void_session':
+            return self.void_preview(a)
         if action == 'player_merge':
             source, target = self.player(a['source']), self.player(a['target'])
             usage = self.player_usage(source['id'])
@@ -1666,6 +1722,18 @@ class Service:
                                 (row['player_id'], s['id'], share * s['person_fee'],
                                  note, f"session:{s['id']}:player:{row['player_id']}"))
             self.db.execute('UPDATE sessions SET finalized=1 WHERE id=?', (s['id'],))
+        elif action == 'void_session':
+            # SPEC-035: no ledger row, ever.  The session is closed with the
+            # flag that says it never took place, and the reason joins the note
+            # so a later reader of the report knows why.
+            s = self.session(a['session'], draft=True)
+            if s['voided'] or self.db.one('SELECT 1 FROM attendance WHERE session_id=?', (s['id'],)):
+                # Re-checked after approval: the card is not a licence to skip
+                # the guards that ``prepare`` applied when it was shown.
+                raise UserError('این سانس دیگر قابل برگزار نشده ثبت کردن نیست؛ وضعیتش تغییر کرده است.')
+            note = f"{s['note']}\nبرگزار نشد: {a['reason']}".strip()
+            self.db.execute('UPDATE sessions SET finalized=1, voided=1, note=? WHERE id=?',
+                            (note, s['id']))
         elif action == 'adjustment':
             self.db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',
                             (a['player'], a['amount'], a['note'], source))

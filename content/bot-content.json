@@ -38,6 +38,7 @@
     "update_session args={session,when_text?,location?,venue_cost?,person_fee?,note?};",
     "attendance args={session,player,guests:تعداد مهمان بدون خود فرد,guest_names?:نام مهمان‌ها وقتی ادمین گفته باشد,present:true/false};",
     "finalize args={session} فقط اگر ادمین درخواست نهایی‌سازی/ثبت بدهی سانس کرده؛",
+    "void_session args={session,reason?} فقط وقتی ادمین می‌گوید سانس برگزار نشد/کسی نیامد/لغو شد؛ این کار سانس را بدون هیچ بدهی می‌بندد و هرگز جای finalize نیست.",
     "adjustment args={player,amount:مثبت برای افزایش بدهی یا منفی برای کاهش بدهی,note:دلیل};",
     "settle args={player:نام یا شناسه} برای اعلام صریح اینکه بازیکن تسویه کرده؛ فقط ماندهٔ مثبت فعلی را صفر کن؛",
     "request_link args={partner:نام یا شناسه} فقط وقتی کاربرِ متصل در پی‌وی صریحاً می‌خواهد حسابش به یک نفر وصل شود؛ همین یک کارت تأیید برای ادمین بساز و خودت پیوند نساز؛ settle_partner args={partner:نام یا شناسه} فقط برای حساب‌های پیوندیِ همان کاربر (context.linked_players) و فقط به‌عنوان درخواست تسویه برای تأیید ادمین؛",

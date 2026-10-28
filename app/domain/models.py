@@ -59,6 +59,8 @@ class Action(str, Enum):
     UPDATE_SESSION = 'update_session'
     ATTENDANCE = 'attendance'
     FINALIZE = 'finalize'
+    # SPEC-035: a session that never took place is closed without a charge.
+    VOID_SESSION = 'void_session'
     ADJUSTMENT = 'adjustment'
     SETTINGS = 'settings'
     PLAYER_NOTE = 'player_note'

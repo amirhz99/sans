@@ -24,7 +24,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     venue_cost INTEGER CHECK(venue_cost IS NULL OR venue_cost >= 0),
     person_fee INTEGER NOT NULL DEFAULT 0 CHECK(person_fee >= 0),
     note TEXT NOT NULL DEFAULT '',
-    finalized INTEGER NOT NULL DEFAULT 0 CHECK(finalized IN (0, 1))
+    finalized INTEGER NOT NULL DEFAULT 0 CHECK(finalized IN (0, 1)),
+    -- SPEC-035: a session that never took place.  ``finalized`` still means
+    -- "closed"; ``voided`` only records that it closed with no game and no
+    -- charge, so the ledger is never involved.
+    voided INTEGER NOT NULL DEFAULT 0 CHECK(voided IN (0, 1))
 );
 CREATE TABLE IF NOT EXISTS attendance (
     session_id INTEGER NOT NULL REFERENCES sessions(id),

@@ -4479,3 +4479,175 @@ class SupportHandleTests(BaseCase):
         reply = self.replies(chat=10)
         self.assertIn('سرویس هوش مصنوعی فعلاً پاسخ معتبر نداد', reply)
         self.assertNotIn('@amirhz99', reply)
+
+
+class VoidSessionTests(BaseCase):
+    """SPEC-035: a session that never took place closes with no charge."""
+
+    def card(self, args):
+        prepared = self.service.prepare('void_session', args)
+        with self.db.conn:
+            return self.bot.propose_commands([prepared], 1, -100)
+
+    def card_id(self, markup):
+        return markup[0][0]['callback_data'].split(':', 1)[1]
+
+    def status(self, ident):
+        return self.db.one('SELECT status FROM pending WHERE id=?', (ident,))['status']
+
+    def callback_texts(self):
+        return [json.loads(row['payload']).get('text', '')
+                for row in self.db.all("SELECT payload FROM outbox WHERE method='answerCallbackQuery' ORDER BY id")]
+
+    def session_row(self, ident=1):
+        return self.db.one('SELECT * FROM sessions WHERE id=?', (ident,))
+
+    def test_an_empty_session_is_voided_and_closed(self):
+        self.seed()
+
+        _, markup = self.card({'session': 1, 'reason': 'باران'})
+        self.click('yes:' + self.card_id(markup))
+
+        row = self.session_row()
+        self.assertEqual(row['finalized'], 1)
+        self.assertEqual(row['voided'], 1)
+
+    def test_voiding_writes_no_ledger_row(self):
+        self.seed()
+        ledger_before = self.db.all('SELECT * FROM ledger')
+
+        _, markup = self.card({'session': 1})
+        self.click('yes:' + self.card_id(markup))
+
+        self.assertEqual(self.db.all('SELECT * FROM ledger'), ledger_before)
+        self.assertFalse(self.db.all('SELECT * FROM ledger WHERE session_id=1'))
+        self.assertEqual(self.service.balance(1), 0)
+        self.assertEqual(self.service.balance(2), 0)
+
+    def test_a_voided_session_is_no_longer_current(self):
+        self.seed()
+        _, markup = self.card({'session': 1})
+        self.click('yes:' + self.card_id(markup))
+
+        # SPEC-035: nothing is open any more.  ``draft=False`` falls back to the
+        # newest row, exactly as it did before this change, so the same call
+        # still returns the voided session and a draft change is refused.
+        self.assertFalse(self.db.all('SELECT * FROM sessions WHERE finalized=0 ORDER BY id DESC'))
+        self.assertNotIn('پنجشنبه ۲۳ مهر', self.service.configuration())
+        with self.assertRaises(UserError):
+            self.service.session('current', draft=True)
+
+    def test_a_session_with_attendance_is_refused(self):
+        self.seed()
+        self.apply('attendance', session=1, player=1, guests=0)
+
+        with self.assertRaises(UserError) as raised:
+            self.service.prepare('void_session', {'session': 1})
+
+        self.assertIn('1 حاضری', str(raised.exception))
+        row = self.session_row()
+        self.assertEqual((row['finalized'], row['voided']), (0, 0))
+        self.assertFalse(self.db.all('SELECT * FROM ledger'))
+
+    def test_a_finalized_session_cannot_be_voided(self):
+        self.seed()
+        self.apply('attendance', session=1, player=1, guests=0)
+        self.apply('finalize', session=1)
+
+        with self.assertRaises(UserError) as raised:
+            self.service.prepare('void_session', {'session': 1})
+
+        self.assertIn('بسته شده', str(raised.exception))
+        self.assertEqual(self.session_row()['voided'], 0)
+        self.assertEqual(self.service.balance(1), 150000)
+
+    def test_voiding_twice_is_refused(self):
+        self.seed()
+        self.apply('void_session', session=1, reason='باران')
+
+        with self.assertRaises(UserError) as raised:
+            self.service.prepare('void_session', {'session': 1})
+
+        # SPEC-035: the closed-session rule fires first, and it must not offer a
+        # ledger adjustment for a session that never charged anybody.
+        self.assertIn('بسته است', str(raised.exception))
+        self.assertIn('برگزار نشد', str(raised.exception))
+        self.assertEqual(self.service.balance(1), 0)
+
+    def test_the_card_expires_when_attendance_is_added(self):
+        self.seed()
+        _, markup = self.card({'session': 1})
+        ident = self.card_id(markup)
+        self.apply('attendance', session=1, player=2, guests=0)
+
+        self.click('yes:' + ident)
+
+        row = self.session_row()
+        self.assertEqual((row['finalized'], row['voided']), (0, 0))
+        self.assertEqual(self.service.balance(2), 0)
+        self.assertEqual(self.status(ident), 'expired')
+        self.assertIn('تغییر کرده', self.callback_texts()[-1])
+
+    def test_a_player_cannot_void_a_session(self):
+        self.seed()
+
+        self.send('/void', user=10, chat=10)
+
+        self.assertIn('این دستور را نمی‌شناسم', self.replies(chat=10))
+        row = self.session_row()
+        self.assertEqual((row['finalized'], row['voided']), (0, 0))
+
+    def test_void_without_an_open_session_answers(self):
+        self.seed()
+        _, markup = self.card({'session': 1})
+        self.click('yes:' + self.card_id(markup))
+        cards_before = len(self.db.all("SELECT * FROM pending WHERE kind='commands'"))
+
+        self.send('/void', user=1, chat=-100)
+
+        # Nothing is voided a second time, and the admin is told there is no
+        # open session instead of a card being built for something else.
+        self.assertIn('سانسی پیدا نشد', self.replies(chat=-100))
+        self.assertEqual(len(self.db.all("SELECT * FROM pending WHERE kind='commands'")), cards_before)
+        self.assertEqual(self.session_row()['voided'], 1)
+
+    def test_the_card_states_every_consequence(self):
+        self.seed()
+
+        preview = self.service.preview(self.service.prepare('void_session', {'session': 1}))
+
+        self.assertIn('پنجشنبه ۲۳ مهر', preview)
+        self.assertIn('هیچ مبلغی در دفتر حساب ثبت نمی‌شود', preview)
+        self.assertIn('هیچ پیامی به بازیکنان فرستاده نمی‌شود', preview)
+        self.assertIn('قابل برگشت', preview)
+        self.assertNotIn('جمع بدهی', preview)
+
+    def test_a_voided_session_reads_as_not_held(self):
+        self.seed()
+        self.apply('void_session', session=1, reason='باران')
+        session = self.session_row()
+
+        self.assertIn('برگزار نشد', SessionView(self.service).render(session, ResponseLevel.FULL, True))
+        self.assertIn('برگزار نشد', self.service.report())
+        self.send('/sessions', user=1, chat=-100)
+        self.assertIn('برگزار نشد', self.replies(chat=-100))
+        self.assertIn('باران', session['note'])
+
+    def test_a_legacy_database_gets_the_voided_column(self):
+        # A database written before SPEC-035 has no ``voided`` column at all.
+        legacy = sqlite3.connect(self.path)
+        legacy.execute('DROP TABLE sessions')
+        legacy.execute('CREATE TABLE sessions (id INTEGER PRIMARY KEY, title TEXT UNIQUE NOT NULL, '
+                       'when_text TEXT NOT NULL DEFAULT "", session_at TEXT, location TEXT NOT NULL DEFAULT "", '
+                       'venue_cost INTEGER, person_fee INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT "", '
+                       'finalized INTEGER NOT NULL DEFAULT 0)')
+        legacy.execute("INSERT INTO sessions(id,title,when_text,person_fee,finalized) "
+                       "VALUES (1,'سانس قدیمی','',150000,0)")
+        legacy.commit()
+        legacy.close()
+
+        db = Database(self.path)
+        try:
+            self.assertEqual(db.one('SELECT * FROM sessions WHERE id=1')['voided'], 0)
+        finally:
+            db.close()

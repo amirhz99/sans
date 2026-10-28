@@ -73,6 +73,7 @@ AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمن�
      * بستن کارت‌های تأیید باز (`expire_proposals`): اگر ادمین گفت «کارت‌های منتظر را ببند»، «پیشنهادها را کنسل کن» یا «کارت‌های منقضی را ببند»، این عملیات را صدا بزن. `older_than_hours` را خالی بگذار یعنی فقط کارت‌های قدیمی‌تر از ۲۴ ساعت، و برای «همه» مقدار ۰ بده. این کار فقط کارت را می‌بندد و هیچ مالی اعمال نمی‌شود؛ همین را شفاف بگو. کارت هویت/اتصال را دست نزن.
    - تغییرات مالی در دفترکل (`propose_financial_change`):
      * نهایی‌سازی بدهی سانس (`finalize`)، اصلاح دستی بدهی/طلب بازیکن (`adjustment`)، تسویه حساب (`settle`) و اعلام بدهی توسط بازیکن (`declare_debt`) حساس هستند. برای این‌ها از `propose_financial_change` استفاده کن تا کارت تأیید با دکمه شیشه‌ای ساخته شود.
+     * اگر ادمین گفت سانس برگزار نشد («کسی نیومد»، «لغو شد»، «سانس انجام نشد»)، عملیات `void_session` را با `propose_financial_change` بساز: کارت سانس را بدون هیچ بدهی می‌بندد. هرگز برای این حالت `finalize` نزن؛ finalize بدهی می‌سازد.
      * اگر درخواست تسویه چند نفره است («بدهی همه را صاف کن»، «حساب این سه نفر را تسویه کن»)، همهٔ نام‌ها را در آرگومان `players` و جداشده با کاما بده تا **یک کارت واحد** ساخته شود. هرگز برای هر نفر کارت جدا نساز و برای هر نفر جداگانه ابزار را صدا نزن.
      * اصلاح حساب چند نفره با مبلغ یکسان: نام‌ها را در `players` و مبلغ مشترک را در `amount` بده.
      * اصلاح حساب با مبلغ متفاوت برای هر نفر: `entries` را به‌صورت JSON بده؛ مثلاً `[{{"player":"مهدی","amount":-150000}},{{"player":"رضا","amount":50000}}]`. هرگز `entries` را با `players` یا `amount` ترکیب نکن.
@@ -202,6 +203,7 @@ class SansAgent:
                     'when_text': s['when_text'],
                     'person_fee': s['person_fee'],
                     'finalized': bool(s['finalized']),
+                    'voided': bool(s['voided']),
                 }
                 for s in recent_sessions
             ],
@@ -257,7 +259,9 @@ class SansAgent:
                         att_str = '، '.join(f"{r['name']}" + (f" (+{r['guests']})" if r['guests'] else '') for r in att) or 'بدون حاضر'
                         lines.append(
                             f"سانس #{s['id']} «{s['title']}» | زمان: {s['when_text'] or s['session_at'] or 'نامشخص'} | "
-                            f"سهم هر نفر: {s['person_fee']:,} | وضعیت: {'نهایی‌شده' if s['finalized'] else 'باز'} | حاضران ({len(att)}): {att_str}"
+                            f"سهم هر نفر: {s['person_fee']:,} | وضعیت: "
+                            + ('برگزار نشد' if s['voided'] else 'نهایی‌شده' if s['finalized'] else 'باز')
+                            + f" | حاضران ({len(att)}): {att_str}"
                         )
                     return '\n'.join(lines)
                 if target == 'session_details':
@@ -750,7 +754,9 @@ class SansAgent:
                                      amount: int = 0, note: str = '',
                                      players: str = '', entries: str = '') -> str:
             """Create an admin-approval proposal (with inline Yes/No buttons) for financial mutations.
-            action: 'finalize', 'adjustment', 'settle', 'declare_debt'.
+            action: 'finalize', 'void_session', 'adjustment', 'settle', 'declare_debt'.
+            «void_session» فقط وقتی که ادمین می‌گوید سانس برگزار نشد/کسی نیامد/لغو شد؛
+            سانس باید هیچ حاضری نداشته باشد و در عوض هیچ بدهی ایجاد نمی‌شود.
             One request is always ONE card, even for many players; never call this per person.
             adjustment:
               - `player` + `amount`: a single player.
@@ -774,6 +780,12 @@ class SansAgent:
 
                 if action == 'finalize':
                     cmd = {'action': 'finalize', 'args': {'session': session or effects.get('last_session_id') or 'current'}}
+                elif action == 'void_session':
+                    # SPEC-035: «برگزار نشد» is the opposite of finalizing, so it
+                    # must never be routed to ``finalize`` and invent a debt.
+                    cmd = {'action': 'void_session',
+                           'args': {'session': session or effects.get('last_session_id') or 'current',
+                                    'reason': note or ''}}
                 elif action == 'adjustment':
                     refs = batch_refs(players)
                     has_entries = ((isinstance(entries, (list, tuple)) and bool(entries))
@@ -837,7 +849,7 @@ class SansAgent:
                         return 'این حساب‌ها بدهی مثبت ندارند و از قبل تسویه‌اند: ' + '، '.join(skipped)
                     return batch_reply(commands, skipped)
                 else:
-                    return 'نوع تغییر مالی نامعتبر است (finalize, adjustment, settle, declare_debt).'
+                    return 'نوع تغییر مالی نامعتبر است (finalize, void_session, adjustment, settle, declare_debt).'
 
                 preview, markup = bot.propose(cmd, user_id, chat_id)
                 effects['markup'] = markup
