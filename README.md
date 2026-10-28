@@ -110,7 +110,7 @@ python3 /opt/sans/run.py
 روی ماشین توسعه (بدون systemd و بدون root) همین مخزن کافی است:
 
 ```bash
-git clone https://github.com/OWNER/sans.git
+git clone https://github.com/amirhz99/sans.git
 cd sans
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -147,7 +147,7 @@ journalctl -u sans-bot.service -n 30 --no-pager
 
 پس از تغییر `.env`، دستور `sudo systemctl restart sans-bot.service` را اجرا کنید. برای ورود CSV یا بکاپ، ابتدا `sudo systemctl stop sans-bot.service` و پس از پایان `start` بزنید؛ ابزارهای نگهداری (`--backup`، `--import-*`، `--migrate-guests`) قفل نصب را می‌گیرند و با ربات در حال اجرا کار نمی‌کنند. گزینهٔ `--discover-ids` را هم‌زمان با سرویس اجرا نکنید.
 
-اعتبار کلید یا دریافت فهرست مدل‌ها، تضمین موفقیت chat/completions نیست. در InferHub شناسهٔ مدل ممکن است به پیشوند ارائه‌دهنده مثل `ali/qwen3.8-flash` نیاز داشته باشد. خطای HTTP 402 با پیام `no provider's ask matches your max-per-mtok bid` به پیدا نشدن ارائه‌دهنده در سقف قیمت پیشنهادی اشاره دارد. تنظیمات قیمت/مسیریابی حساب را نزد سرویس بررسی کنید؛ ربات سقف هزینه را خودکار افزایش نمی‌دهد. در زمان خطای AI، فرمان‌های قطعی همچنان در دسترس‌اند.
+اعتبار کلید یا دریافت فهرست مدل‌ها، تضمین موفقیت chat/completions نیست. بعضی ارائه‌دهنده‌ها شناسهٔ مدل را با پیشوند ارائه‌دهنده می‌خواهند (مثل `provider/model-name`). خطای HTTP 402 با پیامی دربارهٔ `max-per-mtok bid` یعنی برای آن مدل در سقف قیمت پیشنهادی ارائه‌دهنده‌ای پیدا نشده؛ تنظیمات قیمت و مسیریابی حساب را نزد سرویس بررسی کنید. ربات سقف هزینه را خودکار افزایش نمی‌دهد. در زمان خطای AI، فرمان‌های قطعی همچنان در دسترس‌اند.
 
 ### اجرای دائمی بدون root (systemd --user)
 
@@ -180,14 +180,9 @@ RestartSec=15
 TimeoutStopSec=20
 UMask=0077
 Environment=PYTHONUNBUFFERED=1
-# Bale مستقیم پاسخ می‌دهد ولی chat/completions ارائه‌دهندهٔ AI فقط از طریق
-# پروکسی محلی کار می‌کند؛ پس Bale از پروکسی مستثنا و AI از آن رد می‌شود.
-Environment=http_proxy=http://127.0.0.1:10808
-Environment=https_proxy=http://127.0.0.1:10808
-Environment=HTTP_PROXY=http://127.0.0.1:10808
-Environment=HTTPS_PROXY=http://127.0.0.1:10808
-Environment=no_proxy=tapi.bale.ai,localhost,127.0.0.1
-Environment=NO_PROXY=tapi.bale.ai,localhost,127.0.0.1
+# اگر ربات باید از پروکسی رد شود، اینجا اضافه کنید؛ نمونه:
+# Environment=HTTPS_PROXY=http://127.0.0.1:PORT
+# Environment=NO_PROXY=localhost,127.0.0.1
 StandardOutput=append:/home/USER/projects/sans/data/logs/bot.log
 StandardError=append:/home/USER/projects/sans/data/logs/bot.log
 
@@ -200,36 +195,19 @@ systemctl --user status sans-bot.service --no-pager
 tail -f data/logs/bot.log
 ```
 
-سرویس کاربر محیط پوستهٔ شما را به ارث نمی‌برد؛ هر متغیری مثل پروکسی که ربات لازم دارد باید در خود یونیت با `Environment=` بیاید. اگر پروکسی محلی خاموش باشد، polling بله همچنان کار می‌کند (چون در `no_proxy` است) و فقط پاسخ‌های AI خطا می‌دهند.
+### عیب‌یابی شبکه
 
-### تفکیک مسیر شبکه (هر دو مقصد از پروکسی، فقط loopback مستقیم)
+سرویس کاربر محیط پوستهٔ شما را به ارث نمی‌برد؛ هر متغیری مثل پروکسی که ربات لازم دارد باید در خود یونیت با `Environment=` بیاید.
 
-در ۲۰۲۶-۱۰-۲۲ روی همین سرور اندازه‌گیری شد که `tapi.bale.ai` مستقیم سریع‌تر پاسخ می‌دهد و `api.inferhub.dev` فقط از طریق پروکسی محلی جواب می‌دهد؛ برای همین `tapi.bale.ai` در `no_proxy` گذاشته شده بود.
-
-در ۲۰۲۶-۱۰-۲۴ حل نام (DNS) روی این هاست از کار افتاد. نتیجه مستقیمش این بود:
-
-```text
-curl: (6) Could not resolve host: tapi.bale.ai
-```
-
-ربات چون بله را مستقیم صدا می‌زد، در استارت با `Network error or invalid JSON response` می‌مرد، systemd ده بار ری‌استارت می‌کرد و بعد `Start request repeated too quickly` می‌شد (`systemctl --user is-active sans-bot` مقدار `failed` می‌داد).
-
-پروکسی محلی نام‌ها را در خروجی خودش حل می‌کند، پس حالا **هر دو مقصد** از پروکسی می‌روند و فقط loopback دور زده می‌شود:
-
-```ini
-Environment=no_proxy=localhost,127.0.0.1
-Environment=NO_PROXY=localhost,127.0.0.1
-```
-
-اندازه‌گیری دوباره در ۲۰۲۶-۱۰-۲۴: `getMe` از طریق پروکسی در حدود یک ثانیه `{"ok":true}` برمی‌گرداند. اگر روزی DNS درست شد و خواستید بله را دوباره مستقیم ببرید، اول با `getent hosts tapi.bale.ai` مطمئن شوید که نام حل می‌شود، بعد `no_proxy` را برگردانید.
-
-تشخیص سریع وقتی ربات بالا نمی‌آید:
+اگر ربات بالا نمی‌آید و لاگ `Network error or invalid JSON response` نشان می‌دهد، پیش از هر چیز دسترسی شبکه را جدا از ربات بررسی کنید:
 
 ```bash
 systemctl --user is-active sans-bot
 journalctl --user -u sans-bot -n 20 --no-pager
-. ./.env && curl -sS --proxy http://127.0.0.1:10808 "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/getMe"
+getent hosts tapi.bale.ai      # باید یک نشانی IP برگرداند
 ```
+
+`Start request repeated too quickly` در `systemctl --user status` یعنی systemd پس از چند شکست متوالی ربات را متوقف کرده است؛ پس از رفع مشکل شبکه، یک‌بار `systemctl --user reset-failed sans-bot` و بعد `start` بزنید. اگر شبکه فقط از پروکسی در دسترس است، `HTTPS_PROXY` و `NO_PROXY` را در یونیت تنظیم کنید (نمونهٔ commented بالا) و مطمئن شوید `NO_PROXY` شامل `localhost,127.0.0.1` باشد.
 
 ### بازیابی پس از خاموشی غیرتمیز
 
