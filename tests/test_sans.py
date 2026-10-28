@@ -3931,6 +3931,94 @@ class LinkCandidateTests(BaseCase):
 
         self.assertEqual(self.service.link_candidates(), [])
 
+    def test_the_suggestion_card_names_the_pair(self):
+        # SPEC-037: ``format_link_candidates`` was never executed by a test,
+        # so a broken card text would have shipped unnoticed.
+        self.seed()
+        self.apply('new_player', name='حسن رضایی')
+        pairs = self.service.link_candidates()
+
+        text = self.service.format_link_candidates(pairs)
+        self.assertIn('فامیل «رضایی»', text)
+        self.assertIn('#1 علی رضایی', text)
+        self.assertIn('#3 حسن رضایی', text)
+        self.assertIn('↔', text)
+        # The card must say that nothing was linked yet.
+        self.assertIn('هیچ پیوندی بدون تأیید شما ساخته نمی‌شود', text)
+
+        self.assertEqual(self.service.format_link_candidates([]),
+                         'پیشنهادی برای پیوند بر اساس فامیل یکسان پیدا نشد.')
+
+    def test_suggestlinks_builds_a_card_and_creates_no_link(self):
+        # SPEC-037: `/suggestlinks` answers with an approval card, not with a
+        # plain message, so the card is what the admin actually sees.
+        self.seed()
+        self.apply('new_player', name='حسن رضایی')
+        self.send('/suggestlinks', user=1, chat=-100)
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM player_links')['n'], 0)
+        card = self.db.one("SELECT * FROM pending WHERE kind='commands'")
+        self.assertIsNotNone(card)
+        self.assertEqual(card['status'], 'pending')
+
+    def test_an_empty_suggestion_says_so(self):
+        # With no pair to propose there is no card, so the sentence is the reply.
+        self.seed()   # two players, different family names
+        self.send('/suggestlinks', user=1, chat=-100)
+        self.assertIn('پیشنهادی برای پیوند بر اساس فامیل یکسان پیدا نشد.',
+                      self.replies(chat=-100))
+        self.assertIsNone(self.db.one("SELECT id FROM pending WHERE kind='commands'"))
+
+
+class UnlinkCase(BaseCase):
+    """SPEC-037: no test had ever removed a link."""
+
+    def test_unlink_removes_the_link_and_keeps_the_ledger(self):
+        self.seed()
+        with self.db.conn:
+            self.service.link_players(1, 2, 1)
+        self.assertTrue(self.service.are_linked(1, 2))
+        balance_before = self.service.balance(1)
+
+        with self.db.conn:
+            self.service.unlink_players(2, 1, 1)   # order must not matter
+
+        self.assertFalse(self.service.are_linked(1, 2))
+        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM player_links')['n'], 0)
+        # SPEC-025: linking is a read permission, never a financial movement.
+        self.assertEqual(self.service.balance(1), balance_before)
+
+    def test_unlinking_an_unlinked_pair_fails_closed(self):
+        self.seed()
+        with self.assertRaises(UserError) as caught:
+            self.service.unlink_players(1, 2, 1)
+        self.assertIn('به هم وصل نیستند', str(caught.exception))
+        self.assertFalse(self.service.are_linked(1, 2))
+
+    def test_unlinking_yourself_fails_closed(self):
+        self.seed()
+        with self.assertRaises(UserError):
+            self.service.unlink_players(1, 1, 1)
+
+    def test_the_unlink_card_closes_after_a_real_unlink(self):
+        # SPEC-025: the card must not close a pair that already changed.
+        self.seed()
+        with self.db.conn:
+            self.service.link_players(1, 2, 1)
+        self.send('/unlink2 1 2', user=1, chat=-100)
+        self.assertIn('حساب پیوندی', self.replies(chat=-100))
+        self.click('yes:' + self.proposal())
+        self.assertFalse(self.service.are_linked(1, 2))
+
+    def test_a_player_cannot_unlink(self):
+        # SPEC-025: only the admin click unlinks.
+        self.seed()
+        with self.db.conn:
+            self.service.link_players(1, 2, 1)
+        self.send('/unlink2 1 2', user=10, chat=10)
+        self.assertTrue(self.service.are_linked(1, 2))
+        self.assertEqual(self.db.one(
+            "SELECT COUNT(*) n FROM pending WHERE status='pending'")['n'], 0)
+
 
 class RecordingClient:
     """SPEC-027: a stand-in Bale client that records every outbound call."""
