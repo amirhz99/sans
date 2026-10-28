@@ -41,7 +41,7 @@
 
 متن prompt هوش مصنوعی، راهنمای کاربر و راهنمای ادمین، به‌همراه پیش‌فرض‌های ساخت سانس، همگی در فایل زیر قرار دارند:
 
-`/opt/sans/content/bot-content.json`
+`content/bot-content.json`
 
 پیش‌فرض فعلی برای سانس جدید:
 
@@ -59,11 +59,11 @@
 در بله از `@botfather` توکن بگیرید و ربات را به گروه خصوصی ادمین‌ها اضافه کنید. دسترسی دریافت پیام‌های گروه و ارسال پیام/عکس/فایل باید فراهم باشد. همهٔ افراد گروه را مورد اعتماد در نظر بگیرید، چون پاسخ‌های ربات برای تمام اعضای گروه دیده می‌شود.
 
 ```bash
-cp /opt/sans/.env.example /opt/sans/.env
-chmod 600 /opt/sans/.env
+cp .env.example .env
+chmod 600 .env
 ```
 
-فایل `/opt/sans/.env` را تکمیل کنید:
+فایل `.env` را در ریشهٔ پروژه تکمیل کنید:
 
 | تنظیم | توضیح |
 | --- | --- |
@@ -75,7 +75,7 @@ chmod 600 /opt/sans/.env
 | `AI_API_KEY` | کلید سرویس |
 | `AI_MODEL` | نام مدل در همان سرویس |
 | `AI_FALLBACK_MODEL` | اختیاری؛ نام یک یا چند مدل جایگزین با کاما. اگر مدل اصلی خطا بدهد (مثلاً سهمیه/۴۰۲)، همان درخواست با مدل بعدی تکرار می‌شود |
-| `DATABASE_PATH` | پیش‌فرض: `/opt/sans/data/sans.sqlite3`؛ مسیر نسبی نسبت به ریشهٔ پروژه تفسیر می‌شود |
+| `DATABASE_PATH` | پیش‌فرض: `data/sans.sqlite3`. مسیر نسبی نسبت به ریشهٔ پروژه تفسیر می‌شود، نه نسبت به پوشهٔ اجرا |
 | `BOT_NAME` | پیش‌فرض: `مسئول`؛ واژهٔ خطاب در گروه |
 | `REMINDER_HOURS` | فاصلهٔ یادآوری‌ها، پیش‌فرض ۲۴ ساعت؛ صفر یعنی خاموش |
 | `SUPPORT_HANDLE` | اختیاری؛ آیدی پشتیبان انسانی مثل `@club_support`. ربات وقتی نتواند مشکل کاربر را حل کند یا او بپرسد «با کی صحبت کنم»، همین آیدی را می‌دهد و `/support` هم آن را نشان می‌دهد. خالی یعنی این قابلیت خاموش است و ربات به ادمین‌های گروه ارجاع می‌دهد |
@@ -84,10 +84,10 @@ chmod 600 /opt/sans/.env
 
 ### به‌دست‌آوردن شناسه‌ها
 
-فقط توکن را در `/opt/sans/.env` وارد کنید. هر ادمین در خصوصی ربات و در گروه `/id` بفرستد. سپس، در حالی که نمونهٔ دیگری از ربات اجرا نیست:
+فقط توکن را در `.env` وارد کنید. هر ادمین در خصوصی ربات و در گروه `/id` بفرستد. سپس، در حالی که نمونهٔ دیگری از ربات اجرا نیست:
 
 ```bash
-python3 /opt/sans/run.py --discover-ids
+python3 run.py --discover-ids
 ```
 
 این فرمان شناسهٔ گفتگو و فرستنده را از پیام‌های اخیر چاپ می‌کند؛ متن پیام یا توکن را چاپ نمی‌کند. با این اطلاعات `ADMIN_GROUP_ID` را تکمیل کنید. در رباتِ در حال اجرا هم `/id` در دسترس است.
@@ -97,8 +97,8 @@ python3 /opt/sans/run.py --discover-ids
 ### ساخت دیتابیس و اجرا
 
 ```bash
-python3 /opt/sans/run.py --init
-python3 /opt/sans/run.py
+python3 run.py --init
+python3 run.py
 ```
 
 ساخت جداول خودکار است؛ `--init` برای بررسی آفلاین مفید است و توکن نمی‌خواهد. برنامه با long polling اجرا می‌شود؛ پورت ورودی عمومی نیاز ندارد. خروج با `Ctrl+C` است. برای اجرای دائمی از مدیر سرویس سرورتان استفاده کنید.
@@ -133,12 +133,15 @@ python3 -m compileall -q app tests
 
 ### اجرای دائمی با systemd (کاربر اختصاصی)
 
-نمونهٔ سرویس در `deploy/sans-bot.service` است. یک نمونهٔ امن برای سرور است: کاربر اختصاصی `sans`، کد فقط خواندنی، و نوشتن محدود به پوشهٔ داده. مسیرها (`/opt/sans`) و کاربر/گروه را متناسب با نصب خودتان تغییر دهید.
+نمونهٔ سرویس در `deploy/sans-bot.service` است. یک نمونهٔ امن برای سرور است: کاربر اختصاصی `sans`، کد فقط خواندنی، و نوشتن محدود به پوشهٔ داده.
+
+systemd **مسیرهای نسبی را نمی‌پذیرد**، پس در خود یونیت مسیرها مطلق‌اند. `/opt/sans` فقط یک نمونهٔ پیشنهادی است؛ آن را با مسیر واقعی پروژه روی سرور خود جایگزین کنید. اگر جای دیگری نصب می‌کنید، در `deploy/sans-bot.service` سه مقدار `WorkingDirectory`، `ExecStart` و `ReadWritePaths` را عوض کنید. بقیهٔ فرمان‌های این README از ریشهٔ پروژه و با مسیر نسبی اجرا می‌شوند:
 
 ```bash
+cd /opt/sans                          # ریشهٔ پروژه را جایگزین کنید
 sudo useradd --system --home /opt/sans --shell /usr/sbin/nologin sans
 sudo chown -R sans:sans /opt/sans
-sudo install -m 644 /opt/sans/deploy/sans-bot.service /etc/systemd/system/sans-bot.service
+sudo install -m 644 deploy/sans-bot.service /etc/systemd/system/sans-bot.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now sans-bot.service
 sudo systemctl status sans-bot.service --no-pager
@@ -151,7 +154,7 @@ journalctl -u sans-bot.service -n 30 --no-pager
 
 ### اجرای دائمی بدون root (systemd --user)
 
-اگر ربات با کاربر عادی (نه root) اجرا می‌شود، از سرویس کاربر استفاده کنید تا هم به sudo نیاز نباشد و هم بعد از ریبوت خودکار بالا بیاید. مسیرها را با مسیر واقعی مخزن جایگزین کنید:
+اگر ربات با کاربر عادی (نه root) اجرا می‌شود، از سرویس کاربر استفاده کنید تا هم به sudo نیاز نباشد و هم بعد از ریبوت خودکار بالا بیاید.
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -161,7 +164,7 @@ systemctl --user enable --now sans-bot.service
 loginctl enable-linger "$USER"      # بدون این، سرویس با خروج از سیستم می‌خوابد
 ```
 
-نمونهٔ یونیت (مقادیر `WorkingDirectory`، `ExecStart` و مسیر لاگ را با مسیر خودتان تطبیق دهید):
+نمونهٔ یونیت (همهٔ `/path/to/sans` را با مسیر واقعی مخزن جایگزین کنید؛ systemd مسیر نسبی را نمی‌پذیرد):
 
 ```ini
 [Unit]
@@ -173,8 +176,8 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
-WorkingDirectory=/home/USER/projects/sans
-ExecStart=/home/USER/projects/sans/.venv/bin/python3 /home/USER/projects/sans/run.py
+WorkingDirectory=/path/to/sans
+ExecStart=/path/to/sans/.venv/bin/python3 /path/to/sans/run.py
 Restart=always
 RestartSec=15
 TimeoutStopSec=20
@@ -183,8 +186,8 @@ Environment=PYTHONUNBUFFERED=1
 # اگر ربات باید از پروکسی رد شود، اینجا اضافه کنید؛ نمونه:
 # Environment=HTTPS_PROXY=http://127.0.0.1:PORT
 # Environment=NO_PROXY=localhost,127.0.0.1
-StandardOutput=append:/home/USER/projects/sans/data/logs/bot.log
-StandardError=append:/home/USER/projects/sans/data/logs/bot.log
+StandardOutput=append:/path/to/sans/data/logs/bot.log
+StandardError=append:/path/to/sans/data/logs/bot.log
 
 [Install]
 WantedBy=default.target
@@ -229,7 +232,7 @@ systemctl --user start sans-bot.service
 
 ## ورود اطلاعات قبلی
 
-ساختار نمونه در `/opt/sans/examples/players.csv` آمده است. فایل UTF-8 با سرستون‌های زیر بسازید:
+ساختار نمونه در `examples/players.csv` آمده است. فایل UTF-8 با سرستون‌های زیر بسازید:
 
 ```csv
 name,opening_balance,note
@@ -240,10 +243,10 @@ name,opening_balance,note
 
 عدد مثبت یعنی بدهکار، منفی یعنی بستانکار. همهٔ مبلغ‌ها **تومان** هستند. حساب بله لازم نیست؛ بعداً هنگام معرفی و تأیید ادمین متصل می‌شود.
 
-پس از قرار دادن اطلاعات واقعی خودتان در `/opt/sans/players.csv`، ربات را متوقف و اجرا کنید:
+پس از قرار دادن اطلاعات واقعی خودتان در `players.csv` (در ریشهٔ پروژه یا هر مسیری که ترجیح می‌دهید)، ربات را متوقف و اجرا کنید:
 
 ```bash
-python3 /opt/sans/run.py --import-players /opt/sans/players.csv
+python3 run.py --import-players players.csv
 ```
 
 ### سه گام اختیاری: از دفتر کاغذی به سانس‌های واقعی
@@ -253,7 +256,7 @@ python3 /opt/sans/run.py --import-players /opt/sans/players.csv
 **۱) بدهی قبلی هر نفر** (اختیاری): فقط اگر می‌خواهید مانده‌ای از قبل روی حساب‌ها باشد.
 
 ```bash
-python3 /opt/sans/run.py --import-players /opt/sans/players.csv
+python3 run.py --import-players players.csv
 ```
 
 فقط CSV پذیرفته می‌شود (ستون‌های `name,opening_balance,note`؛ مبلغ به تومان، مثبت بدهکار و منفی بستانکار). هر ردیف یک `opening:` در دفتر می‌شود، تراکنشی است، و اجرای دوبارهٔ همان فایل مبلغ را جمع نمی‌کند.
@@ -261,8 +264,8 @@ python3 /opt/sans/run.py --import-players /opt/sans/players.csv
 **۲) سانس‌های واقعی و حضور** (پیشنهادی): به‌جای یک عدد کلی، هر بدهی به همان سانسی وصل می‌شود که برایش بوده، تا `/debt` و `/report` بتوانند نشست‌به‌نشست جواب بدهند.
 
 ```bash
-python3 /opt/sans/run.py --import-sessions /opt/sans/data/sessions.csv --dry-run
-python3 /opt/sans/run.py --import-sessions /opt/sans/data/sessions.csv \
+python3 run.py --import-sessions data/sessions.csv --dry-run
+python3 run.py --import-sessions data/sessions.csv \
   --alias "نام لیست=نام ذخیره‌شده" --allow-new "نام فرد تازه"
 ```
 
@@ -271,8 +274,8 @@ python3 /opt/sans/run.py --import-sessions /opt/sans/data/sessions.csv \
 **۳) مهمان‌ها روی حساب میزبان** (اختیاری، فقط یک بار): اگر نام مهمان‌ها را در فایل جداگانه دارید:
 
 ```bash
-python3 /opt/sans/run.py --migrate-guests /opt/sans/data/guest-links.csv --dry-run
-python3 /opt/sans/run.py --migrate-guests /opt/sans/data/guest-links.csv
+python3 run.py --migrate-guests data/guest-links.csv --dry-run
+python3 run.py --migrate-guests data/guest-links.csv
 ```
 
 ### قواعد ایمنی این ورود اطلاعات
@@ -304,8 +307,8 @@ python3 /opt/sans/run.py --migrate-guests /opt/sans/data/guest-links.csv
 
 ```bash
 systemctl --user stop sans-bot.service
-python3 /opt/sans/run.py --migrate-guests /opt/sans/data/guest-links.csv --dry-run
-python3 /opt/sans/run.py --migrate-guests /opt/sans/data/guest-links.csv
+python3 run.py --migrate-guests data/guest-links.csv --dry-run
+python3 run.py --migrate-guests data/guest-links.csv
 systemctl --user start sans-bot.service
 ```
 
@@ -347,7 +350,7 @@ systemctl --user start sans-bot.service
 
 ورود فایل تراکنشی است: هر خط نامعتبر باشد کل ورود برمی‌گردد. ورود تکراری همان فایل دوباره بدهی ایجاد نمی‌کند. تغییر ماندهٔ اولیهٔ واردشده مجاز نیست؛ اصلاح مالی را از ربات با دلیل ثبت کنید. نام کامل باید یکتا باشد؛ برای هم‌نام‌ها پسوند متمایز بگذارید. ورود اولیه تاریخچهٔ سانس‌های گذشته را بازسازی نمی‌کند؛ یک «ماندهٔ اولیه» با توضیح می‌سازد.
 
-**فایل واقعی اعضا را وارد Git نکنید.** بهتر است آن را در `/opt/sans/data/players.csv` که نادیده گرفته می‌شود نگهداری کنید و مسیر فرمان را مطابق آن تغییر دهید.
+**فایل واقعی اعضا را وارد Git نکنید.** بهتر است آن را در `data/players.csv` که نادیده گرفته می‌شود نگهداری کنید و مسیر فرمان را مطابق آن تغییر دهید.
 
 ## گردش کار ادمین
 
@@ -507,8 +510,8 @@ git diff --check
 ربات را متوقف کنید. مقصد بکاپ باید جدید باشد:
 
 ```bash
-python3 /opt/sans/run.py --backup /opt/sans/data/backup-2026-10-15.sqlite3
-python3 -m unittest discover -s /opt/sans/tests -t /opt/sans -v
+python3 run.py --backup data/backup-2026-10-15.sqlite3
+python3 -m unittest discover -s tests -t . -v
 ```
 
 بکاپ از API خود SQLite استفاده می‌کند تا WAL باعث نسخهٔ ناقص نشود. برای بازیابی، در حالت توقف از مسیر فایل بکاپ به‌عنوان `DATABASE_PATH` استفاده کنید. فایل‌های WAL قدیمی را کنار دیتابیس جایگزین‌شده رها نکنید.
@@ -517,13 +520,13 @@ python3 -m unittest discover -s /opt/sans/tests -t /opt/sans -v
 
 ## فایل‌های اصلی
 
-- `/opt/sans/app/schema.sql`: مدل SQLite
-- `/opt/sans/app/service.py`: قواعد مالی و اعتبارسنجی
-- `/opt/sans/app/bot.py`: گفتگو، دسترسی و تأییدها
-- `/opt/sans/app/turns.py`: جمع‌کردن پیام‌های پشت‌سرهم در یک نوبت
-- `/opt/sans/app/clients.py`: API بله و OpenAI-compatible
-- `/opt/sans/app/main.py`: polling، صف ارسال، CLI، ورود CSV و بکاپ
-- `/opt/sans/tests/test_sans.py`: تست‌های سناریویی
+- `app/schema.sql`: مدل SQLite
+- `app/service.py`: قواعد مالی و اعتبارسنجی
+- `app/bot.py`: گفتگو، دسترسی و تأییدها
+- `app/turns.py`: جمع‌کردن پیام‌های پشت‌سرهم در یک نوبت
+- `app/clients.py`: API بله و OpenAI-compatible
+- `app/main.py`: polling، صف ارسال، CLI، ورود CSV و بکاپ
+- `tests/test_sans.py`: تست‌های سناریویی
 
 مرجع API بله: <https://docs.bale.ai>؛ آدرس فراخوانی: `https://tapi.bale.ai/bot<TOKEN>/METHOD`.
 
