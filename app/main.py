@@ -16,13 +16,11 @@ from .config import Config, ROOT, load_env
 from .db import Database
 from .service import UserError, integer, normalize, text
 from .turns import TurnBuffer
-# SPEC-022: the workbook reader, the roster importer and the reconcile gate live
-# in their own module; the legacy snapshot path below only wrapper-calls them.
-from .backfill import (PERIOD, SESSION_HOUR, VENUE_COST, apply_payments,
-                       apply_sessions, format_guest_migration, format_payments,
-                       format_reconcile, format_sessions, migrate_guests, read_guest_links,
-                       read_plan, read_workbook, reconcile,
-                       workbook_amount, xlsx_rows)
+# SPEC-022: the roster importer and the guest migration live in their own
+# module.  SPEC-039 retired the workbook half of it.
+from .backfill import (SESSION_HOUR, VENUE_COST, apply_sessions,
+                       format_guest_migration, format_sessions, migrate_guests,
+                       read_guest_links, read_plan)
 
 LOG = logging.getLogger('sans')
 ACKNOWLEDGEMENT = 'پیامتان دریافت شد؛ در حال بررسی هستم…'
@@ -71,32 +69,6 @@ def instance_lock(database):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def _xlsx_rows(path):
-    """SPEC-022: the workbook reader now lives in ``app/backfill.py``."""
-    return xlsx_rows(path)
-
-
-def _workbook_amount(value, sessions, name):
-    """Return تومان for one snapshot row; the debt column is in هزار تومان.
-
-    SPEC-022 fixed this helper: it used to ignore the paid column, so a fully
-    paid row («ایلانلو», 1 attended and 1 paid) became 150,000 T of debt.
-    """
-    try:
-        return workbook_amount(value, sessions, 0, 150000)
-    except UserError as exc:
-        raise UserError(f'{exc} (ردیف {name})') from None
-
-
-def _read_xlsx_players(path):
-    """SPEC-022: read the snapshot columns into the legacy import shape."""
-    result = []
-    for row in read_workbook(path, 150000):
-        result.append({'name': row['name'], 'opening_balance': row['debt'],
-                       'note': f'بدهی تا {PERIOD}'})
-    return result
-
-
 def _read_csv_players(path):
     with path.open(encoding='utf-8-sig', newline='') as handle:
         reader = csv.DictReader(handle)
@@ -105,29 +77,21 @@ def _read_csv_players(path):
         return list(reader)
 
 
-def _backup_before_snapshot(db, digest):
-    destination = db.path.with_name(db.path.name + f'.before-xlsx-{digest[:12]}.sqlite3')
-    if destination.exists():
-        return destination
-    backup = sqlite3.connect(destination)
-    try:
-        db.conn.backup(backup)
-    finally:
-        backup.close()
-    return destination
-
-
 def import_players(db, path):
-    """Import CSV as before, or replace the opening-balance snapshot from XLSX atomically."""
+    """Import CSV opening balances, once per file digest.
+
+    SPEC-039: the ``.xlsx`` snapshot branch is gone.  It existed to load one
+    operator's spreadsheet and refused nothing a public user could provide.
+    """
     path = Path(path)
+    if path.suffix.lower() == '.xlsx':
+        raise UserError('ورود فایل اکسل حذف شده است؛ فایل را به CSV با ستون‌های '
+                        'name,opening_balance,note تبدیل کنید.')
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    is_xlsx = path.suffix.lower() == '.xlsx'
-    import_key = ('xlsx-import:' if is_xlsx else 'import:') + digest
+    import_key = 'import:' + digest
     if db.setting(import_key):
         return 0
-    rows = _read_xlsx_players(path) if is_xlsx else _read_csv_players(path)
-    if is_xlsx:
-        _backup_before_snapshot(db, digest)
+    rows = _read_csv_players(path)
     with db.conn:
         seen = set()
         prepared = []
@@ -141,31 +105,24 @@ def import_players(db, path):
             note = text(row.get('note', ''), 'توضیح', False)
             prepared.append((name, norm, amount, note))
 
-        if is_xlsx:
-            # This is a new accounting snapshot. Remove only prior imported opening
-            # entries; sessions, receipts, and all other financial history survive.
-            db.execute("DELETE FROM ledger WHERE source LIKE 'opening:%'")
-            db.execute("DELETE FROM settings WHERE key LIKE 'opening:%'")
-
         for name, norm, amount, note in prepared:
             player = db.one('SELECT * FROM players WHERE normalized_name=?', (norm,))
             if not player:
                 ident = db.execute('INSERT INTO players(name,normalized_name,note) VALUES (?,?,?)', (name, norm, note)).lastrowid
             else:
                 ident = player['id']
-            if not is_xlsx:
-                previous = db.setting(f'opening:{ident}', '')
-                if previous:
-                    if int(previous) != amount:
-                        raise UserError(f'ماندهٔ اولیهٔ {name} قبلاً ثبت شده؛ تغییر را با اصلاح حساب انجام دهید.')
-                    continue
-                if db.one('SELECT 1 FROM ledger WHERE player_id=?', (ident,)):
-                    raise UserError(f'حساب {name} گردش دارد؛ برای اضافه‌کردن بدهی از اصلاح حساب استفاده کنید.')
+            previous = db.setting(f'opening:{ident}', '')
+            if previous:
+                if int(previous) != amount:
+                    raise UserError(f'ماندهٔ اولیهٔ {name} قبلاً ثبت شده؛ تغییر را با اصلاح حساب انجام دهید.')
+                continue
+            if db.one('SELECT 1 FROM ledger WHERE player_id=?', (ident,)):
+                raise UserError(f'حساب {name} گردش دارد؛ برای اضافه‌کردن بدهی از اصلاح حساب استفاده کنید.')
             if amount:
                 db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',
-                           (ident, amount, note if is_xlsx else 'ماندهٔ اولیه؛ ' + note, f'opening:{ident}'))
+                           (ident, amount, 'ماندهٔ اولیه؛ ' + note, f'opening:{ident}'))
             db.set_setting(f'opening:{ident}', amount)
-            db.audit('cli', 'import_xlsx' if is_xlsx else 'import_player',
+            db.audit('cli', 'import_player',
                      {'player': ident, 'opening_balance': amount})
         db.set_setting(import_key, 'done')
     return len(rows)
@@ -326,29 +283,24 @@ def run(db, config):
 def build_parser():
     """Build the argument parser used by every command-line entry point.
 
-    The commands exclude each other, but the SPEC-022 modifiers do not:
-    ``--workbook-overrides`` has to travel with ``--import-payments`` and
-    ``--reconcile``, which both read the workbook it corrects.
+    SPEC-039: the workbook flags (``--reconcile``, ``--import-payments``,
+    ``--workbook-overrides``) are gone with the importer they served, so no
+    option is command-specific any more.
     """
     parser = argparse.ArgumentParser(description='Bale football-session manager')
     parser.add_argument('--database', type=Path, help='SQLite path (overrides DATABASE_PATH)')
     commands = parser.add_mutually_exclusive_group()
     commands.add_argument('--init', action='store_true', help='Initialize database, no credentials needed')
-    commands.add_argument('--import-players', type=Path, metavar='CSV_OR_XLSX')
+    commands.add_argument('--import-players', type=Path, metavar='CSV',
+                          help='Import opening balances from a CSV (name,opening_balance,note)')
     commands.add_argument('--import-sessions', type=Path, metavar='ROSTER_CSV',
                           help='SPEC-022: create/repair the real sessions and apply the roster')
     commands.add_argument('--migrate-guests', type=Path, metavar='LINKS_CSV',
                           help='SPEC-024: move explicit guests onto their host account')
-    commands.add_argument('--import-payments', type=Path, metavar='WORKBOOK_XLSX',
-                          help='SPEC-022: bring every payment to the workbook column')
-    commands.add_argument('--reconcile', type=Path, metavar='WORKBOOK_XLSX',
-                          help='SPEC-022: read-only diff of the ledger against the workbook; writes nothing')
     commands.add_argument('--backup', type=Path, metavar='DESTINATION', help='Create consistent SQLite backup')
     commands.add_argument('--discover-ids', action='store_true', help='Show IDs from recent messages; only BALE_BOT_TOKEN needed')
     commands.add_argument('--logs', type=int, nargs='?', const=30, metavar='N', help='Show last N agent trace logs from database')
-    # SPEC-022 modifiers belong to the command above them, not to the group.
-    parser.add_argument('--workbook-overrides', type=Path, metavar='CSV',
-                        help='SPEC-022: apply approved attendance/debt corrections')
+    # SPEC-022 modifiers: they describe the roster, not the database.
     parser.add_argument('--dry-run', action='store_true',
                         help='SPEC-022: report what would change and roll it back')
     parser.add_argument('--alias', action='append', default=[], metavar='ROSTER=STORED',
@@ -364,16 +316,6 @@ def build_parser():
     return parser
 
 
-def check_modifiers(args):
-    """Refuse a SPEC-022 modifier that the chosen command cannot use.
-
-    ``--workbook-overrides`` only means something next to the workbook reader;
-    on its own it would silently fall through to starting the bot.
-    """
-    if args.workbook_overrides and not (args.import_payments or args.reconcile):
-        raise UserError('--workbook-overrides فقط همراه --import-payments یا --reconcile معنا دارد.')
-
-
 def main():
     os.umask(0o077)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -384,7 +326,6 @@ def main():
     if not path.is_absolute():
         path = ROOT / path
     try:
-        check_modifiers(args)
         if args.discover_ids:
             token = os.getenv('BALE_BOT_TOKEN', '').strip()
             if not token:
@@ -433,17 +374,6 @@ def main():
                     report = migrate_guests(db, read_guest_links(args.migrate_guests),
                                             dry_run=args.dry_run)
                     print(format_guest_migration(report))
-                elif args.import_payments:
-                    rows = read_workbook(args.import_payments, args.session_fee, args.workbook_overrides)
-                    report = apply_payments(db, rows, args.session_fee, dry_run=args.dry_run,
-                                            aliases=aliases(args.alias), allow_new=args.allow_new)
-                    print(format_payments(report))
-                elif args.reconcile:
-                    rows = read_workbook(args.reconcile, args.session_fee, args.workbook_overrides)
-                    result = reconcile(db, rows, args.session_fee)
-                    print(format_reconcile(result))
-                    if not result['ok']:
-                        raise UserError('حساب‌ها با اکسل نمی‌خوانند؛ جدول بالا را ببینید.')
                 elif args.backup:
                     destination = args.backup.resolve()
                     if destination.exists():

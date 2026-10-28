@@ -1,8 +1,18 @@
 # SPEC-022: Real sessions instead of a snapshot, reconciled against the workbook
 
-Status: verified
+Status: superseded
 Owner: agent
 Created: 2026-10-24
+
+> **Superseded by SPEC-039 (2026-10-29).** This specification shipped and closed
+> its migration on 2026-10-25. SPEC-039 then removed the workbook reader, the
+> payments importer (`--import-payments`), the reconcile gate (`--reconcile`)
+> and the override file (`--workbook-overrides`), because they served one
+> one-off import and could no longer pass against a ledger that had moved past
+> their cut-off. The roster importer (`--import-sessions`) and everything else
+> in this document remain in force; the criteria marked *retired* below no
+> longer have a test. The body is kept as the historical record of how the
+> 1405 balances were brought into the ledger.
 
 ## Problem
 
@@ -148,7 +158,11 @@ visible as its own ledger row.
 
 ## Acceptance Criteria
 
-- [x] AC-001: The workbook reader derives `debt = (attended − paid) × fee` and refuses a row whose stated debt disagrees, naming the row.
+Retired criteria are kept for the record but no longer map to a test: SPEC-039
+removed the workbook reader, the payments importer and the reconcile gate, and
+the tests that covered them went with them. See `039-retire-workbook-import.md`.
+
+- [x] ~~AC-001~~ (retired, SPEC-039): The workbook reader derives `debt = (attended − paid) × fee` and refuses a row whose stated debt disagrees, naming the row.
 - [x] AC-002: The wide and the long roster forms produce the same sessions and the same attendance.
 - [x] AC-003: A roster date that is not a Friday is rejected before anything is written.
 - [x] AC-004: Each planned Friday becomes a session with the canonical title, `when_text`, a 16:30 Tehran `session_at`, `venue_cost` and `person_fee`.
@@ -158,18 +172,17 @@ visible as its own ledger row.
 - [x] AC-008: A person dropped from the roster loses the attendance row and gets a reversal ledger row; no ledger row is deleted.
 - [x] AC-009: A roster name that strongly resembles an existing player, without an alias or `--allow-new`, aborts the import with nothing written.
 - [x] AC-010: An alias renames the stored short name, keeps its id and its ledger history, and is idempotent.
-- [x] AC-011: Payments are corrected to the workbook column, and running the import twice changes nothing the second time.
-- [x] AC-012: `reconcile` prints a per-person attended/paid/balance diff and writes nothing.
-- [x] AC-013: `reconcile` is `ok` and its totals equal the sheet when the ledger matches every row.
+- [x] ~~AC-011~~ (retired, SPEC-039): Payments are corrected to the workbook column, and running the import twice changes nothing the second time.
+- [x] ~~AC-012~~ (retired, SPEC-039): `reconcile` prints a per-person attended/paid/balance diff and writes nothing.
+- [x] ~~AC-013~~ (retired, SPEC-039): `reconcile` is `ok` and its totals equal the sheet when the ledger matches every row.
 - [x] AC-014: `--dry-run` reports the same plan and leaves the database unchanged.
-- [x] AC-015: The legacy snapshot importer no longer overstates a fully paid row and records the sheet's period.
-- [x] AC-016: An approved override file replaces the workbook row it names and may add a person the sheet does not list, under the same `debt = (attended − paid) × fee` rule.
-- [x] AC-017: An override whose stated debt disagrees with its own attended/paid slots stops the whole import instead of choosing one.
-- [x] AC-018: `--workbook-overrides` is accepted next to `--import-payments` and `--reconcile`, and is refused when no workbook command can use it.
+- [x] ~~AC-015~~ (retired, SPEC-039): The legacy snapshot importer no longer overstates a fully paid row and records the sheet's period.
+- [x] ~~AC-016~~ (retired, SPEC-039): An approved override file replaces the workbook row it names and may add a person the sheet does not list, under the same `debt = (attended − paid) × fee` rule.
+- [x] ~~AC-017~~ (retired, SPEC-039): An override whose stated debt disagrees with its own attended/paid slots stops the whole import instead of choosing one.
+- [x] ~~AC-018~~ (retired, SPEC-039): `--workbook-overrides` is accepted next to `--import-payments` and `--reconcile`, and is refused when no workbook command can use it.
 
 ## Test Mapping
 
-- AC-001 -> `tests/test_backfill.py::WorkbookTests::test_debt_is_the_formula_and_a_mismatch_names_the_row`
 - AC-002 -> `tests/test_backfill.py::PlanTests::test_wide_and_long_rosters_agree`
 - AC-003 -> `tests/test_backfill.py::PlanTests::test_a_non_friday_date_is_rejected`
 - AC-004 -> `tests/test_backfill.py::SessionImportTests::test_creates_the_ten_fridays_with_their_own_cost_and_fee`
@@ -179,14 +192,7 @@ visible as its own ledger row.
 - AC-008 -> `tests/test_backfill.py::SessionImportTests::test_removing_a_player_records_a_reversal`
 - AC-009 -> `tests/test_backfill.py::NameTests::test_an_ambiguous_name_fails_closed`
 - AC-010 -> `tests/test_backfill.py::NameTests::test_an_alias_renames_the_stored_name_and_keeps_history`
-- AC-011 -> `tests/test_backfill.py::PaymentTests::test_payments_follow_the_workbook_and_are_idempotent`
-- AC-012 -> `tests/test_backfill.py::ReconcileTests::test_reports_differences_without_writing`
-- AC-013 -> `tests/test_backfill.py::ReconcileTests::test_is_green_when_every_row_matches`
 - AC-014 -> `tests/test_backfill.py::SessionImportTests::test_dry_run_leaves_the_database_unchanged`
-- AC-015 -> `tests/test_sans.py::OperationalTests::test_xlsx_snapshot_uses_fixed_note_and_session_fallback`
-- AC-016 -> `tests/test_backfill.py::WorkbookTests::test_explicit_overrides_replace_rows_and_can_add_approved_player`
-- AC-017 -> `tests/test_backfill.py::WorkbookTests::test_an_override_with_inconsistent_debt_fails_closed`
-- AC-018 -> `tests/test_backfill.py::CliTests::test_the_override_file_is_a_modifier_not_a_command`
 
 ## Safety Constraints
 

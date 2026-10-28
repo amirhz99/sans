@@ -1,50 +1,25 @@
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
-from zipfile import ZipFile
+from unittest.mock import patch
 
-from app.backfill import (apply_payments, apply_sessions, format_reconcile, marked_sessions,
-                          migrate_guests, paid_total, read_guest_links, read_plan,
-                          read_workbook, reconcile)
+from app import backfill
+from app.backfill import (apply_sessions, marked_sessions, migrate_guests, paid_total,
+                          read_guest_links, read_plan)
 from app.db import Database
-from app.main import build_parser, check_modifiers
+from app.main import build_parser
 from app.service import Service, UserError
+from tests.helpers import write_xlsx
 
 # The ten Fridays the operator confirmed for 1405 (SPEC-022).
 TEN = ['۸ خرداد', '۱۵ خرداد', '۲۲ خرداد', '۲۹ خرداد',
        '۵ تیر', '۱۲ تیر', '۱۹ تیر', '۲۶ تیر', '۲ مرداد', '۱۶ مرداد']
 HEADER = ['نام', 'جلسات آمده', 'جلسات پرداخت شده', 'مجموع  بدهکاری']
-SHEET_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-
-
-def write_xlsx(path, rows):
-    """Write a minimal XLSX: text cells are shared strings, numbers are values."""
-    shared, body = [], []
-    for index, row in enumerate(rows, 1):
-        cells = []
-        for position, value in enumerate(row):
-            if value is None or value == '':
-                continue
-            column = chr(ord('A') + position)
-            if isinstance(value, (int, float)):
-                cells.append(f'<c r="{column}{index}"><v>{value}</v></c>')
-            else:
-                if value not in shared:
-                    shared.append(value)
-                cells.append(f'<c r="{column}{index}" t="s"><v>{shared.index(value)}</v></c>')
-        body.append(f'<row r="{index}">' + ''.join(cells) + '</row>')
-    with ZipFile(path, 'w') as archive:
-        archive.writestr('xl/sharedStrings.xml',
-                         f'<?xml version="1.0" encoding="UTF-8"?><sst xmlns="{SHEET_NS}">'
-                         + ''.join(f'<si><t>{value}</t></si>' for value in shared) + '</sst>')
-        archive.writestr('xl/worksheets/sheet1.xml',
-                         f'<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="{SHEET_NS}">'
-                         '<sheetData>' + ''.join(body) + '</sheetData></worksheet>')
-    return path
 
 
 class BackfillCase(unittest.TestCase):
-    """Shared temporary database, workbook writer and roster writer."""
+    """Shared temporary database, roster writer and session builder."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -60,9 +35,6 @@ class BackfillCase(unittest.TestCase):
         path = Path(self.temp.name) / name
         path.write_text(contents, encoding='utf-8')
         return path
-
-    def workbook(self, rows, name='account.xlsx'):
-        return write_xlsx(Path(self.temp.name) / name, rows)
 
     def roster(self, marks, name='roster.csv', labels=None):
         """``marks`` maps a name to ``{label: guests}``; a missing label is absent."""
@@ -112,33 +84,6 @@ class BackfillCase(unittest.TestCase):
             self.db.one('SELECT COUNT(*) n FROM ledger')['n'],
             self.db.one('SELECT COALESCE(SUM(amount),0) n FROM ledger')['n'],
         )
-class WorkbookTests(BackfillCase):
-    def test_explicit_overrides_replace_rows_and_can_add_approved_player(self):
-        workbook = self.workbook([HEADER, ['علی', 3, 1, 300], ['رضا', 2, 0, 300]])
-        overrides = self.file('overrides.csv',
-                             'name,attended,paid,debt\nعلی,4,1,450\nسارا,7,2,750\n')
-        rows = read_workbook(workbook, 150000, overrides)
-        self.assertEqual([(row['name'], row['attended'], row['paid'], row['debt']) for row in rows],
-                         [('علی', 4, 1, 450000), ('رضا', 2, 0, 300000),
-                          ('سارا', 7, 2, 750000)])
-
-    def test_an_override_with_inconsistent_debt_fails_closed(self):
-        workbook = self.workbook([HEADER, ['علی', 3, 1, 300]])
-        overrides = self.file('bad-overrides.csv', 'name,attended,paid,debt\nعلی,4,1,300\n')
-        with self.assertRaises(UserError):
-            read_workbook(workbook, 150000, overrides)
-
-    def test_debt_is_the_formula_and_a_mismatch_names_the_row(self):
-        path = self.workbook([HEADER, ['مهیار', 10, 2, 1200], ['ایلانلو', 1, 1, ''],
-                              ['قامتی', 1, 0, '']])
-        rows = read_workbook(path, 150000)
-        self.assertEqual([row['debt'] for row in rows], [1200000, 0, 150000])
-        self.assertEqual(rows[1]['paid'], 1)
-        bad = self.workbook([HEADER, ['مهیار', 10, 2, 1300]], 'bad.xlsx')
-        with self.assertRaises(UserError) as caught:
-            read_workbook(bad, 150000)
-        self.assertIn('مهیار', str(caught.exception))
-        self.assertIn('1,200,000', str(caught.exception))
 
 
 class PlanTests(BackfillCase):
@@ -304,135 +249,54 @@ class NameTests(BackfillCase):
         self.assertEqual(self.db.one('SELECT COUNT(*) n FROM players')['n'], 1)
 
 
-class PaymentTests(BackfillCase):
-    def test_payments_follow_the_workbook_and_are_idempotent(self):
-        ali = self.player('علی')
-        reza = self.player('رضا')
-        with self.db.conn:
-            # The database recorded more payment than the sheet knows about.
-            self.db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',
-                            (ali['id'], -450000, 'پرداخت قبلی', 'proposal:old'))
-        path = self.workbook([HEADER, ['علی', 3, 1, 300], ['رضا', 1, 0, 150]])
-        report = apply_payments(self.db, read_workbook(path, 150000), 150000)
-        self.assertEqual(report['adjusted'], [{'name': 'علی', 'amount': 300000}])
-        self.assertEqual(report['unchanged'], 1)
-        row = self.db.one('SELECT * FROM ledger WHERE source=?', (f'backfill:paid:{ali["id"]}',))
-        self.assertEqual(row['amount'], 300000)
-        self.assertIn('اصلاح پرداخت', row['note'])
-        self.assertEqual(self.service.balance(ali['id']), -150000)
-        self.assertEqual(self.service.balance(reza['id']), 0)
-        fingerprint = self.counts()
-        second = apply_payments(self.db, read_workbook(path, 150000), 150000)
-        self.assertEqual((second['adjusted'], second['unchanged']), ([], 2))
-        self.assertEqual(self.counts(), fingerprint)
+class CliTests(BackfillCase):
+    """SPEC-039: the workbook flags are gone, the roster flags are not."""
 
-    def test_an_opening_snapshot_row_is_not_read_as_a_payment(self):
-        ali = self.player('علی')
-        with self.db.conn:
-            # A legacy ``--import-players`` snapshot: a debt, never a payment.
-            self.db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',
-                            (ali['id'], 1200000, 'بدهی تا ۱۶ مرداد ۱۴۰۵', f'opening:{ali["id"]}'))
-        path = self.workbook([HEADER, ['علی', 2, 1, 150]])
-        report = apply_payments(self.db, read_workbook(path, 150000), 150000)
-        self.assertEqual([item['amount'] for item in report['adjusted']], [-150000])
-        self.assertEqual(self.service.balance(ali['id']), 1200000 - 150000)
-        self.assertEqual(paid_total(self.db, ali['id']), 150000)
-
-    def test_a_missing_player_is_created_from_the_sheet(self):
-        path = self.workbook([HEADER, ['ناشناس', 1, 0, '']])
-        report = apply_payments(self.db, read_workbook(path, 150000), 150000)
-        self.assertEqual([item['name'] for item in report['created']], ['ناشناس'])
-        player = self.service.player('ناشناس')
-        self.assertEqual(self.service.balance(player['id']), 0)
-
-    def test_an_ambiguous_name_stops_the_payment_import(self):
-        self.player('علی رضایی')
-        path = self.workbook([HEADER, ['علی', 1, 0, '']])
-        with self.assertRaises(UserError) as caught:
-            apply_payments(self.db, read_workbook(path, 150000), 150000)
-        self.assertIn('علی رضایی', str(caught.exception))
-        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM players')['n'], 1)
-        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM ledger')['n'], 0)
-
-
-class ReconcileTests(BackfillCase):
-    def seeded(self, marks):
-        """One finalized session with charges; returns its id."""
-        return self.session('سانس ۸ خرداد', '۸ خرداد ۱۴۰۵', players=marks)['id']
-
-    def pay(self, player_id, amount, source):
-        with self.db.conn:
-            self.db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',
-                            (player_id, amount, 'پرداخت', source))
-
-    def test_is_green_when_every_row_matches(self):
-        session_id = self.seeded([('علی رضایی', 1), ('رضا محمدی', 0)])
-        ali, reza = self.player('علی رضایی')['id'], self.player('رضا محمدی')['id']
-        self.pay(ali, -150000, f'test:pay:{ali}')
-        self.pay(reza, -150000, f'test:pay:{reza}')
-        path = self.workbook([HEADER, ['علی رضایی', 2, 1, 150], ['رضا محمدی', 1, 1, 0]])
-        result = reconcile(self.db, read_workbook(path, 150000), 150000, session_ids=[session_id])
-        self.assertEqual([row['attended'] for row in result['rows']], [2, 1])
-        self.assertEqual([row['diff'] for row in result['rows']], [0, 0])
-        self.assertEqual(result['sheet_total'], 150000)
-        self.assertEqual(result['ledger_total'], 150000)
-        self.assertTrue(result['ok'])
-        self.assertIn('می‌خوانند', format_reconcile(result))
-
-    def test_reports_differences_without_writing(self):
-        session_id = self.seeded([('علی رضایی', 0)])
-        before = self.counts()
-        path = self.workbook([HEADER, ['علی رضایی', 3, 2, 150], ['رضا محمدی', 1, 0, '']])
-        result = reconcile(self.db, read_workbook(path, 150000), 150000, session_ids=[session_id])
-        self.assertFalse(result['ok'])
-        self.assertEqual(result['missing'], ['رضا محمدی'])
-        self.assertEqual(result['rows'][0]['attended'], 1)
-        self.assertEqual(result['rows'][0]['sheet_attended'], 3)
-        self.assertEqual(result['rows'][0]['paid'], 0)
-        self.assertEqual(result['rows'][0]['sheet_paid'], 300000)
-        text = format_reconcile(result)
-        self.assertIn('علی رضایی', text)
-        self.assertIn('رضا محمدی', text)
-        self.assertIn('اختلاف هست', text)
-        self.assertEqual(self.counts(), before)
-
-    def test_a_player_outside_the_sheet_keeps_the_gate_red(self):
-        session_id = self.seeded([('علی رضایی', 0), ('سارا کریمی', 0)])
-        path = self.workbook([HEADER, ['علی رضایی', 1, 0, 150]])
-        result = reconcile(self.db, read_workbook(path, 150000), 150000, session_ids=[session_id])
-        self.assertFalse(result['ok'])
-        self.assertEqual(result['extra'], [{'name': 'سارا کریمی', 'balance': 150000}])
-        self.assertIn('خارج از اکسل', format_reconcile(result))
-        self.assertEqual(result['ledger_total'], 300000)
-
-    def test_marked_sessions_narrow_the_count(self):
-        first = self.seeded([('علی رضایی', 0)])
-        self.session('سانس ۱۵ خرداد', '۱۵ خرداد ۱۴۰۵', players=[('علی رضایی', 0)])
-        rows = read_workbook(self.workbook([HEADER, ['علی رضایی', 1, 0, 150]]), 150000)
-        marked = reconcile(self.db, rows, 150000, session_ids=[first])
-        self.assertEqual(marked['rows'][0]['attended'], 1)
-        self.assertEqual(marked['ledger_total'], 300000)
-        unmarked = reconcile(self.db, rows, 150000)
-        self.assertEqual(unmarked['rows'][0]['attended'], 2)
-        self.assertFalse(unmarked['ok'])
-        # No import has run in this database, so nothing is marked yet.
-        self.assertEqual(marked_sessions(self.db), [])
-
-
-class CliTests(unittest.TestCase):
-    def test_the_override_file_is_a_modifier_not_a_command(self):
-        """``--workbook-overrides`` must travel with the command it corrects."""
+    def test_the_workbook_flags_are_gone(self):
         parser = build_parser()
-        for command in ('--reconcile', '--import-payments'):
-            parsed = parser.parse_args([command, 'account.xlsx',
-                                        '--workbook-overrides', 'overrides.csv'])
-            self.assertEqual(parsed.workbook_overrides, Path('overrides.csv'))
-            check_modifiers(parsed)
-        parsed = parser.parse_args(['--import-sessions', 'roster.csv', '--dry-run'])
-        self.assertIsNone(parsed.workbook_overrides)
+        for flag in ('--reconcile', '--import-payments', '--workbook-overrides'):
+            with self.assertRaises(SystemExit) as caught, \
+                    patch('sys.stderr', new_callable=StringIO):
+                parser.parse_args([flag, 'account.xlsx'])
+            self.assertEqual(caught.exception.code, 2, flag)
+
+    def test_the_roster_and_guest_flags_survive(self):
+        parser = build_parser()
+        self.assertEqual(parser.parse_args(['--import-sessions', 'roster.csv']).import_sessions,
+                         Path('roster.csv'))
+        self.assertEqual(parser.parse_args(['--migrate-guests', 'links.csv']).migrate_guests,
+                         Path('links.csv'))
+        self.assertEqual(parser.parse_args(['--import-players', 'p.csv']).import_players,
+                         Path('p.csv'))
+        self.assertTrue(parser.parse_args(['--init']).init)
+        # The roster modifiers still travel with the roster command.
+        parsed = parser.parse_args(['--import-sessions', 'roster.csv', '--dry-run',
+                                    '--venue-cost', '3000000', '--alias', 'a=b'])
         self.assertTrue(parsed.dry_run)
-        with self.assertRaises(UserError):
-            check_modifiers(parser.parse_args(['--workbook-overrides', 'overrides.csv']))
+        self.assertEqual(parsed.venue_cost, 3000000)
+        self.assertEqual(parsed.alias, ['a=b'])
+
+    def test_backfill_module_has_no_workbook_symbols(self):
+        for name in ('xlsx_rows', 'read_workbook', 'workbook_amount', 'read_overrides',
+                     'apply_payments', 'reconcile', 'format_reconcile', 'format_payments'):
+            self.assertFalse(hasattr(backfill, name), name)
+        # The reusable half is still exported.
+        for name in ('read_plan', 'apply_sessions', 'format_sessions',
+                     'read_guest_links', 'migrate_guests', 'format_guest_migration'):
+            self.assertTrue(hasattr(backfill, name), name)
+        # SPEC-039: the hand-rolled XLSX reader took these with it.
+        source = Path(backfill.__file__).read_text(encoding='utf-8')
+        self.assertNotIn('zipfile', source)
+        self.assertNotIn('xml.etree', source)
+
+    def test_financial_surface_is_untouched(self):
+        """A dry-run roster import still reports the same thing and writes nothing."""
+        self.session('سانس ۸ خرداد', '۸ خرداد ۱۴۰۵', players=[('علی رضایی', 0)])
+        before = self.counts()
+        plan = read_plan(self.roster({'علی رضایی': {'۸ خرداد': 0}}), '16:30')
+        report = apply_sessions(self.db, plan, dry_run=True)
+        self.assertTrue(report['dry_run'])
+        self.assertEqual(self.counts(), before)
 
 class GuestLinkTests(BackfillCase):
     def test_links_are_explicit_and_mostly_natural(self):
@@ -542,23 +406,3 @@ class GuestMigrationTests(BackfillCase):
         with self.assertRaises(UserError):
             migrate_guests(self.db, [{'guest': 'ناشناس', 'host': 'میزبان'}])
         self.assertEqual(self.counts(), before)
-
-
-class GuestReconcileTests(BackfillCase):
-    """SPEC-024: the workbook still lists the guest, so the row folds on the host."""
-
-    def test_reconcile_folds_a_migrated_guest_into_its_host(self):
-        session = self.session('سانس مشترک', 'مشترک', players=[('میزبان', 0), ('مهمان', 0)])
-        path = self.workbook([HEADER, ['میزبان', 1, 0, 150], ['مهمان', 1, 0, 150]])
-        rows = read_workbook(path, 150000)
-        before = reconcile(self.db, rows, 150000, session_ids=[session['id']])
-        self.assertTrue(before['ok'])
-        migrate_guests(self.db, [{'guest': 'مهمان', 'host': 'میزبان'}])
-        after = reconcile(self.db, rows, 150000, session_ids=[session['id']])
-        self.assertEqual(after['missing'], [])
-        self.assertEqual(after['extra'], [])
-        self.assertEqual(after['rows'][0]['name'], 'میزبان')
-        self.assertEqual((after['rows'][0]['attended'], after['rows'][0]['sheet_attended']), (2, 2))
-        self.assertEqual(after['sheet_total'], 300000)
-        self.assertEqual(after['ledger_total'], 300000)
-        self.assertTrue(after['ok'])

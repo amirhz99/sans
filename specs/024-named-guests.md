@@ -52,7 +52,7 @@ unchanged by the migration.
 - [x] AC-003: The ledger total does not change and no extra share is invented.
 - [x] AC-004: Repeating the migration makes no further changes; `--dry-run`
   writes nothing.
-- [x] AC-005: `--reconcile` still passes after the migration because a workbook
+- [x] ~~AC-005~~ (retired, SPEC-039): `--reconcile` still passes after the migration because a workbook
   row of a migrated guest is counted on its host.
 - [x] AC-006: `guest_names` is optional; `len(names) > guests`, an empty name, or
   a duplicate name fails closed with no side effect.
@@ -69,7 +69,8 @@ unchanged by the migration.
 - AC-003 -> `tests/test_backfill.py::GuestMigrationTests::test_missing_host_is_created_in_guest_session`
 - AC-004 -> `tests/test_backfill.py::GuestMigrationTests::test_repeating_the_migration_changes_nothing`
   `test_a_dry_run_writes_nothing`
-- AC-005 -> `tests/test_backfill.py::GuestReconcileTests::test_reconcile_folds_a_migrated_guest_into_its_host`
+- AC-005: retired by SPEC-039 (the criterion described the workbook reconcile,
+  which no longer exists; the guest-to-host fold is covered by AC-001/AC-002).
 - AC-006 -> `tests/test_sans.py::GuestNameTests`
 - AC-007 -> `tests/test_sans.py::GuestNameTests::test_removing_attendance_removes_guest_names`
   `tests/test_sans.py::GuestOwnShareTests`

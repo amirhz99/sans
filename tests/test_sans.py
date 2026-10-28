@@ -27,7 +27,7 @@ from app.prompt_loader import PromptLoader
 from app.service import (ADMIN_ACTIONS, Service, UserError, integer, normalize,
                          normalize_phone, parse_session_datetime)
 from app.turns import TurnBuffer
-from tests.test_backfill import write_xlsx
+from tests.helpers import write_xlsx
 
 
 class FakeAI:
@@ -1162,26 +1162,27 @@ class OperationalTests(BaseCase):
             import_players(self.db, path)
         self.assertEqual(len(self.db.all('SELECT * FROM players')), 2)
 
-    def test_xlsx_snapshot_uses_fixed_note_and_session_fallback(self):
-        # SPEC-022: the fixture is generated here, so this test never skips and
-        # the fully paid row is no longer overstated by one fee.
+    def test_xlsx_player_import_is_refused(self):
+        """SPEC-039: the workbook snapshot branch is gone, so refuse it early.
+
+        The refusal must happen before any write: a caller who hands back the
+        old spreadsheet gets a clear message, not a half-applied import.
+        """
         source = Path(self.temp.name) / 'account.xlsx'
-        write_xlsx(source, (('نام   (تا 16 مرداد - 10 جلسه)', 'جلسات آمده',
-                             'جلسات پرداخت شده', 'مجموع  بدهکاری'),
-                            ('مهیار قهرمان زاده', 10, 2, 1200),
-                            ('ایلانلو', 1, 1, None),
-                            ('قامتی', 1, 0, None)))
-        self.assertEqual(import_players(self.db, source), 3)
-        self.assertEqual(import_players(self.db, source), 0)
-        self.assertEqual(self.db.one('SELECT COUNT(*) n FROM players')['n'], 3)
-        self.assertEqual(self.db.one("SELECT COUNT(*) n FROM ledger WHERE source LIKE 'opening:%'")['n'], 2)
-        self.assertEqual(self.db.one('SELECT COALESCE(SUM(amount),0) n FROM ledger')['n'], 1350000)
-        self.assertEqual(self.db.one("SELECT COUNT(*) n FROM ledger WHERE note != 'بدهی تا ۱۶ مرداد ۱۴۰۵'")['n'], 0)
-        # The paid column is respected: one attended and one paid session is zero.
-        self.assertFalse(self.db.all(
-            "SELECT 1 FROM ledger l JOIN players p ON p.id=l.player_id WHERE p.name='ایلانلو'"))
-        backup = self.path.with_name(self.path.name + '.before-xlsx-')
-        self.assertTrue(any(p.name.startswith(backup.name) for p in self.path.parent.iterdir()))
+        write_xlsx(source, (('نام', 'جلسات آمده', 'جلسات پرداخت شده', 'مجموع  بدهکاری'),
+                            ('مهیار', 10, 2, 1200)))
+        self.seed()
+        before = (self.db.one('SELECT COUNT(*) n FROM players')['n'],
+                  self.db.one('SELECT COUNT(*) n FROM ledger')['n'])
+        with self.assertRaises(UserError) as caught:
+            import_players(self.db, source)
+        self.assertIn('CSV', str(caught.exception))
+        after = (self.db.one('SELECT COUNT(*) n FROM players')['n'],
+                 self.db.one('SELECT COUNT(*) n FROM ledger')['n'])
+        self.assertEqual(after, before)
+        # No import-side backup file is created for a refused path either.
+        self.assertFalse(any(p.name.startswith(self.path.name + '.before-xlsx-')
+                             for p in self.path.parent.iterdir()))
 
     def test_duplicate_names_in_import_roll_back(self):
         path = self.csv('name,opening_balance,note\nعلي,100,\nعلی,200,\n')

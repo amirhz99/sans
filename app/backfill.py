@@ -1,26 +1,33 @@
-"""Import real sessions from the operator's roster and reconcile the workbook.
+"""Import real sessions from the operator's roster and migrate named guests.
 
-SPEC-022.  ``football-account.xlsx`` is the reference document for the period up
-to 16 Mordad 1405: it holds the sessions attended, the sessions paid and the
-debt of every person.  This module turns that reference into ordinary sessions,
-attendance rows and ledger entries, and it never deletes financial history — a
-correction is always its own ledger row with its own ``source``.
+SPEC-022 introduced this module to turn a spreadsheet of the 1405 season into
+ordinary sessions, attendance rows and ledger entries.  SPEC-039 retired the
+spreadsheet half: the workbook reader, the payments importer and the reconcile
+gate existed to close a single migration, which has since run, and they can no
+longer pass against a ledger that has moved past their cut-off.
+
+What remains is general and reusable for any club:
+
+- ``read_plan``/``apply_sessions`` — create and repair real sessions from a
+  roster CSV (``--import-sessions``).
+- ``read_guest_links``/``migrate_guests`` — move explicit named guests onto
+  their host's account (``--migrate-guests``).
+
+The module never deletes financial history — a correction is always its own
+ledger row with its own ``source``.
 """
 
 import csv
 import json
 import re
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from xml.etree import ElementTree as ET
-from zipfile import ZipFile
 
 from . import jalali
-from .service import (TEHRAN, Service, UserError, integer, normalize,
+from .service import (TEHRAN, Service, UserError, normalize,
                       parse_session_datetime, text)
 
-# Fallback defaults used when a backfill workbook row does not carry a hall.
+# Fallback defaults used when a roster row does not carry a hall.
 # These are placeholders: pass ``--venue-cost`` and edit the location (or set
 # the ``location`` default in ``content/bot-content.json``) for your own club.
 FRIDAY = 4
@@ -47,110 +54,6 @@ SOURCE_LIMIT = 50
 
 class _DryRun(Exception):
     """Raised inside the transaction so a dry run rolls back every write."""
-
-
-def xlsx_rows(path):
-    """Read the small, plain XLSX workbook used for the football account."""
-    namespace = {'m': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-    with ZipFile(path) as workbook:
-        shared = []
-        if 'xl/sharedStrings.xml' in workbook.namelist():
-            root = ET.fromstring(workbook.read('xl/sharedStrings.xml'))
-            for item in root.findall('m:si', namespace):
-                shared.append(''.join(node.text or '' for node in item.iter(
-                    '{%s}t' % namespace['m'])))
-        sheet_names = [name for name in workbook.namelist()
-                       if name.startswith('xl/worksheets/') and name.endswith('.xml')]
-        if not sheet_names:
-            raise UserError('فایل Excel هیچ شیتی ندارد.')
-        root = ET.fromstring(workbook.read(sorted(sheet_names)[0]))
-        rows = []
-        for row in root.findall('.//m:sheetData/m:row', namespace):
-            values = {}
-            for cell in row.findall('m:c', namespace):
-                reference = cell.attrib.get('r', '')
-                column = ''.join(char for char in reference if char.isalpha())
-                value = cell.find('m:v', namespace)
-                value = None if value is None else value.text
-                if cell.attrib.get('t') == 's' and value is not None:
-                    try:
-                        value = shared[int(value)]
-                    except (IndexError, ValueError):
-                        raise UserError('رشتهٔ مشترک نامعتبر در فایل Excel.') from None
-                elif cell.attrib.get('t') == 'inlineStr':
-                    value = ''.join(node.text or '' for node in cell.iter(
-                        '{%s}t' % namespace['m']))
-                values[column] = value
-            if values:
-                rows.append(values)
-    if not rows:
-        raise UserError('فایل Excel خالی است.')
-    return rows
-
-
-def _header(value):
-    """Normalize one workbook header cell for a tolerant column lookup."""
-    return ' '.join(str(value).replace('\u200c', ' ').split())
-
-
-def _column(header, *prefixes):
-    for name, column in header.items():
-        if any(name.startswith(prefix) for prefix in prefixes):
-            return column
-    return None
-
-
-def _sheet_int(value, label):
-    """Return a non-negative integer from a sheet cell, ``0`` when empty."""
-    if value is None or not str(value).strip():
-        return 0
-    raw = normalize(value).replace(',', '').replace('٬', '')
-    try:
-        number = Decimal(raw)
-    except InvalidOperation:
-        raise UserError(f'{label} در Excel عدد نیست.') from None
-    if number != number.to_integral_value() or number < 0:
-        raise UserError(f'{label} در Excel باید عدد صحیح نامنفی باشد.')
-    return int(number)
-
-
-def read_overrides(path, fee):
-    """Read explicit operator corrections without changing the workbook.
-
-    The CSV has ``name,attended,paid`` columns; ``debt`` is optional and, when
-    present, is expressed in thousands of تومان.  An override may also add a
-    person absent from the workbook (for example an approved late addition).
-    """
-    with Path(path).open(encoding='utf-8-sig', newline='') as handle:
-        reader = csv.DictReader(handle)
-        fields = {normalize(value): value for value in (reader.fieldnames or [])}
-        if not fields.get('نام') and not fields.get('name'):
-            raise UserError('فایل اصلاحات باید ستون name یا نام داشته باشد.')
-        result, seen = {}, set()
-        name_field = fields.get('نام') or fields.get('name')
-        for raw in reader:
-            name = text(raw.get(name_field, ''), 'نام اصلاحات')
-            key = normalize(name)
-            if key in seen:
-                raise UserError('نام تکراری در فایل اصلاحات: ' + name)
-            seen.add(key)
-            item = {'name': name}
-            for key_name, aliases in (('attended', ('جلسات آمده', 'attended')),
-                                      ('paid', ('جلسات پرداخت شده', 'جلسات پرداخت', 'paid'))):
-                field = next((fields[a] for a in aliases if a in fields), None)
-                if field and str(raw.get(field, '')).strip():
-                    item[key_name] = _sheet_int(raw[field], f'{key_name} {name}')
-            debt_field = next((fields[a] for a in ('مجموع بدهکاری', 'مجموع', 'debt') if a in fields), None)
-            if debt_field and str(raw.get(debt_field, '')).strip():
-                item['debt'] = _sheet_int(raw[debt_field], f'بدهی {name}') * 1000
-            if 'attended' not in item or 'paid' not in item:
-                raise UserError(f'اصلاح {name} باید attended و paid داشته باشد.')
-            expected = (item['attended'] - item['paid']) * fee
-            if 'debt' in item and item['debt'] != expected:
-                raise UserError(f'بدهی اصلاحی {name} با attended و paid نمی‌خواند.')
-            item['debt'] = expected
-            result[key] = item
-    return result
 
 
 def read_guest_links(path):
@@ -186,67 +89,6 @@ def read_guest_links(path):
     return result
 
 
-def read_workbook(path, fee, overrides=None):
-    """Return ``[{'name', 'attended', 'paid', 'debt'}]`` from the account sheet.
-
-    ``overrides`` is an explicit correction CSV path; corrected rows are merged
-    after workbook validation and may add approved people.
-    """
-    rows = xlsx_rows(path)
-    header = {_header(value): column for column, value in rows[0].items()
-              if value is not None}
-    name_column = _column(header, 'نام', 'name')
-    attended_column = _column(header, 'جلسات آمده', 'attended')
-    paid_column = _column(header, 'جلسات پرداخت', 'paid')
-    debt_column = _column(header, 'مجموع', 'debt')
-    if not (name_column and attended_column and paid_column):
-        raise UserError('Excel باید ستون‌های نام، جلسات آمده و جلسات پرداخت شده را داشته باشد.')
-    result, seen = [], set()
-    for row in rows[1:]:
-        raw_name = row.get(name_column)
-        if raw_name is None or not str(raw_name).strip():
-            continue
-        name = text(str(raw_name), 'نام')
-        key = normalize(name)
-        if key in seen:
-            raise UserError('نام تکراری در اکسل: ' + name)
-        seen.add(key)
-        attended = _sheet_int(row.get(attended_column), f'جلسات آمدهٔ {name}')
-        paid = _sheet_int(row.get(paid_column), f'جلسات پرداخت‌شدهٔ {name}')
-        expected = (attended - paid) * fee
-        stated = row.get(debt_column) if debt_column else None
-        if stated is not None and str(stated).strip():
-            # The debt column is written in هزار تومان, like the sheet's own
-            # ۱۲۰۰ for 1,200,000 T.
-            amount = _sheet_int(stated, f'بدهی {name}') * 1000
-            if amount != expected:
-                raise UserError(
-                    f'بدهی {name} در اکسل {amount:,} تومان است ولی '
-                    f'({attended}−{paid})×{fee:,} = {expected:,} می‌دهد؛ ابتدا اکسل را اصلاح کنید.')
-        result.append({'name': name, 'attended': attended, 'paid': paid, 'debt': expected})
-    if not result:
-        raise UserError('اکسل هیچ بازیکنی ندارد.')
-    if overrides:
-        corrections = read_overrides(overrides, fee)
-        by_name = {normalize(row['name']): row for row in result}
-        for key, correction in corrections.items():
-            if key in by_name:
-                by_name[key].update(correction)
-            else:
-                result.append(correction)
-    return result
-
-
-def workbook_amount(value, attended, paid, fee):
-    """Return the تومان debt of one snapshot row (SPEC-022 fixes the formula).
-
-    The legacy ``--import-players`` path uses this helper: a blank debt cell
-    still means «the formula», but the paid column is no longer ignored.
-    """
-    if value is None or not str(value).strip():
-        return (integer(attended, 'جلسات آمده', 0, 10000)
-                - integer(paid, 'جلسات پرداخت‌شده', 0, 10000)) * fee
-    return _sheet_int(value, 'بدهی') * 1000
 def phrase_date(value):
     """Return the Tehran ``date`` inside a session phrase, or ``None``.
 
@@ -652,55 +494,6 @@ def paid_total(db, player_id):
                    (player_id,))['n']
 
 
-def apply_payments(db, rows, fee, dry_run=False, aliases=None, allow_new=()):
-    """Bring every person's payments to the workbook's paid-session count.
-
-    A person who paid more than the sheet records gets a positive correction
-    row, so the balance rises to the sheet's debt; nobody's history is deleted.
-    A name the roster did not create is created here from the sheet, because the
-    sheet is the reference for who owes what; an ambiguous name still blocks the
-    whole import.  A second run computes a zero difference and writes nothing.
-    """
-    report = {'dry_run': bool(dry_run), 'adjusted': [], 'unchanged': 0,
-              'created': [], 'renamed': [], 'blocked': []}
-    try:
-        with db.conn:
-            found = resolve_players(db, [row['name'] for row in rows], aliases, allow_new)
-            report['created'] = found['created']
-            report['renamed'] = found['renamed']
-            report['blocked'] = found['blocked']
-            if found['blocked']:
-                raise UserError(_blocked_message(found['blocked']))
-            for row in rows:
-                player = db.one('SELECT * FROM players WHERE normalized_name=?',
-                                (normalize(row['name']),))
-                target = row['paid'] * fee
-                current = paid_total(db, player['id'])
-                delta = current - target
-                if delta == 0:
-                    report['unchanged'] += 1
-                    continue
-                source = f'{_PAID_SOURCE}{player["id"]}'
-                attempt = 2
-                while db.one('SELECT 1 FROM ledger WHERE source=?', (source,)):
-                    source = f'{_PAID_SOURCE}{player["id"]}:{attempt}'
-                    attempt += 1
-                    if attempt > SOURCE_LIMIT:
-                        raise UserError('اصلاح پرداخت تکراری از حد مجاز گذشت؛ حساب را دستی بررسی کنید.')
-                note = (f'پرداخت طبق اکسل {PERIOD}' if delta < 0
-                        else f'اصلاح پرداخت طبق اکسل {PERIOD}')
-                db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',
-                           (player['id'], delta, note, source))
-                db.audit('backfill', 'payment_adjust', {'player': player['id'],
-                                                        'paid': target, 'amount': delta})
-                report['adjusted'].append({'name': player['name'], 'amount': delta})
-            if dry_run:
-                raise _DryRun()
-    except _DryRun:
-        pass
-    return report
-
-
 def marked_sessions(db):
     """Return the session ids the last import covered (SPEC-022)."""
     try:
@@ -714,6 +507,16 @@ def _migrated(db, guest_name, session_id):
     """Return ``True`` when this guest already left this session (SPEC-024)."""
     return db.one('SELECT 1 FROM guest_migrations WHERE guest_name=? AND session_id=?',
                   (guest_name, session_id)) is not None
+
+
+def _session_distance(left, right):
+    """Distance between ISO session timestamps, with deterministic fallback."""
+    if not left or not right:
+        return 10**18
+    try:
+        return abs((datetime.fromisoformat(left) - datetime.fromisoformat(right)).total_seconds())
+    except ValueError:
+        return 10**18
 
 
 def _guest_host_session(db, host_id, session_at):
@@ -839,107 +642,6 @@ def migrate_guests(db, links, dry_run=False):
     return report
 
 
-def _session_distance(left, right):
-    """Distance between ISO session timestamps, with deterministic fallback."""
-    if not left or not right:
-        return 10**18
-    try:
-        return abs((datetime.fromisoformat(left) - datetime.fromisoformat(right)).total_seconds())
-    except ValueError:
-        return 10**18
-
-
-def reconcile(db, rows, fee, session_ids=None):
-    """Compare the ledger with the workbook.  Read-only: it never writes.
-
-    SPEC-024: a workbook row whose name is a registered guest is counted on its
-    host, because the guest no longer owns an account or an attendance row.
-    """
-    if session_ids is None:
-        session_ids = marked_sessions(db)
-    covered = set(session_ids) if session_ids else None
-    hosts = {}
-    for row in db.all('SELECT normalized_name, host_id FROM attendance_guests'):
-        hosts.setdefault(row['normalized_name'], row['host_id'])
-    # The workbook counts slots, not rows: a player with two guests counts as
-    # three attended sessions, and a guest-only row adds its guests alone.
-    attended = {}
-    for row in db.all('SELECT session_id, player_id, guests, own FROM attendance'):
-        if covered is not None and row['session_id'] not in covered:
-            continue
-        attended[row['player_id']] = (attended.get(row['player_id'], 0)
-                                      + row['own'] + row['guests'])
-    # Fold the sheet onto the players that really own the money.
-    wanted, missing = {}, []
-    for row in rows:
-        key = normalize(row['name'])
-        player = db.one('SELECT id FROM players WHERE normalized_name=?', (key,))
-        host_id = hosts.get(key)
-        if player is None and host_id is None:
-            missing.append(row['name'])
-            continue
-        target = host_id or player['id']
-        item = wanted.setdefault(target, {'name': None, 'attended': 0, 'paid': 0, 'debt': 0})
-        item['attended'] += row['attended']
-        item['paid'] += row['paid']
-        item['debt'] += row['debt']
-    result = {'rows': [], 'missing': missing, 'extra': [], 'ok': not missing,
-              'session_ids': list(session_ids or []), 'sheet_total': 0}
-    for player_id, expected in wanted.items():
-        player = db.one('SELECT * FROM players WHERE id=?', (player_id,))
-        if not player:
-            result['missing'].append(expected['name'] or str(player_id))
-            result['ok'] = False
-            continue
-        balance = db.one('SELECT COALESCE(SUM(amount),0) n FROM ledger WHERE player_id=?',
-                         (player_id,))['n']
-        paid = paid_total(db, player_id)
-        count = attended.get(player_id, 0)
-        item = {'name': player['name'], 'attended': count, 'sheet_attended': expected['attended'],
-                'paid': paid, 'sheet_paid': expected['paid'] * fee, 'balance': balance,
-                'sheet_debt': expected['debt'], 'diff': balance - expected['debt']}
-        result['rows'].append(item)
-        result['sheet_total'] += expected['debt']
-        if item['diff'] or count != item['sheet_attended'] or paid != item['sheet_paid']:
-            result['ok'] = False
-    for player in db.all('SELECT * FROM players ORDER BY id'):
-        if player['id'] in wanted:
-            continue
-        balance = db.one('SELECT COALESCE(SUM(amount),0) n FROM ledger WHERE player_id=?',
-                         (player['id'],))['n']
-        if balance:
-            result['extra'].append({'name': player['name'], 'balance': balance})
-            result['ok'] = False
-    result['ledger_total'] = db.one('SELECT COALESCE(SUM(amount),0) n FROM ledger')['n']
-    return result
-TABLE_HEAD = 'نام                          آمده  اکسل   پرداخت     اکسل      مانده       اکسل    تفاضل'
-TABLE_RULE = '-' * 96
-
-
-def format_reconcile(result):
-    """Render the reconcile table the operator reads before trusting a total."""
-    lines = []
-    if result['session_ids']:
-        lines.append('سانس‌های بررسی‌شده: ' + '، '.join(f'#{ident}' for ident in result['session_ids']))
-    else:
-        lines.append('سانسی علامت نخورده؛ همهٔ سانس‌های دیتابیس شمرده شد.')
-    lines.append(TABLE_HEAD)
-    for row in result['rows']:
-        lines.append('%-26s %5d %5d %9s %9s %10s %10s %8s' % (
-            row['name'], row['attended'], row['sheet_attended'],
-            f"{row['paid']:,}", f"{row['sheet_paid']:,}",
-            f"{row['balance']:,}", f"{row['sheet_debt']:,}", f"{row['diff']:,}"))
-    lines.append(TABLE_RULE)
-    lines.append(f"جمع اکسل: {result['sheet_total']:,} تومان — جمع دفتر: {result['ledger_total']:,} تومان")
-    if result['missing']:
-        lines.append('در دیتابیس نیستند: ' + '، '.join(result['missing']))
-    for item in result['extra']:
-        lines.append(f"خارج از اکسل: {item['name']} با {item['balance']:,} تومان")
-    lines.append('نتیجه: ' + ('همهٔ ردیف‌ها با اکسل می‌خوانند.' if result['ok']
-                             else 'اختلاف هست؛ تا صفر‌شدن تفاضل‌ها ورود اطلاعات تمام نیست.'))
-    return '\n'.join(lines)
-
-
 def format_sessions(report):
     lines = []
     if report['dry_run']:
@@ -972,22 +674,4 @@ def format_guest_migration(report):
                  f"حساب مهمان حذف‌شده: {report['removed_players']}")
     for item in report['moved']:
         lines.append(f"{item['guest']} ← {item['host']}؛ سانس #{item['from']} به #{item['to']}")
-    return '\n'.join(lines)
-
-
-def format_payments(report):
-    lines = []
-    if report['dry_run']:
-        lines.append('حالت آزمایشی: هیچ تغییری در دیتابیس ثبت نشد.')
-    for item in report['adjusted']:
-        verb = 'پرداخت ثبت شد' if item['amount'] < 0 else 'اصلاح بدهی ثبت شد'
-        lines.append(f"{item['name']}: {verb} {abs(item['amount']):,} تومان")
-    lines.append(f"اصلاح‌شده: {len(report['adjusted'])}؛ بی‌تغییر: {report['unchanged']}")
-    if report['created']:
-        lines.append(f"بازیکن جدید از اکسل: {len(report['created'])} نفر — "
-                     + '، '.join(item['name'] for item in report['created']))
-    for item in report['renamed']:
-        lines.append(f"نام #{item['id']} از «{item['old']}» به «{item['new']}» اصلاح شد.")
-    if report['blocked']:
-        lines.append(_blocked_message(report['blocked']))
     return '\n'.join(lines)

@@ -116,7 +116,8 @@ weekday that does match.
 - AC-006 -> `tests/test_sans.py::RelativeDateTests::test_explicit_dates_win_over_relative_words`
 - AC-007 -> `tests/test_agent_contracts.py::SnapshotDateContextTests::test_snapshot_now_is_jalali_with_persian_weekday`
 - AC-008 -> `tests/test_sans.py::RelativeDateTests::test_roster_importer_still_requires_fridays`
-- AC-008 -> `tests/test_backfill.py::ReconcileTests` (existing gate tests)
+- AC-008 -> also covered by the roster planner tests in `tests/test_backfill.py::PlanTests`
+  (the workbook reconcile half was removed by SPEC-039).
 
 ## Safety Constraints
 
