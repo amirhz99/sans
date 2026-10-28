@@ -26,7 +26,7 @@ contact.
 
 - `Config.support_handle` is parsed from `SUPPORT_HANDLE`, normalised to the
   single canonical form `@name`, and defaulted to `''` (feature disabled).
-- `amirhz99` and `@amirhz99` are both accepted and stored as `@amirhz99`.
+- `club_support` and `@club_support` are both accepted and stored as `@club_support`.
 - An invalid value (missing name, spaces, punctuation, a URL, `t.me/...`,
   a bare `@`, or a length outside 3–64) raises at startup, like the other
   configuration errors in `Config.from_env`.
@@ -63,8 +63,8 @@ contact.
 
 ## Acceptance Criteria
 
-- [x] AC-001: `SUPPORT_HANDLE=@amirhz99` and `SUPPORT_HANDLE=amirhz99` both
-  produce `Config.support_handle == '@amirhz99'` through `from_env`.
+- [x] AC-001: `SUPPORT_HANDLE=@club_support` and `SUPPORT_HANDLE=club_support` both
+  produce `Config.support_handle == '@club_support'` through `from_env`.
 - [x] AC-002: An invalid `SUPPORT_HANDLE` value raises `ValueError` at startup
   instead of reaching the prompt.
 - [x] AC-003: A missing or empty `SUPPORT_HANDLE` leaves support disabled and

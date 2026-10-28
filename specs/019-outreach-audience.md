@@ -216,7 +216,7 @@ git diff --check
   nullable and `user_id` was added. The live table was empty, so no row changed.
 - Live audience: `contacts` was empty and no player had a `bale_id`, so
   `audience='all'` resolved to the single open identity request
-  (`9b7898198d6e47ac`, player #16, Bale user `1590533468`). One recipient is the
+  (`9b7898198d6e47ac`, player #16, Bale user `100000001`). One recipient is the
   honest answer for a bot that exactly one person has started so far.
 - Not verified live: a real delivery and the «ارسال شمارهٔ من» round trip need a
   message from the admin. The unit tests cover the queued payloads, the

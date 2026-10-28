@@ -74,7 +74,7 @@ class Config:
 def parse_support_handle(raw):
     """Return a normalised ``@handle`` or ``''`` when support is not configured.
 
-    SPEC-031: ``amirhz99`` and ``@amirhz99`` are both accepted and stored in the
+    SPEC-031: ``club_support`` and ``@club_support`` are both accepted and stored in the
     same canonical form so the prompt and ``/support`` cannot disagree.  An
     empty value disables the feature; anything else that is not a plain handle
     raises, because it would be injected verbatim into the system prompt.
@@ -88,7 +88,7 @@ def parse_support_handle(raw):
     # to name a contact, so silently turning the hand-off off would hide it.
     name = value[1:].strip() if value.startswith('@') else value
     if not SUPPORT_HANDLE.fullmatch(name):
-        raise ValueError('SUPPORT_HANDLE must be a plain handle such as @amirhz99')
+        raise ValueError('SUPPORT_HANDLE must be a plain handle such as @club_support')
     return '@' + name
 
 

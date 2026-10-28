@@ -131,9 +131,9 @@ git diff --check
   skip).
 - `python3 -m compileall -q app tests`: OK.
 - `git diff --check`: clean.
-- Deployment: `.env` now has `ADMIN_USER_IDS=1590533468` and
+- Deployment: `.env` now has `ADMIN_USER_IDS=100000001` and
   `ADMIN_ACCESS=allowlist` (previous file kept at `/tmp/env.backup.*`). With the
-  real config, `is_admin(1590533468, 1590533468)` is `True`, a member of the
+  real config, `is_admin(100000001, 100000001)` is `True`, a member of the
   admin group is still an admin, and a stranger's private chat is not.
 - Not verified live: a private `/report` from the admin's own chat needs a real
   message from him; the bot was restarted with this code at 16:53.

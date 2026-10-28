@@ -43,7 +43,7 @@ spec -> plan -> implement -> test -> review
 
 ## Test and validation commands
 
-Run these from `/root/sans`:
+Run these from the repository root:
 
 ```bash
 python3 -m unittest discover -s tests -t . -v

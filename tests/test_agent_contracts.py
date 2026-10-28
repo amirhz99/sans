@@ -1637,8 +1637,8 @@ class SupportPromptTests(unittest.TestCase):
             support_contact=support_contact(bot) or SUPPORT_FALLBACK_TEXT)
 
     def test_prompt_offers_the_configured_handle(self):
-        prompt = self.render('@amirhz99')
-        self.assertIn('@amirhz99', prompt)
+        prompt = self.render('@club_support')
+        self.assertIn('@club_support', prompt)
         self.assertIn('ارجاع به پشتیبان انسانی', prompt)
         self.assertNotIn('{support_contact}', prompt)
 
@@ -1646,7 +1646,7 @@ class SupportPromptTests(unittest.TestCase):
         # A stand-in config that predates SPEC-031 must not break rendering.
         prompt = self.render('')
         self.assertNotIn('{support_contact}', prompt)
-        self.assertNotIn('@amirhz99', prompt)
+        self.assertNotIn('@club_support', prompt)
 class ActionContractTests(unittest.TestCase):
     """SPEC-035: voiding a session is an admin action, never a read-only one."""
 

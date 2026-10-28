@@ -3,10 +3,9 @@ __pycache__/
 *.py[cod]
 .venv/
 data/*
-!data/guest-links.csv
-/logs/
-*.sqlite3*
-*.log
 /players.csv
 *.xlsx
 *.xls
+/logs/
+*.sqlite3*
+*.log

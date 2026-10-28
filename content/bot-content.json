@@ -3,7 +3,7 @@
     "currency": "تومان",
     "venue_cost": 2500000,
     "person_fee": 150000,
-    "location": "سالن فوتسال تیموری",
+    "location": "سالن فوتسال نمونه",
     "guest_fee_multiplier": 1,
     "venue_cost_in_player_debt": false,
     "formula": "سهم هر نفر × (۱ + تعداد مهمان؛ اگر میزبان خودش نبود فقط تعداد مهمان)"

@@ -20,11 +20,12 @@ from . import jalali
 from .service import (TEHRAN, Service, UserError, integer, normalize,
                       parse_session_datetime, text)
 
-# Every session of this period was played on a Friday at 16:30 in the Teymouri
-# Tarasht hall; the operator confirmed the schedule and the hall cost.
+# Fallback defaults used when a backfill workbook row does not carry a hall.
+# These are placeholders: pass ``--venue-cost`` and edit the location (or set
+# the ``location`` default in ``content/bot-content.json``) for your own club.
 FRIDAY = 4
 SESSION_HOUR = '16:30'
-LOCATION = 'سالن تیموری طرشت'
+LOCATION = 'سالن فوتسال نمونه'
 VENUE_COST = 2500000
 PERIOD = '۱۶ مرداد ۱۴۰۵'
 SESSIONS_KEY = 'backfill:sessions'

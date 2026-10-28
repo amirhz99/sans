@@ -2,6 +2,20 @@
 
 ربات فارسی بله برای مدیریت سانس، حضور، مهمان، بدهی و رسید پرداخت؛ با **Python 3.12+، SQLite و API هوش مصنوعی OpenAI-compatible**. بدون پنل وب، ORM، سرویس دیتابیس جداگانه؛ تنها وابستگی‌های pip مربوط به لایهٔ AI است و در `requirements.txt` آمده‌اند. اجرای فعلی برای Linux است.
 
+هدف پروژه ساده است: یک گروه فوتبال دوستانه که هر هفته سالن می‌گیرد، باید بتواند با حرف زدن عادی — نه با فرم و پنل — سانس بسازد، بگوید چه کسی آمد، چه کسی مهمان آورد و چه کسی چقدر بدهکار است. ربات همهٔ این‌ها را از زبان فارسی می‌فهمد و هر تغییر مالی را پیش از ثبت، با یک کارت تأیید به ادمین نشان می‌دهد.
+
+## اصل طراحی
+
+هوش مصنوعی در این پروژه **یک درخواست‌ساز است، نه یک مجری**. مدل فقط می‌تواند «قصد» (Intent) بسازد؛ و هر Intent پیش از هر اثری اعتبارسنجی می‌شود:
+
+```text
+پیام کاربر → مدل → Intent → اعتبارسنجی → پیش‌فرض/پیشنهاد → کارت تأیید ادمین → دفتر کل
+```
+
+- قصد ناشناخته، آرگومان بدشکل، بازیکن ناموجود و سطح پاسخ نامعتبر **fail-closed** رد می‌شوند و هیچ اثری نمی‌گذارند.
+- پول فقط پس از یک کلیک «تأیید» جابه‌جا می‌شود و هر تغییر یک ردیف دفتر کل با توضیح می‌گیرد.
+- مدل هرگز فهرست کامل بازیکنان، شمارهٔ تلفن‌ها، محتوای رسیدها یا مقادیر `.env` را نمی‌بیند.
+
 ## امکانات
 
 - مکالمهٔ آزاد فارسی برای ادمین و بازیکن؛ فرمان‌های جایگزین در زمان قطع AI.
@@ -19,16 +33,19 @@
 - پرسش دوره‌ای از ادمین‌ها دربارهٔ اطلاعات ناقص و یادآوری بررسی رسید/هویت.
 - ورود CSV اولیه بدون حساب بله، بکاپ سازگار SQLite، تاریخچهٔ تغییرات و صف ارسال پایدار.
 - پیام‌های پشت‌سرهم یک نفر در یک بازهٔ کوتاه به‌صورت **یک درخواست** پردازش می‌شوند و حافظهٔ گفتگو عمیق‌تر و کران‌دار است.
+- **پیشرفت زنده**: پیام «دریافت شد» مرحله‌به‌مرحله ویرایش می‌شود و پاسخ در پیام جدا می‌آید.
+- سانس برگزارنشده با یک کارت صریح بسته می‌شود، بدون ثبت هیچ بدهی.
+- پیام مستقیم به مخاطبان ربات، با تأیید ادمین، و دریافت شماره با دکمه.
 
 ### متن‌ها و پیش‌فرض‌های قابل کنترل
 
 متن prompt هوش مصنوعی، راهنمای کاربر و راهنمای ادمین، به‌همراه پیش‌فرض‌های ساخت سانس، همگی در فایل زیر قرار دارند:
 
-`/root/sans/content/bot-content.json`
+`/opt/sans/content/bot-content.json`
 
 پیش‌فرض فعلی برای سانس جدید:
 
-- محل: **سالن فوتسال تیموری**
+- محل: **سالن فوتسال نمونه**
 - هزینهٔ کل زمین: **۲٬۵۰۰٬۰۰۰ تومان**
 - سهم هر نفر: **۱۵۰٬۰۰۰ تومان**
 - فرمول بدهی: سهم هر نفر × (۱ + تعداد مهمان)
@@ -42,11 +59,11 @@
 در بله از `@botfather` توکن بگیرید و ربات را به گروه خصوصی ادمین‌ها اضافه کنید. دسترسی دریافت پیام‌های گروه و ارسال پیام/عکس/فایل باید فراهم باشد. همهٔ افراد گروه را مورد اعتماد در نظر بگیرید، چون پاسخ‌های ربات برای تمام اعضای گروه دیده می‌شود.
 
 ```bash
-cp /root/sans/.env.example /root/sans/.env
-chmod 600 /root/sans/.env
+cp /opt/sans/.env.example /opt/sans/.env
+chmod 600 /opt/sans/.env
 ```
 
-فایل `/root/sans/.env` را تکمیل کنید:
+فایل `/opt/sans/.env` را تکمیل کنید:
 
 | تنظیم | توضیح |
 | --- | --- |
@@ -58,19 +75,19 @@ chmod 600 /root/sans/.env
 | `AI_API_KEY` | کلید سرویس |
 | `AI_MODEL` | نام مدل در همان سرویس |
 | `AI_FALLBACK_MODEL` | اختیاری؛ نام یک یا چند مدل جایگزین با کاما. اگر مدل اصلی خطا بدهد (مثلاً سهمیه/۴۰۲)، همان درخواست با مدل بعدی تکرار می‌شود |
-| `DATABASE_PATH` | پیش‌فرض: `/root/sans/data/sans.sqlite3`؛ مسیر نسبی نسبت به ریشهٔ پروژه تفسیر می‌شود |
+| `DATABASE_PATH` | پیش‌فرض: `/opt/sans/data/sans.sqlite3`؛ مسیر نسبی نسبت به ریشهٔ پروژه تفسیر می‌شود |
 | `BOT_NAME` | پیش‌فرض: `مسئول`؛ واژهٔ خطاب در گروه |
 | `REMINDER_HOURS` | فاصلهٔ یادآوری‌ها، پیش‌فرض ۲۴ ساعت؛ صفر یعنی خاموش |
-| `SUPPORT_HANDLE` | اختیاری؛ آیدی پشتیبان انسانی مثل `@amirhz99`. ربات وقتی نتواند مشکل کاربر را حل کند یا او بپرسد «با کی صحبت کنم»، همین آیدی را می‌دهد و `/support` هم آن را نشان می‌دهد. خالی یعنی این قابلیت خاموش است و ربات به ادمین‌های گروه ارجاع می‌دهد |
+| `SUPPORT_HANDLE` | اختیاری؛ آیدی پشتیبان انسانی مثل `@club_support`. ربات وقتی نتواند مشکل کاربر را حل کند یا او بپرسد «با کی صحبت کنم»، همین آیدی را می‌دهد و `/support` هم آن را نشان می‌دهد. خالی یعنی این قابلیت خاموش است و ربات به ادمین‌های گروه ارجاع می‌دهد |
 
 متغیرهای محیطی سیستم بر مقادیر فایل اولویت دارند. فایل env ساده است و از expansion یا کامنت انتهای مقدار پشتیبانی نمی‌کند.
 
 ### به‌دست‌آوردن شناسه‌ها
 
-فقط توکن را در `/root/sans/.env` وارد کنید. هر ادمین در خصوصی ربات و در گروه `/id` بفرستد. سپس، در حالی که نمونهٔ دیگری از ربات اجرا نیست:
+فقط توکن را در `/opt/sans/.env` وارد کنید. هر ادمین در خصوصی ربات و در گروه `/id` بفرستد. سپس، در حالی که نمونهٔ دیگری از ربات اجرا نیست:
 
 ```bash
-python3 /root/sans/run.py --discover-ids
+python3 /opt/sans/run.py --discover-ids
 ```
 
 این فرمان شناسهٔ گفتگو و فرستنده را از پیام‌های اخیر چاپ می‌کند؛ متن پیام یا توکن را چاپ نمی‌کند. با این اطلاعات `ADMIN_GROUP_ID` را تکمیل کنید. در رباتِ در حال اجرا هم `/id` در دسترس است.
@@ -80,8 +97,8 @@ python3 /root/sans/run.py --discover-ids
 ### ساخت دیتابیس و اجرا
 
 ```bash
-python3 /root/sans/run.py --init
-python3 /root/sans/run.py
+python3 /opt/sans/run.py --init
+python3 /opt/sans/run.py
 ```
 
 ساخت جداول خودکار است؛ `--init` برای بررسی آفلاین مفید است و توکن نمی‌خواهد. برنامه با long polling اجرا می‌شود؛ پورت ورودی عمومی نیاز ندارد. خروج با `Ctrl+C` است. برای اجرای دائمی از مدیر سرویس سرورتان استفاده کنید.
@@ -93,7 +110,7 @@ python3 /root/sans/run.py
 روی ماشین توسعه (بدون systemd و بدون root) همین مخزن کافی است:
 
 ```bash
-git clone git@github.com:amirhz99/sans.git
+git clone https://github.com/OWNER/sans.git
 cd sans
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -114,21 +131,21 @@ python3 -m compileall -q app tests
 
 برای هر توکن فقط **یک** نمونهٔ long polling اجرا کنید. پیش از اجرای محلی، سرویس سرور را متوقف نگه دارید (`systemctl stop sans-bot.service`)؛ قفل محلی فقط جلوی دو نمونه روی یک دیتابیس را می‌گیرد، نه همان توکن روی دو ماشین.
 
-### اجرای دائمی روی همین سرور
+### اجرای دائمی با systemd (کاربر اختصاصی)
 
-نمونهٔ سرویس در `/root/sans/deploy/sans-bot.service` است. این نمونه برای همین مسیر و اجرای کاربر root نوشته شده، کد/تنظیمات را فقط خواندنی می‌کند و نوشتن را به پوشهٔ داده محدود می‌کند. برای جابه‌جایی پروژه مسیرها و کاربر سرویس را بازبینی کنید.
+نمونهٔ سرویس در `deploy/sans-bot.service` است. یک نمونهٔ امن برای سرور است: کاربر اختصاصی `sans`، کد فقط خواندنی، و نوشتن محدود به پوشهٔ داده. مسیرها (`/opt/sans`) و کاربر/گروه را متناسب با نصب خودتان تغییر دهید.
 
 ```bash
-install -m 644 /root/sans/deploy/sans-bot.service /etc/systemd/system/sans-bot.service
-systemctl daemon-reload
-systemctl enable --now sans-bot.service
-systemctl status sans-bot.service --no-pager
+sudo useradd --system --home /opt/sans --shell /usr/sbin/nologin sans
+sudo chown -R sans:sans /opt/sans
+sudo install -m 644 /opt/sans/deploy/sans-bot.service /etc/systemd/system/sans-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now sans-bot.service
+sudo systemctl status sans-bot.service --no-pager
 journalctl -u sans-bot.service -n 30 --no-pager
 ```
 
-پس از تغییر `/root/sans/.env`، دستور `systemctl restart sans-bot.service` را اجرا کنید. برای ورود CSV یا بکاپ، ابتدا `systemctl stop sans-bot.service` و پس از پایان `systemctl start sans-bot.service` بزنید. گزینهٔ `--discover-ids` یا polling مستقل را هم‌زمان با سرویس اجرا نکنید (`--discover-ids` گزینهٔ CLI است، نه فرمان ربات).
-
-این یونیت مخصوص اجرای root در `/root/sans` است. اگر مخزن در مسیر دیگری است یا ربات با کاربر عادی اجرا می‌شود، به‌جای آن بخش «اجرای دائمی بدون root» را ببینید؛ در آن حالت `systemctl` و `journalctl` هر دو پرچم `--user` می‌گیرند.
+پس از تغییر `.env`، دستور `sudo systemctl restart sans-bot.service` را اجرا کنید. برای ورود CSV یا بکاپ، ابتدا `sudo systemctl stop sans-bot.service` و پس از پایان `start` بزنید؛ ابزارهای نگهداری (`--backup`، `--import-*`، `--reconcile`) قفل نصب را می‌گیرند و با ربات در حال اجرا کار نمی‌کنند. گزینهٔ `--discover-ids` را هم‌زمان با سرویس اجرا نکنید.
 
 اعتبار کلید یا دریافت فهرست مدل‌ها، تضمین موفقیت chat/completions نیست. در InferHub شناسهٔ مدل ممکن است به پیشوند ارائه‌دهنده مثل `ali/qwen3.8-flash` نیاز داشته باشد. خطای HTTP 402 با پیام `no provider's ask matches your max-per-mtok bid` به پیدا نشدن ارائه‌دهنده در سقف قیمت پیشنهادی اشاره دارد. تنظیمات قیمت/مسیریابی حساب را نزد سرویس بررسی کنید؛ ربات سقف هزینه را خودکار افزایش نمی‌دهد. در زمان خطای AI، فرمان‌های قطعی همچنان در دسترس‌اند.
 
@@ -234,7 +251,7 @@ systemctl --user start sans-bot.service
 
 ## ورود اطلاعات قبلی
 
-ساختار نمونه در `/root/sans/examples/players.csv` آمده است. فایل UTF-8 با سرستون‌های زیر بسازید:
+ساختار نمونه در `/opt/sans/examples/players.csv` آمده است. فایل UTF-8 با سرستون‌های زیر بسازید:
 
 ```csv
 name,opening_balance,note
@@ -245,16 +262,16 @@ name,opening_balance,note
 
 عدد مثبت یعنی بدهکار، منفی یعنی بستانکار. همهٔ مبلغ‌ها **تومان** هستند. حساب بله لازم نیست؛ بعداً هنگام معرفی و تأیید ادمین متصل می‌شود.
 
-پس از قرار دادن اطلاعات واقعی خودتان در `/root/sans/players.csv`، ربات را متوقف و اجرا کنید:
+پس از قرار دادن اطلاعات واقعی خودتان در `/opt/sans/players.csv`، ربات را متوقف و اجرا کنید:
 
 ```bash
-python3 /root/sans/run.py --import-players /root/sans/players.csv
+python3 /opt/sans/run.py --import-players /opt/sans/players.csv
 ```
 
 برای snapshot حساب اعضا از فایل Excel نیز می‌توان استفاده کرد:
 
 ```bash
-python3 /root/sans/run.py --import-players '/root/sans/football-account(1).xlsx'
+python3 /opt/sans/run.py --import-players '/opt/sans/football-account(1).xlsx'
 ```
 
 در Excel، مبالغ ستون «مجموع بدهکاری» هزار تومان هستند و به تومان تبدیل می‌شوند. بدهی هر ردیف همیشه از فرمول `(جلسات آمده − جلسات پرداخت‌شده) × ۱۵۰٬۰۰۰ تومان` ساخته می‌شود؛ اگر ستون بدهی پر باشد ولی با این فرمول نخواند، ورود با نام همان ردیف متوقف می‌شود تا ابتدا اکسل اصلاح شود. توضیح همهٔ بدهی‌های این snapshot `بدهی تا ۱۶ مرداد ۱۴۰۵` ثبت می‌شود. ورود Excel snapshot قبلیِ opening را جایگزین می‌کند، روی بدهی‌های سانس‌ها و پرداخت‌های ثبت‌شده دست نمی‌زند، تراکنشی است و اجرای دوبارهٔ همان فایل مبلغ را جمع نمی‌کند.
@@ -265,14 +282,14 @@ Snapshot برای دورهٔ «تا ۱۶ مرداد ۱۴۰۵» کافی نیست
 
 ```bash
 systemctl --user stop sans-bot.service
-python3 /root/sans/run.py --import-sessions /root/sans/data/sessions.csv --dry-run
-python3 /root/sans/run.py --import-sessions /root/sans/data/sessions.csv \
+python3 /opt/sans/run.py --import-sessions /opt/sans/data/sessions.csv --dry-run
+python3 /opt/sans/run.py --import-sessions /opt/sans/data/sessions.csv \
   --alias "عباس رسولی=رسولی" --alias "محمد مهدی سبحانی=سبحانی" \
   --allow-new "رفیق علی بختیاری" --allow-new "امین"
-python3 /root/sans/run.py --import-payments '/root/sans/football-account.xlsx' \
-  --workbook-overrides /root/sans/data/workbook-overrides.csv
-python3 /root/sans/run.py --reconcile '/root/sans/football-account.xlsx' \
-  --workbook-overrides /root/sans/data/workbook-overrides.csv
+python3 /opt/sans/run.py --import-payments '/opt/sans/football-account.xlsx' \
+  --workbook-overrides /opt/sans/data/workbook-overrides.csv
+python3 /opt/sans/run.py --reconcile '/opt/sans/football-account.xlsx' \
+  --workbook-overrides /opt/sans/data/workbook-overrides.csv
 systemctl --user start sans-bot.service
 ```
 
@@ -284,7 +301,7 @@ systemctl --user start sans-bot.service
 
 قواعد ایمنی این سه فرمان:
 
-- تاریخ هر سانس باید **جمعه** باشد؛ همهٔ سانس‌های این دوره ساعت ۱۶:۳۰ در «سالن تیموری طرشت» با هزینهٔ زمین ۲٬۵۰۰٬۰۰۰ تومان و سهم نفر ۱۵۰٬۰۰۰ تومان ثبت می‌شوند (`--hour`، `--venue-cost` و `--session-fee` قابل تغییرند).
+- تاریخ هر سانس باید **جمعه** باشد؛ همهٔ سانس‌های این دوره ساعت ۱۶:۳۰ در «سالن ورزشی نمونه» با هزینهٔ زمین ۲٬۵۰۰٬۰۰۰ تومان و سهم نفر ۱۵۰٬۰۰۰ تومان ثبت می‌شوند (`--hour`، `--venue-cost` و `--session-fee` قابل تغییرند).
 - هیچ ردیفی حذف نمی‌شود. حضور و دفتر فقط **تفاضلی** به‌روز می‌شوند: نفر تازه اضافه می‌شود، تغییر مهمان یک ردیف اصلاح می‌گیرد و حذف یک نفر با یک ردیف اصلاح منفی ثبت می‌شود.
 - سانس قدیمی که تاریخش غلط است اصلاح می‌شود، نه دوباره ساخته؛ مثلاً «سانس ۹ خرداد» به «سانس ۸ خرداد» با `session_at` درست تبدیل می‌شود و مبلغ‌هایش دست نمی‌خورد.
 - نامی که به یک بازیکن موجود شبیه است خودکار ثبت نمی‌شود؛ با `--alias "نام لیست=نام ذخیره‌شده"` بگویید یکی هستند (نام ذخیره‌شده اصلاح و تاریخچه‌اش حفظ می‌شود) یا با `--allow-new "نام لیست"` بگویید فرد جدیدی است.
@@ -309,10 +326,10 @@ systemctl --user start sans-bot.service
 
 ```bash
 systemctl --user stop sans-bot.service
-python3 /root/sans/run.py --migrate-guests /root/sans/data/guest-links.csv --dry-run
-python3 /root/sans/run.py --migrate-guests /root/sans/data/guest-links.csv
-python3 /root/sans/run.py --reconcile '/root/sans/football-account.xlsx' \
-  --workbook-overrides /root/sans/data/workbook-overrides.csv
+python3 /opt/sans/run.py --migrate-guests /opt/sans/data/guest-links.csv --dry-run
+python3 /opt/sans/run.py --migrate-guests /opt/sans/data/guest-links.csv
+python3 /opt/sans/run.py --reconcile '/opt/sans/football-account.xlsx' \
+  --workbook-overrides /opt/sans/data/workbook-overrides.csv
 systemctl --user start sans-bot.service
 ```
 
@@ -356,7 +373,7 @@ systemctl --user start sans-bot.service
 
 ورود فایل تراکنشی است: هر خط نامعتبر باشد کل ورود برمی‌گردد. ورود تکراری همان فایل دوباره بدهی ایجاد نمی‌کند. تغییر ماندهٔ اولیهٔ واردشده مجاز نیست؛ اصلاح مالی را از ربات با دلیل ثبت کنید. نام کامل باید یکتا باشد؛ برای هم‌نام‌ها پسوند متمایز بگذارید. ورود اولیه تاریخچهٔ سانس‌های گذشته را بازسازی نمی‌کند؛ یک «ماندهٔ اولیه» با توضیح می‌سازد.
 
-**فایل واقعی اعضا را وارد Git نکنید.** بهتر است آن را در `/root/sans/data/players.csv` که نادیده گرفته می‌شود نگهداری کنید و مسیر فرمان را مطابق آن تغییر دهید.
+**فایل واقعی اعضا را وارد Git نکنید.** بهتر است آن را در `/opt/sans/data/players.csv` که نادیده گرفته می‌شود نگهداری کنید و مسیر فرمان را مطابق آن تغییر دهید.
 
 ## گردش کار ادمین
 
@@ -481,13 +498,43 @@ systemctl --user start sans-bot.service
 - یادآوری‌ها هنگام اجرای برنامه بررسی می‌شوند؛ تایمر دقیق تقویمی، پیامک یا پیگیری خارج از بله وجود ندارد. سؤال مشابه در کمتر از ۶ ساعت تکرار نمی‌شود.
 - SQLite رمزگذاری‌شده نیست. فایل دیتابیس، بکاپ‌ها، CSV و `.env` را محرمانه نگه دارید. برنامه فایل‌های تازه را با دسترسی خصوصی ایجاد می‌کند.
 
+## ساختار پروژه
+
+```text
+app/
+  domain/models.py   قراردادهای دامنه: Action، Intent، ConversationState (بدون وابستگی)
+  domain/jalali.py   تبدیل تاریخ جلالی و عبارت‌های نسبی
+  service.py         قواعد مالی، اعتبارسنجی، پیشنهاد/اعمال، اعتبارسنجی Intent
+  db.py              لایهٔ SQLite و مهاجرت‌های افزایشی
+  schema.sql         مدل داده (FA، معامله‌ای)
+  bot.py             مسیریابی، مرز دسترسی، کارت‌های تأیید، پیشرفت زنده
+  agent.py           گراف LangGraph، ابزارها، پرامپت سیستم
+  ai_context.py      ساخت حداقلی و نقش‌آگاه context برای مدل
+  backfill.py        ورود اکسل، بازسازی سانس، آمار تطبیق
+  clients.py         API بله و OpenAI-compatible
+  main.py            حلقهٔ polling، صف خروجی، CLI، بکاپ
+  keyboards.py       کیبوردهای مشترک
+specs/               مشخصات SDD (هر تغییر با AC و نگاشت تست)
+tests/               تست‌های اجرایی، بدون شبکه و بدون توکن
+```
+
+## تست و اعتبارسنجی
+
+```bash
+python3 -m unittest discover -s tests -t . -v
+python3 -m compileall -q app tests
+git diff --check
+```
+
+تست‌ها به توکن، شبکه، دیتابیس واقعی یا کلید AI نیاز ندارند: هر تست یک SQLite موقت می‌سازد و مدل را با یک نمونهٔ جعلی (`FakeAI`) جایگزین می‌کند. صحبت‌های خارجی با بله یا مدل هیچ‌وقت در تست‌ها اجرا نمی‌شوند؛ فقط شکل payload صف خروجی بررسی می‌شود.
+
 ## بکاپ و تست
 
 ربات را متوقف کنید. مقصد بکاپ باید جدید باشد:
 
 ```bash
-python3 /root/sans/run.py --backup /root/sans/data/backup-2026-10-15.sqlite3
-python3 -m unittest discover -s /root/sans/tests -t /root/sans -v
+python3 /opt/sans/run.py --backup /opt/sans/data/backup-2026-10-15.sqlite3
+python3 -m unittest discover -s /opt/sans/tests -t /opt/sans -v
 ```
 
 بکاپ از API خود SQLite استفاده می‌کند تا WAL باعث نسخهٔ ناقص نشود. برای بازیابی، در حالت توقف از مسیر فایل بکاپ به‌عنوان `DATABASE_PATH` استفاده کنید. فایل‌های WAL قدیمی را کنار دیتابیس جایگزین‌شده رها نکنید.
@@ -496,12 +543,47 @@ python3 -m unittest discover -s /root/sans/tests -t /root/sans -v
 
 ## فایل‌های اصلی
 
-- `/root/sans/app/schema.sql`: مدل SQLite
-- `/root/sans/app/service.py`: قواعد مالی و اعتبارسنجی
-- `/root/sans/app/bot.py`: گفتگو، دسترسی و تأییدها
-- `/root/sans/app/turns.py`: جمع‌کردن پیام‌های پشت‌سرهم در یک نوبت
-- `/root/sans/app/clients.py`: API بله و OpenAI-compatible
-- `/root/sans/app/main.py`: polling، صف ارسال، CLI، ورود CSV و بکاپ
-- `/root/sans/tests/test_sans.py`: تست‌های سناریویی
+- `/opt/sans/app/schema.sql`: مدل SQLite
+- `/opt/sans/app/service.py`: قواعد مالی و اعتبارسنجی
+- `/opt/sans/app/bot.py`: گفتگو، دسترسی و تأییدها
+- `/opt/sans/app/turns.py`: جمع‌کردن پیام‌های پشت‌سرهم در یک نوبت
+- `/opt/sans/app/clients.py`: API بله و OpenAI-compatible
+- `/opt/sans/app/main.py`: polling، صف ارسال، CLI، ورود CSV و بکاپ
+- `/opt/sans/tests/test_sans.py`: تست‌های سناریویی
 
 مرجع API بله: <https://docs.bale.ai>؛ آدرس فراخوانی: `https://tapi.bale.ai/bot<TOKEN>/METHOD`.
+
+## مشارکت
+
+این پروژه با یک گردش‌کار سبک مشخصات‌محور (Spec-Driven Development) پیش می‌رود و `AGENTS.md` قرارداد آن است:
+
+```text
+spec → plan → implement → test → review
+```
+
+هر تغییر غیرجزئی طبق این ترتیب انجام می‌شود:
+
+1. مشخصهٔ مربوط در `specs/` را بخوانید و معیار پذیرش را **قبل** از کد بنویسید.
+2. تست اجرایی برای همان معیارها اضافه کنید (`tests/`).
+3. کوچک‌ترین تغییری را که تست‌ها را سبز می‌کند بنویسید.
+4. هر سه فرمان اعتبارسنجی را اجرا کنید.
+5. وضعیت مشخصه و محدودیت‌های باقی‌مانده را ثبت کنید.
+
+`tests/test_spec_contracts.py` این قرارداد را اجباری می‌کند: هر مشخصه باید بخش‌های لازم، شناسه‌های یکتا و **نگاشت به تستی که واقعاً وجود دارد** داشته باشد؛ مشخصهٔ بدون تست، سوئیت را قرمز می‌کند.
+
+```bash
+python3 -m unittest discover -s tests -t . -v
+python3 -m compileall -q app tests
+git diff --check
+```
+
+قواعد ثابت پروژه:
+
+- خروجی مدل یک **درخواست** است، نه فرمان؛ قصد/آرگومان/موجودیت نامعتبر باید fail-closed رد شود.
+- context مدل حداقلی و نقش‌آگاه بماند؛ فهرست کامل بازیکنان، شماره‌ها، محتوای رسید و `.env` فرستاده نشود.
+- قواعد مالی، معنای دفتر کل و شِمای SQLite فقط با مشخصهٔ اختصاصی تغییر کنند.
+- فقط کتابخانهٔ استاندارد پایتون و وابستگی‌های موجود در `requirements.txt`.
+
+## مجوز
+
+این پروژه تحت مجوز **MIT** منتشر می‌شود؛ متن کامل در فایل [`LICENSE`](LICENSE) است.
