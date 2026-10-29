@@ -1146,6 +1146,20 @@ class OperationalTests(BaseCase):
         self.assertFalse(cfg.admins)
         self.assertTrue(Bot(self.db, cfg, self.ai).is_admin(-100, 999))
 
+    def test_config_defaults_to_group_only_admin(self):
+        # An installation that forgets ADMIN_ACCESS must not accidentally grant
+        # private admin powers.  Group-only is the safe default.
+        env = {'BALE_BOT_TOKEN': 'test', 'ADMIN_GROUP_ID': '-100',
+               'AI_BASE_URL': 'https://example.com/v1', 'AI_API_KEY': 'test',
+               'AI_MODEL': 'test'}
+        with patch.dict(os.environ, env, clear=True), patch('app.config.load_env'):
+            cfg = Config.from_env()
+        self.assertEqual(cfg.admin_access, 'group_members')
+        bot = Bot(self.db, cfg, self.ai)
+        self.assertTrue(bot.is_admin(-100, 999))   # member of the admin group
+        self.assertFalse(bot.is_admin(999, 999))   # same user, private chat
+        self.assertEqual(Config.admin_access, 'group_members')
+
     def csv(self, contents):
         path = Path(self.temp.name) / 'players.csv'
         path.write_text(contents, encoding='utf-8')
@@ -4792,12 +4806,29 @@ class ShortHelpTests(BaseCase):
 
     def test_private_admin_gets_only_the_admin_guide(self):
         self.seed()
-        # user 1 is in the admin allowlist, so his private chat keeps the powers.
+        # user 1 is in the admin allowlist, so his private chat keeps the powers
+        # only under the `allowlist` policy.  The default is `group_members`,
+        # which grants no private admin, so this case is stated explicitly.
+        self.bot.config = replace(self.config, admins=frozenset({1, 2}),
+                                  admin_access='allowlist')
         self.send('/help', user=1, chat=1)
 
         reply = self.replies(1)
         self.assertIn(self.ADMIN_TITLE, reply)
         self.assertNotIn(self.PLAYER_TITLE, reply)
+
+    def test_group_only_default_denies_private_admin(self):
+        # The default policy must not hand admin powers to a private chat, even
+        # for a user who is on a configured allow-list.  This is the guard that
+        # makes `group_members` a safe default.
+        self.seed()
+        self.bot.config = replace(self.config, admins=frozenset({1, 2}),
+                                  admin_access='group_members')
+        self.send('/help', user=1, chat=1)
+
+        reply = self.replies(1)
+        self.assertNotIn(self.ADMIN_TITLE, reply)
+        self.assertIn(self.PLAYER_TITLE, reply)
 
     def test_help_balance_is_a_separate_short_message(self):
         self.seed()

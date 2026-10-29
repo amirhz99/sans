@@ -33,7 +33,10 @@ class Config:
     database: Path
     bot_name: str = 'مسئول'
     reminder_hours: int = 24
-    admin_access: str = 'allowlist'
+    # SPEC-038/020: the admin group is the boundary.  `group_members` grants
+    # admin only there; `allowlist` additionally keeps private admin for
+    # `admins`.  Group-only is the safer default.
+    admin_access: str = 'group_members'
     ai_fallback_models: tuple[str, ...] = ()
     # SPEC-031: empty means "no human hand-off is configured".
     support_handle: str = ''
@@ -41,7 +44,7 @@ class Config:
     @classmethod
     def from_env(cls):
         load_env()
-        access = os.getenv('ADMIN_ACCESS', 'allowlist').strip()
+        access = os.getenv('ADMIN_ACCESS', 'group_members').strip()
         if access not in ('allowlist', 'group_members'):
             raise ValueError('ADMIN_ACCESS must be allowlist or group_members')
         required = ('BALE_BOT_TOKEN', 'ADMIN_GROUP_ID',
