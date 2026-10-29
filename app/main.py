@@ -247,7 +247,9 @@ def run(db, config):
                                                  'timeout': poll_timeout, 'limit': 50})
             for update in sorted(updates or [], key=lambda u: u['update_id']):
                 state = turns.add(update, time.time())
-                if state == 'joined':
+                if state in ('joined', 'duplicate'):
+                    # SPEC-042: a redelivered update is already part of the open
+                    # turn; it must not add text or raise a second ack.
                     continue
                 if state == 'new':
                     # Acknowledge the first fragment immediately; the reply comes

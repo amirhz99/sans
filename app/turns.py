@@ -45,10 +45,28 @@ class TurnBuffer:
         return body
 
     def add(self, update, now):
-        """Buffer ``update`` and return ``'new'``, ``'joined'``, or ``None``.
+        """Buffer ``update`` and return its outcome.
 
-        ``None`` means the caller must handle the update immediately: either the
-        window is disabled, or the update is not a mergeable plain-text message.
+        The return value is one of:
+
+        ``'new'``
+            The update opened a turn; an acknowledgement may be shown.
+        ``'joined'``
+            The update extended the turn already open for this sender.
+        ``'duplicate'``
+            This ``update_id`` is already part of the open turn (SPEC-042).
+            The platform redelivered it, so it must not contribute text and
+            must not move the deadline.
+        ``None``
+            The caller must handle the update immediately: either the window is
+            disabled, or the update is not a mergeable plain-text message.
+
+        A redelivered update used to be appended again on every delivery.  Bale
+        can return the same ``update_id`` repeatedly inside one poll batch, so a
+        single ``1050000`` arrived as ten fragments, was joined into
+        ``"1050000\\n1050000\\n..."``, and no single-token parser could read it.
+        ``processed_updates`` cannot help here because it is only consulted
+        later, inside ``Bot.process``.
         """
         if self.window <= 0:
             return None
@@ -66,8 +84,14 @@ class TurnBuffer:
                 'deadline': now + self.window,
             }
             return 'new'
+        ident = update.get('update_id')
+        if ident is not None and ident in entry['ids']:
+            # Keep the newest payload so the turn carries the freshest message
+            # metadata, but do not add a fragment and do not extend the window.
+            entry['update'] = update
+            return 'duplicate'
         entry['texts'].append(body)
-        entry['ids'].append(update.get('update_id'))
+        entry['ids'].append(ident)
         entry['update'] = update
         entry['deadline'] = now + self.window
         return 'joined'
@@ -101,16 +125,33 @@ class TurnBuffer:
     def __len__(self):
         return len(self._pending)
 
+    @staticmethod
+    def _distinct(texts):
+        """Collapse runs of an identical fragment into one (SPEC-042).
+
+        A person can legitimately send the same short text twice, so only
+        adjacency is collapsed and order is preserved.  This is a second line of
+        defence: ``add`` already rejects a repeated ``update_id``, but a client
+        that resends the same text under a new id would otherwise still turn one
+        amount into ``"1050000\\n1050000"``.
+        """
+        collapsed = []
+        for text in texts:
+            if not collapsed or collapsed[-1] != text:
+                collapsed.append(text)
+        return collapsed
+
     def _pop(self, key):
         entry = self._pending.pop(key)
         first = entry.get('first') or {}
         update = dict(entry['update'])
-        if len(entry['texts']) > 1:
+        texts = self._distinct(entry['texts'])
+        if len(texts) > 1:
             # One turn, one reply: the model sees the whole thought in order.
             message = dict(update.get('message') or {})
-            message['text'] = '\n'.join(entry['texts'])
+            message['text'] = '\n'.join(texts)
             update['message'] = message
-            update['_coalesced'] = [ident for ident in entry['ids']
+            update['_coalesced'] = [ident for ident in dict.fromkeys(entry['ids'])
                                     if isinstance(ident, int) and not isinstance(ident, bool)]
             # SPEC-028: the progress acknowledgement is attached to the *first*
             # fragment, but this merged turn is built from the *last* one.  Carry

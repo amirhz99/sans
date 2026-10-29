@@ -39,6 +39,13 @@ PROGRESS_STEPS = frozenset({PROGRESS_START, PROGRESS_READING,
 # Two edits closer than this would burst the provider on a very fast turn.
 PROGRESS_MIN_INTERVAL = 0.0
 
+# SPEC-042: a receipt photo waits for its amount inside ``conversations.state``.
+# Without a limit that photo stayed pending for 13 hours in production and every
+# later message from the same account was read as "the amount of that receipt".
+RECEIPT_TTL_SECONDS = 24 * 60 * 60
+RECEIPT_EXPIRED_NOTICE = ('رسید قبلی منقضی شد چون مبلغش فرستاده نشد. '
+                          'اگر هنوز پرداخت کرده‌اید عکس رسید را دوباره بفرستید.')
+
 
 def progress_enabled():
     """SPEC-027/028: ``PROGRESS_UPDATES=0`` disables the progress feed."""
@@ -797,7 +804,6 @@ class Bot:
             details={'private': private, 'admin': admin, 'has_reply': bool(reply_to)},
         )
         state, history = self.db.conversation(chat_id, user_id)
-        had_receipt_step = bool(state.get('receipt'))
         # SPEC-021: the very first private message is answered by the bot itself.
         # The text is deterministic, needs no model call, and is sent once per
         # account.  `/start`, a bare greeting, and an empty body stop here; any
@@ -827,6 +833,9 @@ class Bot:
             if private and msg.get('contact'):
                 reply, keyboard = self.receive_contact(msg['contact'], user_id, chat_id, state)
             elif private and (msg.get('photo') or msg.get('document')):
+                # SPEC-042: a photo that never got an amount must not block the
+                # player forever; drop the stale one and take the new photo.
+                self.expired_receipt(state)
                 if not self.service.linked(user_id):
                     raise UserError('قبل از ارسال رسید، با /identify نام کامل خودتان را معرفی کنید و منتظر تأیید ادمین بمانید.')
                 if state.get('receipt'):
@@ -834,7 +843,8 @@ class Bot:
                 media_type = 'photo' if msg.get('photo') else 'document'
                 media = msg['photo'][-1] if media_type == 'photo' else msg['document']
                 state['receipt'] = {'file_id': media['file_id'], 'file_key': media.get('file_unique_id') or media['file_id'],
-                                    'media_type': media_type, 'chat_id': chat_id, 'message_id': msg['message_id']}
+                                    'media_type': media_type, 'chat_id': chat_id,
+                                    'message_id': msg['message_id'], 'at': int(time.time())}
                 reply = 'رسید دریافت شد. مبلغ دقیق پرداخت را به تومان بنویسید؛ مثلاً /amount 150000. برای لغو /cancel.'
                 # A bare explicit caption is convenient; never infer an amount from the image.
                 amount = self.parse_amount(body)
@@ -857,9 +867,23 @@ class Bot:
                 reply = f'رسید #{receipt_id} برای {player["name"]} ثبت شد؛ پس از بررسی با /approve {receipt_id} تأیید کنید.'
             else:
                 command = self.command(body, admin)
+                if command is None and state.get('receipt') and self.expired_receipt(state):
+                    # SPEC-042: the photo is gone, so this message is ordinary
+                    # text again.  Say so instead of silently ignoring the TTL.
+                    self.db.say(chat_id, RECEIPT_EXPIRED_NOTICE)
                 if command is None:
-                    amount = self.parse_amount(body) if state.get('receipt') else None
-                    if amount is not None:
+                    if state.get('receipt'):
+                        # SPEC-042: a step the bot itself opened must not be
+                        # handed to the model.  Before this guard an unreadable
+                        # amount fell through to the agent, which answered with
+                        # a ``declare_debt`` card and told the player, in words,
+                        # that the receipt had been recorded.  Fail closed and
+                        # ask again instead.
+                        amount = self.parse_amount(body)
+                        if amount is None:
+                            raise UserError(
+                                'مبلغ رسید را فقط به تومان و به صورت یک عدد بنویسید؛ '
+                                'مثلاً 1050000 یا /amount 1050000. برای لغو /cancel.')
                         command = {'action': 'payment_amount', 'args': {'amount': amount}}
                     elif getattr(self.ai, 'use_langgraph', False):
                         # SPEC-028: the acknowledgement message becomes a live
@@ -1124,7 +1148,18 @@ class Bot:
 
     @staticmethod
     def parse_amount(body):
-        value = normalize(body).replace(',', '').replace('٬', '')
+        """Return the amount in ``body`` as a positive integer, else ``None``.
+
+        SPEC-042: a turn can legitimately carry several lines, and before
+        SPEC-042 a redelivered update produced the same line ten times.  Only a
+        body whose *last* non-empty line is a single numeric token is an amount;
+        any surrounding chatter still returns ``None`` so a sentence that merely
+        mentions a number is never read as a payment.
+        """
+        lines = [line for line in str(body or '').splitlines() if line.strip()]
+        if not lines:
+            return None
+        value = normalize(lines[-1]).replace(',', '').replace('٬', '')
         match = re.fullmatch(r'(\d+)\s*(?:تومان)?', value)
         return integer(match.group(1), 'مبلغ پرداخت', 1) if match else None
 
@@ -1877,6 +1912,24 @@ class Bot:
         return (self.service.preview(command) +
                 f'\n\nبرای ثبت بدهی و ارسال روش پرداخت تأیید کنید. کد: {ident}',
                 buttons('yes:' + ident, 'no:' + ident))
+
+    def expired_receipt(self, state):
+        """SPEC-042: drop a pending receipt photo that outlived its TTL.
+
+        Returns ``True`` when a stale receipt was discarded so the caller can
+        tell the player.  A receipt without ``at`` predates SPEC-042 and is kept:
+        dropping it would throw away a photo somebody is in the middle of using.
+        """
+        media = state.get('receipt') if isinstance(state, dict) else None
+        if not isinstance(media, dict):
+            return False
+        stamp = media.get('at')
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            return False
+        if time.time() - stamp < RECEIPT_TTL_SECONDS:
+            return False
+        state.pop('receipt', None)
+        return True
 
     def submit_amount(self, amount, state, user_id):
         player = self.service.linked(user_id)
