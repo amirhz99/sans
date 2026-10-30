@@ -11,7 +11,7 @@ from .ai_context import AIContextBuilder
 from .clients import APIError
 from .content import ADMIN_HELP, DEFAULTS, HELP, SYSTEM_PROMPT
 from .db import dumps
-from .domain import ConversationState, EntityRef, Intent, ResponseLevel
+from .domain import ConversationState, DeclaredDirection, EntityRef, Intent, ResponseLevel
 from .keyboards import CONTACT_BUTTON as _CONTACT_BUTTON
 from .keyboards import contact_keyboard as _contact_keyboard
 from .keyboards import hide_keyboard as _hide_keyboard
@@ -1046,6 +1046,11 @@ class Bot:
                 elif action == 'payment_amount' and private:
                     reply = self.submit_amount(args.get('amount'), state, user_id)
                 elif action == 'declare_debt' and private:
+                    # SPEC-043: the legacy JSON route never carried a direction,
+                    # and the only meaning it ever had was "I owe this".  An
+                    # explicit direction in the payload still wins; it is never
+                    # guessed from the sign of the amount.
+                    args = {**args, 'direction': args.get('direction') or 'owed'}
                     reply, markup = self.request_self_debt(args, user_id, chat_id)
                 elif action == 'request_link' and private:
                     reply, markup = self.request_link(args.get('partner'), user_id, chat_id,
@@ -1787,6 +1792,7 @@ class Bot:
         elif approve:
             raise UserError('ابتدا تطبیق بازیکن را با /link مشخص کنید.')
         self.db.execute('UPDATE pending SET status=? WHERE id=?', ('approved' if approve else 'rejected', ident))
+        self.notify_requester(row, payload, approve)
         if row['kind'] == 'binding':
             self.db.say(row['chat_id'], 'اتصال حساب تأیید شد ✅')
         elif row['kind'] in ('identity', 'claim'):
@@ -1815,6 +1821,36 @@ class Bot:
                 c.get('action') in ('player_merge', 'player_delete') for c in payload):
             return 'انجام شد ✅ فهرست بازیکنان به‌روز شد؛ برای بررسی /players و /duplicates را بفرستید.'
         return 'ثبت شد ✅' if approve else 'درخواست رد شد؛ تغییری در حساب ایجاد نشد.'
+
+    def notify_requester(self, row, payload, approve):
+        """SPEC-043: tell the player what happened to their own declaration.
+
+        Before this, a rejected request was announced only in the admin chat, so
+        the player kept believing a payment had been recorded.  The balance is
+        rendered by the service, never by the model, and a rejection states in
+        words that nothing changed.
+        """
+        if row['kind'] != 'commands' or not isinstance(payload, list):
+            return
+        if row['chat_id'] == self.config.admin_group:
+            return  # an admin declaring for themselves is already in this chat
+        for command in payload:
+            if not isinstance(command, dict) or command.get('action') != 'declare_debt':
+                continue
+            args = command.get('args', {})
+            player_id = args.get('player')
+            try:
+                if approve:
+                    body = ('اعلام شما تأیید شد.\n' + self.service.debt(player_id)
+                            if args.get('direction') == 'paid' else
+                            'بدهی اعلامی شما تأیید شد.\n' + self.service.debt(player_id))
+                else:
+                    body = ('اعلام شما توسط ادمین تأیید نشد؛ هیچ مبلغی به حساب اضافه یا از آن کم نشد.\n'
+                            + self.service.debt(player_id))
+            except UserError:
+                return
+            self.db.say(row['chat_id'], body)
+            return
 
     def attach_identity_phone(self, payload, actor):
         """Store the number an approved identity card carries (SPEC-021).
@@ -1898,20 +1934,43 @@ class Bot:
         player = self.service.linked(user_id)
         if not player:
             raise UserError('برای اعلام بدهی ابتدا با /identify نام کامل خودتان را معرفی و منتظر تأیید ادمین بمانید.')
+        # SPEC-043: the sign is never guessed.  A declaration without a known
+        # direction is refused here, before any card exists, because the same
+        # amount means opposite things depending on it.
+        raw_direction = args.get('direction')
+        try:
+            direction = DeclaredDirection.parse(raw_direction)
+        except ValueError:
+            raise UserError('مشخص نشد این مبلغ بدهی است یا پرداخت؛ '
+                            'بگویید «بدهکارم» یا «پرداخت کردم» تا کارت درست ساخته شود.') from None
         pending = self.db.all("SELECT payload FROM pending WHERE requester=? AND chat_id=? "
                               "AND kind='commands' AND status='pending'", (user_id, chat_id))
         for row in pending:
             commands = json.loads(row['payload'])
+            # Only the same direction is a duplicate: a player with an open
+            # «بدهکارم» card may still file a separate «پرداخت کردم» one.
             if any(c.get('action') == 'declare_debt' and c.get('args', {}).get('player') == player['id']
+                   and c.get('args', {}).get('direction') == direction.value
                    for c in commands):
-                raise UserError('یک اعلام بدهی از شما هنوز منتظر تأیید است؛ ابتدا همان درخواست را تأیید یا رد کنید.')
+                raise UserError('یک اعلام با همین نوع از شما هنوز منتظر تأیید است؛ '
+                                'ابتدا همان درخواست را تأیید یا رد کنید.')
         command = self.service.prepare('declare_debt', {
             'player': player['id'], 'amount': args.get('amount'),
-            'note': 'بدهی اعلام‌شده توسط خود فرد'})
+            'direction': direction.value,
+            'note': ('پرداخت اعلام‌شده توسط خود فرد' if direction is DeclaredDirection.PAID
+                     else 'بدهی اعلام‌شده توسط خود فرد')})
         ident = self.new_pending('commands', [command], user_id, chat_id)
+        # SPEC-043: approval is an admin decision, so the card goes to the admin
+        # group exactly like every other proposal; the player only sees their
+        # own receipt of the request.
+        heading = ('درخواست اعلام پرداخت' if direction is DeclaredDirection.PAID
+                   else 'درخواست اعلام بدهی')
+        self.db.say(self.config.admin_group,
+                    f"{heading} از {player['name']}:\n\n" + self.service.preview(command),
+                    buttons('yes:' + ident, 'no:' + ident))
         return (self.service.preview(command) +
-                f'\n\nبرای ثبت بدهی و ارسال روش پرداخت تأیید کنید. کد: {ident}',
-                buttons('yes:' + ident, 'no:' + ident))
+                f'\n\nاین اعلام برای تأیید ادمین ارسال شد. کد: {ident}',
+                None)
 
     def expired_receipt(self, state):
         """SPEC-042: drop a pending receipt photo that outlived its TTL.

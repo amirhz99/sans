@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .content import CONTENT_PATH, DEFAULTS
+from .domain import DeclaredDirection
 from .keyboards import contact_keyboard
 from . import jalali
 
@@ -1407,9 +1408,21 @@ class Service:
             a['player'] = self.player(args.get('player', ''))['id']
             a['note'] = text(args.get('note', 'بدهی اعلام‌شده توسط خود فرد'), 'توضیح', False)
             if action in ('adjustment', 'declare_debt'):
-                a['amount'] = integer(args.get('amount'), 'اصلاح حساب', 1 if action == 'declare_debt' else -10**12)
+                # SPEC-043: a declaration's magnitude is always positive and the
+                # sign belongs to the direction.  A signed amount would be a
+                # second, contradicting instruction, so negative is refused.
+                a['amount'] = integer(args.get('amount'), 'مبلغ اعلام‌شده', 1 if action == 'declare_debt' else -10**12)
                 if not a['amount']:
                     raise UserError('مبلغ اصلاح نباید صفر باشد.')
+                if action == 'declare_debt':
+                    if a['amount'] < 0:
+                        raise UserError('مبلغ اعلام‌شده باید مثبت باشد؛ برای پرداخت یا بدهی '
+                                        'همیشه عدد مثبت بدهید و نوع را با «پرداخت» یا «بدهی» مشخص کنید.')
+                    try:
+                        a['direction'] = DeclaredDirection.parse(args.get('direction')).value
+                    except ValueError:
+                        raise UserError('نوع اعلام باید «بدهی» یا «پرداخت» باشد؛ '
+                                        'بدون آن هیچ مبلغی ثبت نمی‌شود.') from None
         elif action == 'settle':
             a['player'] = self.player(args.get('player', ''))['id']
             balance = self.balance(a['player'])
@@ -1520,6 +1533,11 @@ class Service:
             return {'linked': int(self.are_linked(a['player'], a['partner'])),
                     'pair': list(self.link_pair(a['player'], a['partner']))}
         if action in ('adjustment', 'declare_debt', 'player_delete'):
+            # SPEC-043: the direction is part of what the admin approved, so a
+            # changed direction must expire the old card like a changed amount.
+            if action == 'declare_debt':
+                return {'player': a['player'], 'direction': a.get('direction'),
+                        'amount': a['amount']}
             return {'player': a['player']}
         if action == 'broadcast':
             recipients, _ = self.broadcast_recipients(a['players'], a['audience'])
@@ -1621,9 +1639,13 @@ class Service:
             return '\n'.join(lines)
         labels = {'new_player': 'ثبت بازیکن', 'new_session': 'ثبت سانس', 'update_session': 'تکمیل سانس',
                   'attendance': 'ثبت/اصلاح حضور', 'finalize': 'نهایی‌سازی بدهی سانس',
-                  'adjustment': 'اصلاح حساب', 'declare_debt': 'ثبت بدهی اعلام‌شده',
+                  'adjustment': 'اصلاح حساب', 'declare_debt': 'اعلام مبلغ توسط بازیکن',
                   'settle': 'تسویه کامل حساب', 'settings': 'تنظیمات', 'player_note': 'یادداشت بازیکن',
                   'player_link': 'پیوند دو حساب', 'player_unlink': 'برداشتن پیوند دو حساب'}
+        # SPEC-043: the card must state the direction in words.  An admin must
+        # never approve a payment believing it is a charge, or the reverse.
+        directions = {'owed': 'بدهی (به بدهی بازیکن اضافه می‌شود)',
+                      'paid': 'پرداخت (از بدهی بازیکن کم می‌شود)'}
         fields = {'name': 'نام', 'title': 'عنوان', 'note': 'توضیح', 'when_text': 'عبارت زمان',
                   'location': 'محل', 'venue_cost': 'هزینهٔ زمین (تومان)', 'person_fee': 'سهم هر نفر (تومان)',
                   'guests': 'تعداد مهمان', 'present': 'حاضر', 'amount': 'مبلغ (مثبت: بدهکار؛ منفی: بستانکار)',
@@ -1643,6 +1665,8 @@ class Service:
             elif key == 'guest_names':
                 if value:
                     lines.append('نام مهمان‌ها: ' + '، '.join(value))
+            elif key == 'direction':
+                lines.append('نوع اعلام: ' + directions.get(value, 'نامشخص'))
             else:
                 lines.append(f'{fields.get(key, key)}: {value}')
         used = a.get('defaults_used') or []
@@ -1681,8 +1705,11 @@ class Service:
             self.db.execute('INSERT INTO players(name, normalized_name, note) VALUES (?,?,?)',
                             (a['name'], normalize(a['name']), a['note']))
         elif action == 'declare_debt':
+            # SPEC-043: a declared payment credits the account.  The sign comes
+            # from the direction and nowhere else, so "I paid" can never add debt.
+            direction = DeclaredDirection.parse(a.get('direction'))
             self.db.execute('INSERT INTO ledger(player_id,amount,note,source) VALUES (?,?,?,?)',
-                            (a['player'], a['amount'], a['note'], source))
+                            (a['player'], direction.sign * abs(a['amount']), a['note'], source))
         elif action == 'settle':
             current = self.balance(a['player'])
             if current <= 0:

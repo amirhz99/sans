@@ -26,6 +26,35 @@ class EntityType(str, Enum):
     SESSION = 'session'
 
 
+class DeclaredDirection(str, Enum):
+    """SPEC-043: which way a declared amount moves the player's balance.
+
+    A declaration used to carry only an amount, so "I paid 150,000" and
+    "I owe 150,000" were the same row.  The direction is the missing piece:
+    it is supplied by the caller, never derived from the amount's sign.
+    """
+
+    OWED = 'owed'
+    PAID = 'paid'
+
+    @classmethod
+    def parse(cls, value: Any) -> 'DeclaredDirection':
+        """Return the direction or raise; anything not exactly ours fails closed."""
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            raise ValueError('declaration direction is required')
+        try:
+            return cls(value.strip())
+        except ValueError:
+            raise ValueError('declaration direction is not supported') from None
+
+    @property
+    def sign(self) -> int:
+        """The only place a declaration's ledger sign is decided."""
+        return -1 if self is DeclaredDirection.PAID else 1
+
+
 class Action(str, Enum):
     """Actions understood by the current application layer.
 

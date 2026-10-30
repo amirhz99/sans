@@ -3,6 +3,7 @@
 from .models import (
     Action,
     ConversationState,
+    DeclaredDirection,
     EntityType,
     EntityRef,
     Intent,
@@ -13,6 +14,7 @@ from .models import (
 __all__ = [
     'Action',
     'ConversationState',
+    'DeclaredDirection',
     'EntityType',
     'EntityRef',
     'Intent',

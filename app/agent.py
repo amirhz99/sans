@@ -14,6 +14,7 @@ from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import tools_condition
 
 from . import jalali
+from .domain import DeclaredDirection
 from .service import (MAX_BATCH, TEHRAN, UserError, integer, normalize,
                       setting_value_is_explicit)
 
@@ -72,8 +73,10 @@ AGENT_SYSTEM_PROMPT = """تو «{bot_name}» هستی؛ دستیار هوشمن�
      * برای یافتن نام‌های تکراری از `query_database` با target='duplicate_players' استفاده کن.
      * بستن کارت‌های تأیید باز (`expire_proposals`): اگر ادمین گفت «کارت‌های منتظر را ببند»، «پیشنهادها را کنسل کن» یا «کارت‌های منقضی را ببند»، این عملیات را صدا بزن. `older_than_hours` را خالی بگذار یعنی فقط کارت‌های قدیمی‌تر از ۲۴ ساعت، و برای «همه» مقدار ۰ بده. این کار فقط کارت را می‌بندد و هیچ مالی اعمال نمی‌شود؛ همین را شفاف بگو. کارت هویت/اتصال را دست نزن.
    - تغییرات مالی در دفترکل (`propose_financial_change`):
-     * نهایی‌سازی بدهی سانس (`finalize`)، اصلاح دستی بدهی/طلب بازیکن (`adjustment`)، تسویه حساب (`settle`) و اعلام بدهی توسط بازیکن (`declare_debt`) حساس هستند. برای این‌ها از `propose_financial_change` استفاده کن تا کارت تأیید با دکمه شیشه‌ای ساخته شود.
-     * `declare_debt` هرگز رسید ثبت نمی‌کند و رسید شناسایی نمی‌شود. هرگز نگو «رسیدت را ثبت کردم»، «رسید رسید» یا «رسید فرستادم»؛ این کار فقط یک بدهی اعلامی برای تأیید ادمین می‌سازد. ثبت رسید فقط از مسیر عکس رسید انجام می‌شود که ارسال آن در اختیار کاربر است، نه تو. اگر کسی گفت «رسید فرستادم» و رسیدی در سوابق نبود، صادقانه بگو رسیدی نرسیده و از او بخواه عکس رسید را جداگانه بفرستد و بعد مبلغ را دقیقاً بنویسد.
+     * نهایی‌سازی بدهی سانس (`finalize`)، اصلاح دستی بدهی/طلب بازیکن (`adjustment`)، تسویه حساب (`settle`) و اعلام مبلغ توسط بازیکن (`declare_debt`) حساس هستند. برای این‌ها از `propose_financial_change` استفاده کن تا کارت تأیید با دکمه شیشه‌ای ساخته شود.
+     * `declare_debt` **حتماً** با `direction` صدا زده می‌شود و مقدار آن تعیین‌کنندهٔ جهت است: `owed` برای «بدهکارم»/«باید بدم» و `paid` برای «پرداخت کردم»/«واریز کردم»/«تسویه کردم». مقدار `amount` همیشه مثبت است و علامت را تو تعیین نمی‌کنی. اگر جهت از پیام کاربر روشن نیست، کارت نساز و اول یک سؤال کوتاه بپرس.
+     * `declare_debt` هرگز رسید ثبت نمی‌کند و رسید شناسایی نمی‌شود. هرگز نگو «رسیدت را ثبت کردم»، «رسید رسید» یا «رسید فرستادم»؛ این کار فقط یک اعلام برای تأیید ادمین می‌سازد. ثبت رسید فقط از مسیر عکس رسید انجام می‌شود که ارسال آن در اختیار کاربر است، نه تو. اگر کسی گفت «رسید فرستادم» و رسیدی در سوابق نبود، صادقانه بگو رسیدی نرسیده و از او بخواه عکس رسید را جداگانه بفرستد و بعد مبلغ را دقیقاً بنویسد.
+     * هرگز از خودت عدد بدهی یا «کم شد / زیاد شد» نگو. عدد موجودی را فقط از نتیجهٔ `query_database` یا از پاسخ ابزار اعلام کن. تا وقتی ادمین کارت را تأیید نکرده، هیچ تغییری در حساب رخ نداده است.
      * اگر ادمین گفت سانس برگزار نشد («کسی نیومد»، «لغو شد»، «سانس انجام نشد»)، عملیات `void_session` را با `propose_financial_change` بساز: کارت سانس را بدون هیچ بدهی می‌بندد. هرگز برای این حالت `finalize` نزن؛ finalize بدهی می‌سازد.
      * اگر درخواست تسویه چند نفره است («بدهی همه را صاف کن»، «حساب این سه نفر را تسویه کن»)، همهٔ نام‌ها را در آرگومان `players` و جداشده با کاما بده تا **یک کارت واحد** ساخته شود. هرگز برای هر نفر کارت جدا نساز و برای هر نفر جداگانه ابزار را صدا نزن.
      * اصلاح حساب چند نفره با مبلغ یکسان: نام‌ها را در `players` و مبلغ مشترک را در `amount` بده.
@@ -753,12 +756,20 @@ class SansAgent:
         @tool
         def propose_financial_change(action: str, player: str = '', session: str = '',
                                      amount: int = 0, note: str = '',
-                                     players: str = '', entries: str = '') -> str:
+                                     players: str = '', entries: str = '',
+                                     direction: str = '') -> str:
             """Create an admin-approval proposal (with inline Yes/No buttons) for financial mutations.
             action: 'finalize', 'void_session', 'adjustment', 'settle', 'declare_debt'.
             «void_session» فقط وقتی که ادمین می‌گوید سانس برگزار نشد/کسی نیامد/لغو شد؛
             سانس باید هیچ حاضری نداشته باشد و در عوض هیچ بدهی ایجاد نمی‌شود.
             One request is always ONE card, even for many players; never call this per person.
+            declare_debt (بازیکن، مبلغ خود اعلام‌شده): `direction` اجباری است و فقط
+              دو مقدار دارد:
+              - `owed` یعنی «بدهکارم» → مبلغ به بدهی اضافه می‌شود.
+              - `paid` یعنی «پرداخت کردم»/«واریز کردم»/«تسویه کردم» → مبلغ از بدهی کم می‌شود.
+              `amount` همیشه مثبت است. هرگز علامت را با عدد بیان نکن؛ جهت را فقط با
+              `direction` بگو. اگر از پیام کاربر مطمئن نیست که بدهکار است یا پرداخت‌کننده،
+              این ابزار را صدا نزن و اول از او بپرس.
             adjustment:
               - `player` + `amount`: a single player.
               - `players` (names or ids separated by , ، or newline) + one shared `amount`.
@@ -771,10 +782,29 @@ class SansAgent:
                     linked = service.linked(user_id)
                     if not linked:
                         return 'ابتدا باید حساب کاربری به نام بازیکن متصل شود.'
-                    cmd = {'action': 'declare_debt', 'args': {'player': linked['id'], 'amount': amount, 'note': note or 'بدهی اعلامی کاربر'}}
+                    # SPEC-043: the direction is mandatory.  Without it the same
+                    # amount would mean opposite things, and the model used to
+                    # turn a payment into extra debt.
+                    try:
+                        parsed = DeclaredDirection.parse(direction)
+                    except ValueError:
+                        return ('نوع اعلام مشخص نیست: برای «بدهکارم» مقدار owed و برای '
+                                '«پرداخت کردم» مقدار paid را در direction بده. هیچ مبلغی ثبت نشد.')
+                    cmd = {'action': 'declare_debt',
+                           'args': {'player': linked['id'], 'amount': amount,
+                                    'direction': parsed.value,
+                                    'note': note or ('پرداخت اعلامی کاربر' if parsed is DeclaredDirection.PAID
+                                                     else 'بدهی اعلامی کاربر')}}
                     preview, markup = bot.propose(cmd, user_id, chat_id)
-                    db.say(bot.config.admin_group, f"درخواست ثبت بدهی از {linked['name']}:\n\n" + preview, markup)
-                    return 'پیشنهاد ثبت بدهی برای تأیید به گروه ادمین‌ها ارسال شد.'
+                    heading = ('درخواست اعلام پرداخت' if parsed is DeclaredDirection.PAID
+                               else 'درخواست اعلام بدهی')
+                    db.say(bot.config.admin_group, f"{heading} از {linked['name']}:\n\n" + preview, markup)
+                    return ('پیشنهاد اعلام پرداخت برای تأیید به گروه ادمین‌ها ارسال شد. '
+                            'تا تأیید نشود از بدهی کم نمی‌شود؛ همین را به کاربر بگو و '
+                            'هیچ عدد بدهی جدیدی از خودت نگو.'
+                            if parsed is DeclaredDirection.PAID else
+                            'پیشنهاد اعلام بدهی برای تأیید به گروه ادمین‌ها ارسال شد. '
+                            'تا تأیید نشود هیچ مبلغی به بدهی اضافه نمی‌شود.')
 
                 if not admin:
                     return 'تغییرات مالی فقط توسط ادمین قابل پیشنهاد است.'
